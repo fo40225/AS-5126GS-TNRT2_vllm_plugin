@@ -46,8 +46,8 @@ path, no systematic bias (round to nearest even on both partials). Evidence (`be
   NCCL 96.2 %. A vs B same final answer 192 / 200 (without: 191 / 200).
 
 Batch-size consequence (same class as the 2 MiB threshold of the large path before): in the decode range the attn-out all-reduce of
-T <= 8 is exact (fused kernel, 16 .. 128 KiB), from T = 9 on it carries the bf16 exchange; the MoE-out all-reduce `[T, 4096]` carries it
-from T = 8 (64 KiB). An element's bits therefore depend on the padded batch size at those boundaries, which the dummy end-to-end
+T <= 8 is exact (fused kernel, 16 .. 128 KiB), from T = 9 on it carries the bf16 exchange (in the CUDA-graph decode the padded sizes are 1, 2, 4, 8, 16, 24, ..., so
+from T = 16); the MoE-out all-reduce `[T, 4096]` carries it from padded T = 8 (64 KiB). An element's bits therefore depend on the padded batch size at those boundaries, which the dummy end-to-end
 bitwise tool cannot be used for; the GSM8K smoke above is the evidence.
 
 ## Latency (bf16 `[T, 8192]`, CUDA graph of back-to-back calls, us per call; `bench/bench_medium.py`, 2026-10-26)
