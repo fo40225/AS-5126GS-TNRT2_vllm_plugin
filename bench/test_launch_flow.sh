@@ -161,6 +161,24 @@ expect_fail keep2 "--keep-on-fail does not keep a server that never became healt
 run dry serve_spec.sh STUB_STATE=spec_1 -- --dry-run
 if [ $rc = 0 ] && [ ! -s "$d/dry.mark" ] && [ -s "$d/dry/serve_cmd.txt" ] && [ -s "$d/dry/env.txt" ] && [ ! -e "$d/dry/serve.pid" ] && [ "$(result dry)" = "RESULT dryrun" ]; then pass "--dry-run writes serve_cmd.txt and env.txt and starts nothing"
 else bad "--dry-run" "rc=$rc mark=$([ -s "$d/dry.mark" ] && echo yes || echo no)"; fi
+# review r2 M1: a relative --out is resolved to an absolute path before the server subshell cds into it (launch and dry run)
+mkdir -p "$d/relcwd"
+for mode in launch dry; do
+  rm -rf "${d:?}/relcwd/relout_$mode"
+  rargs=(); [ $mode = dry ] && rargs=(--dry-run)
+  (cd "$d/relcwd" && env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none \
+    MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 \
+    bash "$here/launch/serve_spec.sh" "${rargs[@]}" --out "relout_$mode" > "$d/relcwd/$mode.stdout" 2>&1); rc=$?
+  ro=$d/relcwd/relout_$mode
+  if [ $mode = launch ]; then
+    if [ $rc = 0 ] && [ "$(grep -a '^RESULT' "$ro/status.txt" | tail -n 1)" = "RESULT pass" ] && [ -s "$ro/serve.log" ] && [ ! -e "$ro/relout_$mode" ] && grep -q "out=$ro " "$ro/status.txt"; then pass "relative --out: the launch passes, the files are in the absolute directory (M1)"
+    else bad "relative --out (launch)" "rc=$rc $(grep -a '^RESULT' "$ro/status.txt" 2> /dev/null | tail -n 1) $(tail -n 2 "$d/relcwd/$mode.stdout" | tr '\n' '|' | cut -c1-300)"; fi
+    bash "$here/launch/stop_server.sh" "$ro" > /dev/null 2>&1
+  else
+    if [ $rc = 0 ] && [ -s "$ro/serve_cmd.txt" ] && [ -s "$ro/env.txt" ] && grep -q "out=$ro " "$ro/status.txt"; then pass "relative --out: the dry run writes into the absolute directory (M1)"
+    else bad "relative --out (dry run)" "rc=$rc"; fi
+  fi
+done
 # stop_server.sh refuses a pid that is not a vllm process
 mkdir -p "$d/notvllm"; sleep 30 & echo $! > "$d/notvllm/serve.pid"; spid=$!
 bash "$here/launch/stop_server.sh" "$d/notvllm" > /dev/null 2>&1; rc=$?

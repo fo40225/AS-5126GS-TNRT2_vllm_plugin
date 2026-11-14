@@ -257,6 +257,8 @@ lc_main() {
   local name=$LC_PROFILE
   [ -n "$LC_OUT" ] || LC_OUT=$PWD/launch_${name}_tier${LC_TIER}_$(date +%Y%m%d_%H%M%S)
   mkdir -p "$LC_OUT" || { echo "launch: cannot create $LC_OUT" >&2; exit 2; }
+  # absolute before any cd: the server subshell does cd "$LC_OUT" and then opens "$LC_OUT/serve.log" (a relative --out would resolve twice)
+  LC_OUT=$(cd "$LC_OUT" && pwd) || { echo "launch: cannot enter $LC_OUT" >&2; exit 2; }
   LC_STATUS=$LC_OUT/status.txt
   lc_records
   lc_log "START profile=$name tier=$LC_TIER bytes=$LC_KVB mns=$LC_MNS tree=$LC_TREE host=$HOST out=$LC_OUT dry_run=$LC_DRY"
