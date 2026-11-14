@@ -28,10 +28,10 @@ group, so putting the host folder on ``PYTHONPATH`` is enough (no pip install). 
   a call the kernels cannot serve (shape, dtype, contiguity: all rank-uniform; misaligned operands are staged through an aligned
   copy, never a reason to decline) returns ``None`` and the model runs the two steps itself.
 * ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary`` (same interface): the sharded pooler / unpooler GEMV of the
-  decode layer (T <= 8) together with the gather that follows it. The GEMV kernel loads its weights while the all-reduce in front
-  of it is still running, sums in the fixed fp32 order of ``csrc/gemv.cuh`` (class deterministic_different against the cuBLAS GEMV
-  of the model) and pushes its columns to the partner and the island peers; the gather kernel then forwards, collects and runs the
-  epilogue (``docs/r3b_gemv_push.md``).
+  decode layer (T <= MUSE_TOPO_GEMV_MAX_ROWS, 4 by default, at most 8) together with the gather that follows it. The GEMV kernel
+  loads its weights while the all-reduce in front of it is still running, sums in the fixed fp32 order of ``csrc/gemv.cuh`` (class
+  deterministic_different against the cuBLAS GEMV of the model) and pushes its columns to the partner and the island peers; the
+  gather kernel then forwards, collects and runs the epilogue (``docs/r3b_gemv_push.md``).
 * ``destroy``: dumps the call counters and closes the topo communicator.
 
 Capability ``reduce_scatter_all_gather_matches_all_reduce`` (property of the patched ``CudaCommunicator``, a plain
@@ -96,22 +96,27 @@ Environment (all optional):
                              ``MUSE_TOPO_AR_TUNING_FILE`` must be identical on every rank
 ``MUSE_TOPO_FUSED``          0 disables the fused collective + epilogue kernels (``TopoComm.supports_boundary_rows``
                              then declines every batch and the model runs the two steps); default 1
-``MUSE_TOPO_GEMV``           0 keeps the sharded pooler / unpooler GEMV of the decode layer on cuBLAS (T <= 8 otherwise runs
+``MUSE_TOPO_GEMV``           0 keeps the sharded pooler / unpooler GEMV of the decode layer on cuBLAS (T <= MAX_ROWS otherwise runs
                              ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary``: the GEMV kernel of
                              ``csrc/gemv_push.cu`` + the pushed gather kernel, see ``docs/r3b_gemv_push.md``); needs
                              ``MUSE_TOPO_FUSED`` != 0; default 1
 ``MUSE_TOPO_GEMV_PUSH``      push mode of the GEMV kernel: 0 = it only stores its columns and the gather kernel pushes them, 1 = every CTA
                              pushes as soon as it is done (default), 2 = the last CTA pushes the block in coalesced stores; +4 loads the
                              weights behind the wait for the kernel in front instead of before it (A/B switches). Valid: 0, 1, 2, 4, 5,
-                             6; 3 and 7 push nothing but tell the gather kernel that the data was pushed, so the peers spin until the
-                             watchdog traps
-``MUSE_TOPO_GEMV_TRIGGER``   when the all-reduce kernel in front lets the GEMV kernel start: 0 = never (at its completion), 1 = at its start
-                             (delays the all-reduce by ~5 us), 2 = when its last phase begins, 3 = when it ends; default 3 (provisional,
-                             2 measured the same within the noise). Only ``ar2_kernel`` / ``ar2_bnd_kernel`` fire stages 2 and 3
+                             6; 3 and 7 push nothing but tell the gather kernel that the data was pushed, so the peers would spin until
+                             the watchdog traps: they (and anything else) are rejected at start-up, through the stage-1 agreement (every
+                             rank then falls back to NCCL)
+``MUSE_TOPO_GEMV_TRIGGER``   when an all-reduce that precedes a GEMV lets the GEMV kernel start: 0 = never (at its completion), 1 = at its start
+                             (delays the all-reduce by ~5 us), 2 = when its last communication phase begins, 3 = when it has ended; default 3
+                             (decision run: 0.60 % better than 2 on mean(c1, c4), not robust). A property of the launch: only
+                             ``all_reduce_boundary`` and the bf16 [T, 4096] ``all_reduce`` of the MoE latent with T <= MAX_ROWS carry it;
+                             a kernel launched with programmatic stream serialization behind them must ``griddepcontrol.wait`` before it
+                             reads the output. Only ``ar2_kernel`` / ``ar2_bnd_kernel`` fire stages 2 and 3
 ``MUSE_TOPO_GEMV_VARIANT``   pin one geometry variant (0 .. 3) of the GEMV kernels; unset (default) = by rows: V0 for one row, V3 for 2 .. 8
                              (same summation order; V1 / V2 sum in another order, for tuning only)
-``MUSE_TOPO_GEMV_MAX_ROWS``  largest padded decode batch the GEMV + gather kernels serve, 1 .. 8, default 8; above it the model keeps cuBLAS
-                             and the r2d gather
+``MUSE_TOPO_GEMV_MAX_ROWS``  largest padded decode batch the GEMV + gather kernels serve, clamped to 0 .. 8, default 4 (padded batches 1, 2, 4
+                             gain; the padded 8 of c5 .. c8 shows no gain: c8 TPOT 19.992 ms with 8, 19.897 with 4, 19.738 with everything
+                             off); above it the model keeps cuBLAS and the r2d gather
 ``MUSE_TOPO_LOG_OPS``        0 (default): the per-op summary goes to the debug log; 1: info log on group rank 0;
                              2: info log on every rank
 

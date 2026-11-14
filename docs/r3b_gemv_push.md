@@ -64,12 +64,32 @@ the tests to the error of cuBLAS, not claimed to be more accurate.
   into registers *before* `griddepcontrol.wait` (`ld.global.L1::no_allocate` as a volatile asm: ptxas moves `.nc` loads below the wait, which would
   turn the early loads into late ones and hoist `.nc` activation loads above it, reading the producer's output too early). It triggers its successor at
   its start; the gather kernel loads its never-changing operands (RMS weights, boundary gate coefficients and weights) before its own wait.
-* `Ctx::trigger`: the all-reduce kernels in front (`ar2_kernel` of the MoE output, `ar2_bnd_kernel` of the attention output) let the GEMV
+* `Ctx::trigger`: the all-reduce launches in front (`ar2_kernel` of the MoE output, `ar2_bnd_kernel` of the attention output) let the GEMV
   kernel start at a configurable point (`MUSE_TOPO_GEMV_TRIGGER`). Triggering at their start (stage 1) was measured to delay the all-reduce by
-  4 .. 5 us (the 8 MB burst competes with its latency-critical first phases on the last-arriving rank), so the default is stage 3 (the last phase
-  has ended); stage 2 (the last phase begins) measured the same within the noise. The other all-reduce kernels never fire stages 2 and 3, and the
-  GEMV kernel then starts at their completion. A trigger only moves when the dependent grid may become resident: both kernels still wait for the
-  completion and memory flush of the grid in front, so no result depends on it.
+  4 .. 5 us (the 8 MB burst competes with its latency-critical first phases on the last-arriving rank), so the default is stage 3 (the last
+  communication phase has ended; the output of the kernel, and in `ar2_bnd_kernel` its boundary epilogue, is still being written); stage 2 (the last
+  phase begins; in `ar2_kernel` the point sits inside the grid-stride loop, it fires once per iteration, idempotently) measured the same within the
+  noise. The other all-reduce kernels never fire stages 2 and 3, and the GEMV kernel then starts at their completion. With `MUSE_TOPO_PDL=1` every
+  topo kernel triggers at its start already, so stages 2 and 3 have no effect (the plugin logs it once). A trigger only moves when the dependent grid
+  may become resident: both kernels still wait for the completion and memory flush of the grid in front, so no result depends on it.
+* **The stage is a property of the launch, not of the communicator.** `Ctx::trigger` is 0 in every kernel launch except the two all-reduces that
+  precede a GEMV of a batch the GEMV kernels serve (`TopoComm._trigger_stage`): `all_reduce_boundary` with `rows <= MUSE_TOPO_GEMV_MAX_ROWS` (the
+  pooler GEMV follows) and `all_reduce` of a bf16 `[rows, 4096]` tensor with `rows <= MUSE_TOPO_GEMV_MAX_ROWS` (the MoE latent: the unpooler GEMV
+  follows). The embedding all-reduce, batches above the GEMV limit, prefill, the large algorithms and every other topo kernel keep the implicit
+  trigger at their exit, exactly as before this track. Contract for the successor of an armed all-reduce: a kernel launched with programmatic stream
+  serialization behind one of these two launches becomes resident before the all-reduce output is complete and **must call `griddepcontrol.wait`
+  before it reads it** (`gemv_push_kernel` does; so does every PDL-launched kernel of the vLLM Muse Spark decode graph, by the rule of
+  `muse_pdl_enabled`: Triton kernels with `launch_pdl` call `gdc_wait`, and `muse_nvfp4_decode_moe`, `muse_spark_qknorm_rope_kv_insert`,
+  `muse_spark_expert_prefetch` and `router_gemv` use `griddepcontrol.wait` / `cudaGridDependencySynchronize`; in the Muse layer the successor of both
+  launches is the GEMV kernel itself, or a cuBLAS GEMV that is not a programmatic dependent). A kernel of another model or another attention
+  backend behind an armed all-reduce would have to follow the same rule; the drafter graphs were not audited. `bench/test_gemv_push.py` section 4b
+  runs a PDL-launched sentinel kernel (with and without the wait) behind armed and unarmed all-reduces at every stage.
+* Operands that are copied just before the call (a misaligned weight or parameter, staged through `clone()` by `TopoComm`) are not "never changing"
+  for the early loads of the two kernels; such a call launches the GEMV kernel without programmatic stream serialization (it starts after the copy
+  has completed). The production parameters are 16-byte aligned (rows narrowed at multiples of 8 MiB), so this is a correctness guard only.
+* Validation happens before the first launch: the push mode (only 0, 1, 2, 4, 5, 6; checked when `TopoComm` is built, in the `gemv_push` property and in
+  the three C++ entry points) and every operand of the gather kernel. A call that throws after the GEMV kernel has pushed would leave tagged words in
+  the peers' slots and the call counter behind.
 
 ## Knobs
 
@@ -80,10 +100,10 @@ rank.
 |----------|---------|---------|
 | `VLLM_MUSE_SPARK_SM120_FUSED_GEMV` (vLLM branch) | 1 | the model offers the sharded pooler / unpooler GEMV to the TP communicator (needs `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1` and a communicator that implements the hook); 0 keeps the cuBLAS GEMV + the r2d gather |
 | `MUSE_TOPO_GEMV` | 1 | the plugin accepts the offer (needs `MUSE_TOPO_FUSED` != 0); 0 declines every call, so the model runs cuBLAS + the r2d gather. For an A/B set both switches (the vLLM one alone only stops the offer) |
-| `MUSE_TOPO_GEMV_TRIGGER` | 3 (provisional) | stage at which the all-reduce in front lets the GEMV kernel start: 0 = never, 1 = at the start of the all-reduce, 2 = when its last phase begins, 3 = when it ends. With `MUSE_TOPO_PDL=1` the all-reduce kernels trigger at their start whatever the stage |
-| `MUSE_TOPO_GEMV_PUSH` | 1 | bits 0-1: push mode, 0 = the GEMV kernel only stores and the gather kernel pushes, 1 = every GEMV CTA pushes its words as soon as they are done, 2 = the last CTA to finish pushes the block in coalesced stores; bit 2 (+4): the weights are loaded behind the wait for the predecessor instead of before it. Valid values are 0, 1, 2, 4, 5, 6. **Do not use 3 or 7**: mode 3 pushes nothing but tells the gather kernel that the words were pushed, so the peers spin until the watchdog traps |
+| `MUSE_TOPO_GEMV_TRIGGER` | 3 | stage at which an all-reduce that precedes a GEMV (see Protocol) lets the GEMV kernel start: 0 = never, 1 = at the start of the all-reduce, 2 = when its last communication phase begins, 3 = when it has ended. Decision run: 3 over 2 by 0.60 % on mean(c1, c4), not robust (below). With `MUSE_TOPO_PDL=1` the stage has no effect |
+| `MUSE_TOPO_GEMV_PUSH` | 1 | bits 0-1: push mode, 0 = the GEMV kernel only stores and the gather kernel pushes, 1 = every GEMV CTA pushes its words as soon as they are done, 2 = the last CTA to finish pushes the block in coalesced stores; bit 2 (+4): the weights are loaded behind the wait for the predecessor instead of before it. Valid values are 0, 1, 2, 4, 5, 6; **3 and 7 (and anything out of range) are rejected** at start-up (the stage-1 agreement makes every rank fall back to NCCL) and by the C++ entry points: mode 3 would push nothing but tell the gather kernel that the words were pushed, so the peers would spin until the watchdog traps |
 | `MUSE_TOPO_GEMV_VARIANT` | unset (by rows) | pin a geometry variant (0 .. 3) for all calls; unset = V0 for one row, V3 for 2 .. 8 rows. V1 / V2 sum in another order (another number of warps per row) |
-| `MUSE_TOPO_GEMV_MAX_ROWS` | 8 | the largest padded decode batch the kernels serve (1 .. 8; the kernel rejects more); above it the model keeps cuBLAS + the r2d gather |
+| `MUSE_TOPO_GEMV_MAX_ROWS` | 4 | the largest padded decode batch the kernels serve, clamped to 0 .. 8 (0: never); above it the model keeps cuBLAS + the r2d gather. 4 serves the padded batches 1, 2 and 4 and leaves c5 .. c8 (padded 8, also the K = 7 verify batch of speculative decoding) on cuBLAS: at c8 the GEMV shows no gain (decision run below), and V3 at T = 8 spills registers (`ptxas -v`: 64 / 96 bytes of spill stores for the unpooler / pooler instance, none at T <= 7) |
 | `VLLM_MUSE_SPARK_SM120_ROUTER_GEMV` (vLLM branch) | 1 | the fp32 router GEMV of the decode layer (`_muse_C::router_gemv`), companion of this track: one kernel with a fixed summation order instead of cuBLAS dot / sgemm + reduction. Its input is the fp32 router input that the boundary kernel writes in the decode graphs only with the expert prefetch; without it the router stays on cuBLAS and the vLLM log says so once |
 | `VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES` (vLLM branch) | 12582912 (12 MiB) | bytes of the routing-aware expert L2 prefetch (cache hint, no numeric effect); the router GEMV moves the routing ids earlier, which is what a larger budget would need |
 
@@ -123,9 +143,37 @@ changes cannot reach (batches above 8 tokens), by about 1 %.
 
 A5 is the shipped configuration (`VLLM_MUSE_SPARK_SM120_FUSED_GEMV=1`, `MUSE_TOPO_GEMV=1`, `VLLM_MUSE_SPARK_SM120_ROUTER_GEMV=1`, push 1, trigger 3): c1 -4.2 %,
 c4 -3.2 % (reproduced in the second session), c16 and c64 flat. The two changes add up to more than the sum (GEMV -2.2 %, router GEMV -1.0 %, both -4.2 % at c1):
-presumably because the router chain was the long pole once the pooler chain got shorter (profile above). Late weights and the coalesced push do not beat the default. Not measured:
-trigger 2 together with the router GEMV, and the padded T = 8 graph (c5 .. c8; an early bench had the GEMV chain slower than cuBLAS at T = 8, hence
-`MUSE_TOPO_GEMV_MAX_ROWS`).
+presumably because the router chain was the long pole once the pooler chain got shorter (profile above). Late weights and the coalesced push do not beat the default. Not measured in S1-4a: trigger 2 together with the router GEMV, and the padded T = 8 graph
+(c5 .. c8): the decision run below.
+
+### Decision run (S1-4b, 2026-10-27): trigger stage, MAX_ROWS, prefetch budget
+
+One lock hold (17:38 .. 18:29), 11 sessions (one server per arm, all configurations confirmed from `serve.log`), trees vLLM `a38e5ca2f4` + host `c85dd07`, same
+protocol as above (random 512/128, 2 repeats, SEED 9000 + 100 * (rep - 1) + c, 32 prompts per repeat, 36 at c6), TPOT in ms (mean of the 2 repeats).
+The defaults arm was measured at the start (T3s) and at the end (T3e) of the session: drift c1 -0.42 %, c2 0.00 %, c4 +1.11 %, c8 -0.58 %. Rep spreads are 0.4 .. 1.3 %
+(c1), 0.0 .. 2.7 % (c4), 0.5 .. 2.9 % (c8); S1-4a showed about 1 % session-to-session noise, so nothing below that is resolved, the 0.5 % decision bands included.
+
+| arm | configuration | c1 | c2 | c4 | c6 | c8 |
+|-----|---------------|----|----|----|----|----|
+| T3s / T3e | defaults of the trees (trigger 3, MAX_ROWS 8 at the time, router GEMV) | 9.214 / 9.175 | 11.551 / 11.551 | 14.788 / 14.952 | | 20.009 / 19.892 |
+| T2 | `MUSE_TOPO_GEMV_TRIGGER=2` | 9.209 | 11.571 | 14.937 | | 19.799 |
+| MR8 | trigger 3, `MUSE_TOPO_GEMV_MAX_ROWS=8` | | | | 22.972 | 19.992 |
+| MR4 | trigger 3, `MUSE_TOPO_GEMV_MAX_ROWS=4` | | | | 23.005 | 19.897 |
+| REFr | router GEMV only (`FUSED_GEMV=0 MUSE_TOPO_GEMV=0 ROUTER_GEMV=1`) | | | | 22.841 | 19.793 |
+| A0 | everything off (production behaviour) | | | | 23.071 | 19.738 |
+
+Expert-prefetch budget (trigger 3, MAX_ROWS 8), TPOT at c1 / c4: 12 MiB 9.180 / 14.740 (B12a) and 9.179 / 14.820 (B12b); 20 MiB 9.202 / 14.935; 28 MiB 9.230 / 14.838.
+
+* **Trigger** (rule: lower mean of c1 and c4, a tie within 0.5 % goes to 2): mean(c1, c4) is 12.001 ms for 3 and 12.073 ms for 2, 0.60 % lower for 3, hence 3. It is **not
+  robust**: c1 is identical (9.214 / 9.209), the whole difference is c4 (14.788 / 14.937), whose repeat spread (1.41 %) and start-to-end drift (+1.11 %) are of the same
+  size; with mean(T3s, T3e) against T2 (post hoc, not used for the decision) the difference is -0.34 %, inside the tie band. The trigger has no measurable effect at c1.
+* **MAX_ROWS** (rule: 8 only if the c8 TPOT with 8 is not worse than with 4 by more than 0.5 %): c8 is 19.992 ms with 8 and 19.897 ms with 4, +0.48 % for 8, which the
+  rule accepted by 0.02 %. The data supports only "neither a gain nor a loss at padded T = 8": all c8 values with 8 (20.009, 19.799, 19.992, 19.892) lie in the same
+  1.3 % band as MR4 (19.897), router-only (19.793) and everything off (19.738), and MR4 against REFr (the same cuBLAS pooler at padded T = 8) differs by +0.52 % at c8 and +0.71 % at c6, which is the noise.
+  The orchestrator overrode the rule outcome: **the default is 4**, because at c8 the fused GEMV trends slower in all three comparisons (MR8 19.992 against MR4 19.897,
+  router-only 19.793 and all-off 19.738) and the T = 8 layer-chain microbenchmark (53.7 us against 52.1 us for cuBLAS) says the same. (c6 > c8 in every arm, A0 included: a property of the production stack, not of this track.)
+* **Prefetch budget** (rule: 12 MiB unless another value wins by at least 1 % at c1): the mean of the two 12 MiB runs at c1 is 9.180 ms; 20 MiB (+0.24 %) and 28 MiB (+0.55 %)
+  are slower, so it stays 12 MiB (`VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES`, 12582912).
 
 ### Microbenchmarks (single call, graph b2b, `bench/bench_gemv_push.py`)
 
@@ -133,11 +181,23 @@ cuBLAS pooler `[T, 8192] x [512, 8192]^T`: T = 1 gemv 5.3 us hot L2 / 24.3 us co
 Unpooler `[T, 4096] x [1024, 4096]^T`: T = 1 4.3 / 18.5 us; T = 2 .. 8 3.9 + 1.8 = 5.7 / 19 us. Layer chain (all-reduce + boundary, pooler, MoE all-reduce,
 unpooler + boundary, trigger at the start, hot L2, two-step -> fused): T = 1 34.6 -> 27.9 us, T = 2 40.4 -> 33.1 (V3), T = 4 43.9 -> 41.5 (V3); T = 8 52.1 -> 53.7
 (GEMV without the pushes) / 58 .. 74 (with them), i.e. slower; cold L2: T = 1 36.8 -> 24.9, T = 2 43.0 -> 27.4, T = 4 44.9 -> 33.2.
+Rerun with the trigger stage as a property of the launch (2026-10-27, `--ts 1,2,4 --variants 0 --triggers 0,3`, hot L2, layer chain, us): two-step 35.3 / 41.0 / 45.0 at T = 1 / 2 / 4;
+GEMV kernel with the pushes and stage 0 (the GEMV kernel starts when the all-reduce has completed) 29.7 / 36.3 / 44.4; stage 3 28.8 / 35.1 / 43.7, so the two armed all-reduces still
+release the GEMV kernel early (about 1 us per layer at T <= 4).
+Rerun on the current kernels (2026-10-27, `bench_gemv_push.py --ts 8 --variants 0,3 --triggers 3`, trigger stage 3, hot L2, layer chain of all-reduce + boundary, pooler,
+MoE all-reduce, unpooler + boundary): two-step 53.8 us; GEMV kernel without pushes 55.8 (V0) / 59.1 (V3); with every CTA pushing (the default push mode) 63.4 (V0) / 59.9 (V3), i.e.
++6 us (+11 %) against two-step with the geometry that is used (V3). `ptxas -v` shows register spills for exactly the two T = 8 instances of V3 (unpooler 64 bytes, pooler 96 bytes of spill
+stores; 512-thread CTAs are capped at 128 registers), none for T <= 7 or for V0; V0 is slower at T = 8 with the pushes all the same, so the table of geometries is unchanged.
 
 ### Tests
 
-`bench/test_gemv_push.py` (8 ranks, under the GPU lock): the shard bit for bit against the torch emulation of the order (`emulate_gemv`), the fused calls against
-`all_gather` of the emulated shards + the model's Triton kernels (bitwise, equal on every rank, all push modes, all variants, the by-rows selection), accuracy next
-to cuBLAS, the decode-layer chain eager and in CUDA graphs with every trigger stage, misaligned operands, a random mix with other collectives.
-`--quick` is the short run, no flag the full one. The shared all-reduce kernels are covered by `bench/test_ar_boundary.py`, the plugin hook by
-`bench/test_plugin.py`, the medium all-reduce by `bench/test_medium_bx.py`.
+`bench/test_gemv_push.py` (8 ranks, under the GPU lock): the dispatch gates at the default MAX_ROWS; the shard bit for bit against the torch emulation of the order
+(`emulate_gemv`), the fused calls against `all_gather` of the emulated shards + the model's Triton kernels (bitwise, equal on every rank, all push modes 0, 1, 2, 4, 5, 6, all
+variants, the by-rows selection); the rejection of the push modes 3, 7, -1, 8 and 12 (Python and the three C++ entry points, nothing launched) and of a bad gather operand before the
+GEMV kernel has pushed (the next call, started skewed in time with other data, is correct); accuracy next to cuBLAS; the decode-layer chain eager and in CUDA graphs with every trigger
+stage, with the exact and the bf16-exchange all-reduce (the production setting: the padded T = 8 all-reduce of 64 KiB is the BX kernel); a PDL-launched sentinel kernel behind armed
+and unarmed all-reduces (section 4b); activations misaligned on odd ranks, and the static weights / norm weights / boundary parameters misaligned on odd ranks; a random mix with other
+collectives; `MUSE_TOPO_PDL=1` over all push modes. `--quick` is the short run, no flag the full one. `bench/test_plugin_unit.py` (CPU only) covers the plugin wrappers
+(routing, the row gate, the `MUSE_TOPO_GEMV=0` decline, the declines) and the parsing and clamping of the `MUSE_TOPO_GEMV_*` knobs; `bench/test_init_failure.py --cases gemv` a bad
+value on three ranks. The shared all-reduce kernels are covered by `bench/test_ar_boundary.py`, the plugin hook end to end by `bench/test_plugin.py`, the medium all-reduce by
+`bench/test_medium_bx.py`.

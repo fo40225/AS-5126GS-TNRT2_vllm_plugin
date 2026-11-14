@@ -796,14 +796,14 @@ class TopoComm:
         return ((2, 4, 4, 2), (1, 2, 2, 1))[kind][self._variant_for(rows)]
 
     def supports_gemv_all_gather_rmsnorm(self, x: torch.Tensor, w: torch.Tensor) -> bool:
-        """Whether :meth:`gemv_all_gather_rmsnorm` can serve this call: bf16 ``x`` [T, 8192] (1 <= T <= 8) and the bf16 weight rows
+        """Whether :meth:`gemv_all_gather_rmsnorm` can serve this call: bf16 ``x`` [T, 8192] (1 <= T <= ``gemv_max_rows``, at most 8) and the bf16 weight rows
         [512, 8192] of this rank (rank-uniform: shapes, dtypes, contiguity)."""
         return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.gemv_max_rows
                 and tuple(w.shape) == self.GEMV_POOLER_SHAPE and x.shape[1] == self.GEMV_POOLER_SHAPE[1]
                 and self._boundary_ok(x, x.shape, torch.bfloat16) and self._boundary_ok(w, w.shape, torch.bfloat16))
 
     def supports_gemv_all_gather_boundary(self, x: torch.Tensor, w: torch.Tensor, stream: torch.Tensor) -> bool:
-        """Whether :meth:`gemv_all_gather_boundary` can serve this call: bf16 ``x`` [T, 4096] (1 <= T <= 8), the bf16 weight rows
+        """Whether :meth:`gemv_all_gather_boundary` can serve this call: bf16 ``x`` [T, 4096] (1 <= T <= ``gemv_max_rows``, at most 8), the bf16 weight rows
         [1024, 4096] of this rank, fp32 ``stream`` [T, 8192]."""
         return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.gemv_max_rows
                 and tuple(w.shape) == self.GEMV_UNPOOLER_SHAPE and x.shape[1] == self.GEMV_UNPOOLER_SHAPE[1]
