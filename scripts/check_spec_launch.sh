@@ -162,8 +162,8 @@ if [ -n "${SPEC_EXPECT_FCSHARD:-}" ] && [ "$SPEC_EXPECT_FCSHARD" != "$fcs" ]; th
   echo "FAIL aux projection on the target's rows is $fcs in the log, expected $SPEC_EXPECT_FCSHARD"; rc=1
 fi
 # DFlash2 draft in FP8 (S1-9 L7): the state comes from the success lines, never from the flag
-FP8_F1_MAX_BYTES=${FP8_F1_MAX_BYTES:-11781017600}   # flag 1 (layers), cutlass: S1-7 stress S_live 1,278.4 MiB, 1,658,495 KV tokens per rank
-FP8_F2_MAX_BYTES=${FP8_F2_MAX_BYTES:-11573411840}   # flag 2 (layers + FP8 head), cutlass: S1-7 stress S_live 1,278.5 MiB, 1,629,269 KV tokens per rank
+FP8_F1_MAX_BYTES=${FP8_F1_MAX_BYTES:-11781017600}   # flag 1 (layers), cutlass, 0.32.0-derived (not re-derived on 0.33.0): S1-7 stress S_live 1,278.4 MiB, 1,658,495 KV tokens per rank
+FP8_F2_MAX_BYTES=${FP8_F2_MAX_BYTES:-11720212480}   # flag 2 (layers + FP8 head), cutlass, vLLM 0.33.0 (S1-13): S1-7 stress S_live 1,278.4 MiB, 1,649,935 KV tokens per rank (0.32.0: 11,573,411,840, 1,629,269)
 fp8_layers_re='DFlash2 draft weights in FP8 \(VLLM_MUSE_SPARK_SM120_DRAFT_FP8=[12], kernel (marlin|cutlass)\): 30 linear layers quantized'
 fp8=off; fp8k=-
 fp8_states=$(grep -a -o -E "$fp8_layers_re" "$log" | sed -E 's/.*FP8=([12]), kernel ([a-z]+)\).*/\1 \2/' | sort | uniq -c)

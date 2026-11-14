@@ -87,6 +87,18 @@ Cross-socket paths through switches 1 and 3 (NUMA 0 and 4) are 8-15 % slower tha
   230.8 H2D / 226.4 D2H). Host DMA of GPU0 concurrent with cross-socket P2P into the same switch shares the uplink (H2D 32.5 + P2P
   26.6 = 59 of 57.7 cap).
 
+#### Cell (a'): 8 concurrent SM-push cut flows on r^4 (S1-12, 2026-11-10)
+
+Eight cross-socket SM-push flows at once on the r^4 partner pairs, both directions (0<->4, 1<->5, 2<->6, 3<->7), one kernel per GPU (256 MiB message
+per flow, 150 ms window, per-flow median of 5 iterations, 2 repeats; P2P only, NIC untouched; measured on kernel 6.8.0-147, driver 595.91.07):
+
+* The per-flow pattern is the same at 4 / 8 / 16 CTAs per GPU: pairs 0<->4 and 1<->5 run ~8.3 GB/s each, pairs 2<->6 and 3<->7 ~5.5 GB/s each, sum 27.6 GB/s per direction. With 1 CTA per GPU the pairs run 9.7 / 6.4 GB/s, sum ~32 GB/s per direction. The 4 x min
+  score is 22.1 GB/s at 4-16 CTAs and 25.3-25.5 with 1 CTA. Plain `st.global` v4 and `st.volatile.global` v4 give
+  the same rates, so the store flavour is not the cause; CTA count does not matter from 4 up.
+* Beside intra-socket pushes (one 8-CTA push per GPU) a 1-CTA cut flow collapses to ~10-18 GB/s (4 x min; single flows 2.5-5.2 GB/s), while an
+  8-CTA cut flow keeps 22.1.
+* Source: `muse_wf/s1-12/acell_results.md` (raw files under `/raid/vllm-runtime/work/s1-12/acell/`).
+
 ### 2.4 The COLLAPSE RULE (the design constraint everything else follows from)
 
 A virtual switch must never have **concurrent outbound P2P (push or pull) to two different far-socket switches**, and must not mix
@@ -214,3 +226,4 @@ Checked on the rebuilt dev venv (nccl-tests 2.20.0 threaded `-g 8` and the 8-pro
 * With `NCCL_IB_DISABLE=1`: `NCCL_P2P_LEVEL=SYS` and the graph file behave as on 2.29.7 (default without SYS: 3>4 / 7>0 via SHM again;
   `graph_r4.xml`: 4 channels), the outputs are bitwise identical to 2.29.7 (27 shapes eager + graph, all ranks, every config) and the
   bus bandwidths match 2.29.7 (128 MiB 9173 vs 9135 us, +0.4 %; 8-64 KiB with SYS only +1.2-1.5 us, +3 %; with the graph file equal). The graph file needs IB disabled ("Could not find NET with id 0" otherwise).
+* Since 2026-11-10 the ConnectX-7 is in IB mode (the failure above was seen with RoCE); `NCCL_IB_DISABLE=1` stays required (`env/host.env`, `scripts/py_topo.sh`).
