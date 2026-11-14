@@ -32,7 +32,7 @@
 # against R2E_ON_MAX_BYTES. SPEC_EXPECT_FP8=off|1|2 and SPEC_EXPECT_FP8_KERNEL=cutlass|marlin demand the state (default: no expectation unless this shell exports the flag).
 # S1-9 L11 (sequence parallel inside the FULL decode graphs, MUSE_SPEC_GRAPH_SP_MIN_TOKENS / MUSE_SPEC_GRAPH_CAP of env/spec_k7.env, both off / 256 by default): the vLLM branch logs, once per boot and only when the graph floor is on,
 # "sequence parallel inside FULL decode CUDA graphs for batches of at least <g> tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=<env>; decode MoE engines serve up to <E> tokens; eager, mixed and PIECEWISE batches keep the floor of <floor> tokens)".
-# The state is read from that line, never from the env: SPEC_EXPECT_GRAPH_SP=off|<g> demands it (default: this shell's MUSE_SPEC_GRAPH_SP_MIN_TOKENS if it is exported and not 0; an expected value is raised to the engine limit E + 1 of the line, the vLLM
+# The state is read from that line, never from the env: SPEC_EXPECT_GRAPH_SP=off|<g> demands it (default: this shell's MUSE_SPEC_GRAPH_SP_MIN_TOKENS or, as exported by env/spec_k7.env, VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS if it is exported and not 0; an expected value is raised to the engine limit E + 1 of the line, the vLLM
 # rule: 129 in production), else no demand), the floor on the line must be the floor of the first line and max(<env>, E + 1), and a
 # set VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS without the line (a warning of the vLLM branch: no graphs, or a tree without the feature) FAILS. The default expected floor is max(384, cap + 1) (the eager floor is cap + 1 above 383).
 # The line alone does not prove that a graph is sharded (it is printed from the env, also with a PIECEWISE-only or FULL-mixed capture list): the graph manager also logs, once per worker,
@@ -92,6 +92,10 @@ fi
 want_gsp=${SPEC_EXPECT_GRAPH_SP:-}
 if [ -z "$want_gsp" ] && [ "${MUSE_SPEC_GRAPH_SP_MIN_TOKENS:-0}" != 0 ]; then
   want_gsp=$MUSE_SPEC_GRAPH_SP_MIN_TOKENS
+fi
+# the profile of env/spec_k7.env exports the vLLM variable itself (not the MUSE_SPEC_ one): a shell that sourced it is the expectation
+if [ -z "$want_gsp" ] && [ "${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-0}" != 0 ]; then
+  want_gsp=$VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS
 fi
 if [ -n "$want_gsp" ] && [ "$want_gsp" != off ]; then
   # an expected value is raised to the engine limit + 1 of the boot, as the vLLM branch does (the limit is on the line)

@@ -301,15 +301,16 @@ the eager bits, the FP8 head's cross-rank top-k returns the aimed token of every
 **Not done / limits.** The eager rows above 256 draft rows (c33 and up) gain a fraction of the microbench prediction (two Python-wrapped ops per FP8 linear, ~40-55 us of CPU per layer; measured +0.7 .. 1.5 % STEADY at c40 .. c128 against -1.5 % predicted at c64);
 a fused act-quant or one composite custom op is the follow-up. Marlin and the per-M torch rowwise GEMM switching were not built into the default.
 
-## S1-9 L11: sequence parallel inside the FULL decode graphs (A1a / A1b), OFF by default
+## S1-9 L11: sequence parallel inside the FULL decode graphs (A1a adopted, ON in the profile; A1b not adopted)
 
-**Status: implemented and tested, microbenched, NOT adopted: the gate (3 sessions, real prompts, guards, GSM8K, determinism, exact bytes) has not run.**
-`env/spec_k7.env` and `scripts/check_spec_launch.sh` carry the switches; with both at their defaults the sourced environment, `MUSE_SPEC_SERVE_ARGS`, the KV bytes and every boot check
-are the production ones (checked: the `env` dump after sourcing is identical to host 3cc7825, and a feature-tree boot with the flags unset is the `off_OFF` row below).
+**Status: A1a ADOPTED by the pre-registered gate of 2026-11-06 / 07 (one lock hold of 13.5 h, 4 counterbalanced boot groups, exact bytes, determinism, GSM8K): `env/spec_k7.env` sets `MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136` by default
+(exports `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136`), capture list and KV bytes unchanged (11,573,411,840, 1,629,269 KV tokens per rank). A1b (`MUSE_SPEC_GRAPH_CAP=384`) failed its rule and stays opt-in.
+The profile needs a vLLM tree with the feature (6da60b3062 + the L11 commits, `268c64b0e2`): `check_spec_launch.sh` fails a boot that logs no graph-floor line or no flagged FULL decode graph at or above the floor. Set
+`MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0` to restore the previous profile (the vLLM default of the variable itself stays 0: the non-speculative launches never see it).** Gate results: section "Gate" below.
 
 ### What it changes
 
-The vLLM branch (muse/s19-graphsp, 3 commits on 6da60b3062) shards the residual stream inside the FULL decode CUDA graphs from a floor of its own,
+The vLLM branch (muse/s19-graphsp, 6 commits on 6da60b3062, tip 268c64b0e2) shards the residual stream inside the FULL decode CUDA graphs from a floor of its own,
 
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=<n>   (default 0 = off; raised to 129, the muse decode engine's 128 tokens + 1)
 
@@ -333,12 +334,16 @@ with the host plugin's collectives the reduce-scatter + gather equals the all-re
 
 ### Launch lines
 
-    A1a:  MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136 source env/spec_k7.env      -> VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136, graphs <= 256, bytes 11,573,411,840 (safe, not exact: the pool shrinks 24 MiB)
-    A1b:  MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136 MUSE_SPEC_GRAPH_CAP=384 MUSE_SPEC_KV_BYTES_OVERRIDE=<S1-7 bytes of the cap> source env/spec_k7.env     (a cap above 256 without the override logs a warning: the bytes are the cap-256 ones)
-    check: SPEC_EXPECT_GRAPH_SP=136 [SPEC_CAP_MAX_BYTES=<bytes>] scripts/check_spec_launch.sh serve.log [385 384]
+    A1a (adopted, the default of the profile):  source env/spec_k7.env     -> VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136, graphs <= 256, bytes 11,573,411,840 (exact: S_live 1,302.5 MiB, the pool is 24 MiB smaller)
+    off:                                        MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0 source env/spec_k7.env   (the profile of S1-9 L7)
+    A1b (not adopted):  MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136 MUSE_SPEC_GRAPH_CAP=384 MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520 source env/spec_k7.env     (a cap above 256 without the override logs a warning: the bytes are the cap-256 ones)
+    check: scripts/check_spec_launch.sh serve.log        (a shell that sourced the profile is the expectation; SPEC_EXPECT_GRAPH_SP=off|<n> [SPEC_CAP_MAX_BYTES=<bytes>] ... [385 384] for another state)
 
-`check_spec_launch.sh` reads the graph-floor line of the boot log ("sequence parallel inside FULL decode CUDA graphs for batches of at least <g> tokens ..."), not the env; the floor on it must be the eager floor
-of the first line (cap + 1 above a cap of 383); a graph floor at or below 128, a set vLLM env without the line, or a cap above 256 without `SPEC_CAP_MAX_BYTES` FAIL (`bench/test_check_spec_launch.sh`: 21 synthetic-log cases).
+`check_spec_launch.sh` reads the graph-floor line of the boot log ("sequence parallel inside FULL decode CUDA graphs for batches of at least <g> tokens (...MIN_TOKENS=<env>; decode MoE engines serve up to <E> tokens; eager, mixed and PIECEWISE
+batches keep the floor of <f> tokens)"), not the env: the floor on it must be the eager floor of the first line (cap + 1 above a cap of 383) and max(env, E + 1) with E the engine limit named on the line (129 in production; the
+review fix: the rule is no longer hard-coded). Since the review it also reads the graph manager's line "CUDA graphs: <N> FULL decode graphs are flagged full_decode_graph (token counts <lo>..<hi>), ..." from every worker and FAILS an armed boot
+unless N > 0 and hi >= the floor (a capture list without FULL decode graphs, e.g. PIECEWISE only, printed the floor line and sharded nothing). A set vLLM env without the floor line, a cap above 256 without `SPEC_CAP_MAX_BYTES`, and
+workers that disagree FAIL (`bench/test_check_spec_launch.sh`: 40 synthetic-log / profile cases, no GPU).
 
 ### Graph safety (host plugin collectives inside the FULL graphs)
 
@@ -353,19 +358,23 @@ reduce-scatter / all-gather of the sharded stream are captured and replayed like
   `all_gather` shapes (17..., 8192 bf16 etc.), 0 `-> nccl`, 0 errors / tracebacks / OOM in every boot, and the per-size op log reads `capturing=False` (the FULL warm-up) before `capturing=True` at 136, 272 and 384 although
   the PIECEWISE graphs are captured first: the PIECEWISE passes (mixed batches) are never sharded.
 
-### Tests (feature tree 2fd5205acc = muse/s19-graphsp, server tree src_s19-graphsp, host mirror host_topo_s19-graphsp)
+### Tests (feature tree 5b65462cbf = 268c64b0e2 after the message rewrite, same tree 730da5ec2e29; server tree src_s19-graphsp, host mirror host_topo_s19-graphsp; chain t2 of the fix round)
 
 | suite | feature tree | production tree (6da60b3062) |
 |---|---|---|
-| Muse suite (tests/kernels/{moe,core}/test_muse_spark*.py, 1 GPU) | 3666 passed / 200 skipped / 0 failed | 3645 / 199 (L7): +21 new CPU tests, +1 skip = the new 8-GPU test on 1 GPU |
-| SP file, 8 GPUs, NCCL | 99 passed | 77 (L10) + 22 new |
-| SP file, 8 GPUs, host plugin | 97 passed, 2 failed (world-2 variants of test_sharded_branch_*: `NCCL error: unhandled system error` under host.env) | the same 2 fail on the production tree |
-| r2e file (test_muse_spark_sm120_prefill_overlap.py), 8 GPUs | 53 passed / 8 skipped; with MUSE_R2E_REAL_CONFIG=1 (NCCL and host plugin) 61 passed | - |
-| tests/v1/spec_decode + target-dependent AR speculator | 100 failed / 490 passed / 11 skipped, failing set identical to production's (diff empty vs L6 spec_base.failed) | 100 |
-| tests/v1/cudagraph + worker cudagraph / ubatch / attn_utils files | 12 failed / 277 passed / 2 skipped | 12 failed / 270 passed / 2 skipped, failing set identical |
-| bench/test_check_spec_launch.sh (host, no GPU) | 24 cases pass | - |
+| Muse suite (tests/kernels/{moe,core}/test_muse_spark*.py, 1 GPU) | 3690 passed / 201 skipped / 0 failed | 3645 / 199 (L7): +45 new tests (21 CPU of the implementation, 24 of the review round: flagged-graph line, replay self-check, prefetch lists, engine limit), +2 skips = the 8-GPU tests on 1 GPU |
+| SP file, 8 GPUs, NCCL | 104 passed | 77 (L10) + 27 new |
+| SP file, 8 GPUs, host plugin | 102 passed, 2 failed (world-2 variants of test_sharded_branch_*: `NCCL error: unhandled system error` under host.env) | the same 2 fail on the production tree |
+| r2e file (test_muse_spark_sm120_prefill_overlap.py), 8 GPUs | 53 passed / 8 skipped (NCCL and host plugin); with MUSE_R2E_REAL_CONFIG=1 61 passed | - |
+| tests/v1/spec_decode + target-dependent AR speculator | 100 failed / 490 passed / 11 skipped, failing set identical to production's | 100 |
+| tests/v1/cudagraph + worker cudagraph / ubatch / attn_utils files | 12 failed / 284 passed / 2 skipped | 12 failed / 270 passed / 2 skipped, failing set identical |
+| bench/test_check_spec_launch.sh (host, no GPU) | 40 cases pass | - |
 
-### Microbench in real boots (STEADY step ms, c requests with long outputs, 3 x 10 s windows per cell, engine counters, GPU 0 clocks sampled; round-6 driver `drive_r6.py`)
+New in the review round: `test_sharded_moe_collectives_replay_from_a_full_decode_graph` (8 GPUs, NCCL and host plugin): the gathers of the routes ([rows, 16] int32) and the packed latent ([rows, 2304] uint8), the reduce-scatter of the experts' [T, 4096] partial
+sums and the gather of the aux combiner's rows in `forward_sequence_parallel`'s order, captured at 136..512 tokens, bits equal to the eager pass, 20,000 replays at 136 and 272 tokens next to eager calls of other sizes, every rank the same rows,
+reduce-scatter == all-reduce (host plugin: rel 1e-6 bound, NCCL 1e-2); the opt-in full-model replay self-check (`VLLM_CUDAGRAPH_REPLAY_SELFCHECK=1`, `..._MIN_TOKENS=136`); the L2 prefetch hooks warm no pooler / unpooler slice on the sharded stream.
+
+### Microbench of the implementer in real boots, before the gate (STEADY step ms, c requests with long outputs, 3 x 10 s windows per cell, engine counters, GPU 0 clocks sampled; round-6 driver `drive_r6.py`)
 
 Protocol: production speculative line (host.env + env/spec_k7.env of the host mirror, FP8 draft 2, FC shard 2, r2e, MNBT 8199, real weights, TP8 + EP8), 3 boot groups, every group boots CTL / A1a / A1b384 back to back
 (order rotated: CTL-A1a-A1b, A1b-CTL-A1a, A1a-A1b-CTL), cells c1 (cold), c16, 20, 24, 28, 32, 33, 36, 40, 44, 47, 48, 49, 50, 56, 64, c1 again (after the sequence-parallel band); differences are paired inside the boot group
@@ -426,9 +435,43 @@ mixed batches of 257 .. 384 tokens into PIECEWISE graphs (replicated): measured 
 (probe, SP also in the PIECEWISE passes: c24 +0.8, c28 +3.4, c32 +4.0 with A1a; c36 +5.9, c40 +5.5, c44 +6.7, c48 +2.9 with A1b). No failed requests, TTFT not worse in any cell, acceptance length 4.45 .. 4.58 for CTL and 4.46 .. 4.60 for A1a / A1b (never more than 0.02 below CTL in a cell).
 KV trade of A1b384 (estimate): -2.0 % KV tokens per rank against +4.4 .. +7.9 % real-prompt tok/s at c36 .. c48 (c33..c47 band) in this one session.
 
-### Not done here (the gate, SG_COMMON template)
+### Gate (SG_COMMON template, pre-registered `ADOPTION_RULE.txt` frozen before the first A/B boot; one lock hold 2026-11-06 19:59 .. 2026-11-07 09:25, the exact bytes in an earlier hold 18:42 .. 19:59)
 
-3 counterbalanced sessions with the pre-registered rule, real-prompt c28 .. c48 (primary) and guards c1 / c16 cold AND after SP-band traffic, c56 .. c128, TTFT 8k / 16k / 32k and low-c TTFT of 300 .. 3000-token prompts, churn,
-non-speculative c1 / c64, GSM8K-with-speculation 200x2 c64, offline two-cold-process determinism, the S1-7 exact bytes of A1a (the pool is 24 MiB smaller than production's) and of A1b384; merge and deploy of vLLM branch then host folder.
-`MUSE_SPEC_GRAPH_SP_MIN_TOKENS` stays 0 and `MUSE_SPEC_GRAPH_CAP` 256 in the shipped profile until then. The graph floor needs FULL decode CUDA graphs (the default cudagraph mode); with PIECEWISE only it does nothing and
-the boot log still prints the floor line. Under `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=auto` the row gate admits few sizes, so most graph batches stay replicated (the branch's default is the forced mode).
+**Arms**: CTL = production tree + production host folder; OFF = the feature tree with the graph floor unset (tree / host-path control); A1a = graph floor 136, cap 256; A1b = graph floor 136 + `--max-cudagraph-capture-size 384`; each at its exact bytes,
+4 boot groups in a counterbalanced order (every arm once per position), plus two c1 layout-control boots each of OFFB (OFF at A1b's bytes) and CAPB (cap 384, no graph floor, A1b's bytes). 20 speculative boots of ~40 min (STEADY c1 / c8 / c16 / c17..c48 / c56..c128
+with 2 windows of 12 s per ramp, real greedy / default c1..c128, churn, TTFT 8k / 16k / 32k, low-c TTFT of 200..3000-token prompts at c1 / c4 / c16 and next to 8 / 16 / 24 decoders), 6 non-speculative boots, 3 GSM8K boots (A1a c64 and c32, production c64: the A1b arm was not taken to GSM8K), 8 determinism processes; 0 retries,
+every boot healthy (cfgcheck OK, 0 preemptions, launch check and arm check OK). Scoring paired inside the boot groups (t crit 3.18 at 4 groups); the c1 / c16 guards compare the worst state of each boot.
+
+**Exact bytes** (S1-7 procedure, probe tree, REPS = 2, stress A1 B C1 C2 D H I L M X, MNBT 8199): A1a at the production bytes 11,573,411,840: clean, S_live 1,302.5 MiB (production 1,278.5), idle free 3,111.4 MiB (production 3,087.4), 1,629,269 KV tokens per rank:
+**no KV cost, bytes unchanged**. A1b at production - 216 MiB = 11,346,923,520 (554,049 blocks, 1,597,384 KV tokens per rank): clean, S_live 1,278.5 MiB = production's: A1b costs 1.957 % of the KV tokens (31,885 per rank).
+
+**A1a against the flag-off tree** (OFF; paired, 4 groups; gain = faster / more tok/s):
+
+| cell | gain | beyond noise |
+|---|---|---|
+| real greedy c24 / c28 / c32 out tok/s | +0.92 / +2.28 / +2.29 %, pooled **+1.83 %** (production delta +1.64 %) | yes (rule: >= +1.0 %) |
+| STEADY step c20 / c24 / c28 / c32 | +1.86 / +3.03 / +5.28 / +6.99 %, pooled **+4.29 %** | yes (rule: >= +2.0 %) |
+| STEADY step c17 / c18 / c19 / c21 (band start) | +0.77 / +1.12 / +1.83 / +2.97 % | yes: no cell slower, the floor stays 136 |
+| STEADY c56 / c64 / c96 / c128 | +0.10 / +0.21 / +0.14 / -0.31 % | noise (rule: not worse than -1.0 %) |
+| c1 / c16 worst state | +0.28 % / -0.11 % (production +0.98 % / +0.01 %) | noise |
+| real greedy c1 / c16 / c56 / c64 / c96 / c128 | 0.00 / +0.89 / -0.05 / -0.13 / +0.55 / +0.26 % | noise |
+| real default c1 / c16 / c64 / c128, churn c64 | +0.01 / -0.12 / +0.40 / +0.44 %, +0.29 % | noise |
+| TTFT 8k / 16k / 32k | +0.13 / +0.02 / -0.18 % | noise |
+| low-c TTFT, pooled over the 10 lengths: c1, c16, c1 + 8 / 16 / 24 decoders | +0.19 / +0.45 / +1.56 / +0.09 / **+7.1 %** | only the last (next to 24 decoders: the decode steps are faster) beyond noise |
+| acceptance length | draft-weighted dAL -0.0001 over 19 cells; worst cell greedy c48 -0.037 (z -2.79 < 3.01, tok/s guard passes) | no trip |
+
+Non-speculative guard (ON = feature tree defaults vs production, 3 groups): real greedy c1 / c64 -0.02 / +0.26 %, default c1 / c64 +0.02 / -0.28 %, STEADY c1 / c64 +0.01 / -0.11 %: noise. Determinism: two cold offline processes (TP8 + EP8, 85 prompts of 9..23,000 tokens, 128 new tokens,
+12 passes: greedy, t1k64, top_p variants, mixed, repeats) identical in every pass at mns 128 / cap 256 and with the batches pinned into the band (mns 24: T = 136..192 almost every step), and for A1b at mns 128 / cap 384 and mns 40; the full-model replay self-check
+(`VLLM_CUDAGRAPH_REPLAY_SELFCHECK=1`, graphs >= 136 tokens: 16 / 8 / 24 / 20 graphs, all 8 workers) found every graph bit for bit equal to its flagged eager pass, twice. GSM8K 200x2 with speculation: A1a at c64 greedy 389/400 (97.25 %, band 95.5-98.0; production
+388 = 97.00 %), default sampling 395 (production 395), top_p 0.95 394 (392), mixed top_p 395 (394); at c32 greedy 389, default 393 (the c32 boots run greedy and default only: the top_p lines read MISSING by design); 0 request errors.
+
+**A1b (capture list 384) failed its rule**: STEADY c33 / c36 / c40 / c44 / c47 / c48 are +11.6 / +14.6 / +14.8 / +15.2 / +13.7 / +4.1 % faster than A1a, but the real-prompt cells c36 / c40 / c44 / c48 are only +2.67 / +2.63 / +3.25 / +1.66 % (pooled
+**+2.55 %** against the pre-registered threshold 1.96 % KV lost + 2.0 points = 3.96 %: the real rows are bursts of 128-token outputs, probably dominated by prefill and ramp, which dilutes the decode gain; not separated further), and the cap moves the mixed-step edge: the TTFT of a 256-token prompt next to 16 decoders (mixed step of
+384 tokens: eager SP in production, a replicated PIECEWISE graph with the capture list) is 7.5 % worse than the flag-off tree (6.7 % vs production, 6.8 % vs A1a), a 257-token prompt next to 8 decoders (321 tokens) 6.5 % worse than production, and bare 257 / 384-token prompts 5.1 % worse than
+A1a: the predicted side effect of a capture list above 256, measured. c56 / c64 / c96 / c128 and churn of A1b are fine (churn +0.99 %). The c4 low-c TTFT row is bimodal (the TTFT of four simultaneous probes comes in ~240 / ~480 ms steps with the arrival order): informational in practice, it did not trip.
+
+c1 two-state variable (the review's item): in this protocol (12 s windows, 2 per ramp, c1 after c8 and after c40) the worst-state c1 ms of a boot are CTL 17.33 / 17.68 / 17.39 / 17.55, OFF 17.26 / 17.30 / 17.29 / 17.61, A1a 17.24 / 17.33 / 17.44 / 17.26, A1b 17.32 / 17.69 / 17.28 / 17.39, the
+layout controls OFFB 17.29 / 17.22 and CAPB 17.31 / 17.99: the bumps (17.5 .. 18.0 in the cell after c8, or after c128) appear in every arm including production and the layout controls: not attributable to the arm.
+
+Evidence: server `/raid/vllm-runtime/work/s1-9/L11/g/` (ADOPTION_RULE.txt, verdict.txt, master_l11.log, scripts, determinism outputs), `musetest/results/s19l11g_*` (A/B), `s19l11gd_*` (c1 controls), `s19l11n_*` (non-speculative), `s19l11x_*` (stress boots),
+`s19l11g_gsm_*` (GSM8K); local `/tmp/muse_wf/s1-9/L11/` (PROGRESS.md, gate/, verdict_final.txt, master_l11.log).

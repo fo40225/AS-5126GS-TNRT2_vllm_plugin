@@ -34,6 +34,9 @@ run prod 1 "production boot, vLLM env set in the shell but no log line" VLLM_MUS
 mk a1a 384 256 "136 136 384"
 run a1a 0 "A1a boot (graphs 256, graph floor 136)" SPEC_EXPECT_GRAPH_SP=136 -- "$d/a1a/serve.log"
 run a1a 0 "A1a boot, expectation from the shell flag" MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136 -- "$d/a1a/serve.log"
+run a1a 0 "A1a boot, expectation from the vLLM variable of the sourced profile" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136 -- "$d/a1a/serve.log"
+run a1a 1 "A1a boot, profile exports a different vLLM floor (264)" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=264 -- "$d/a1a/serve.log"
+run prod 1 "production boot, profile exports the graph floor but the boot has no line" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136 -- "$d/prod/serve.log"
 run a1a 1 "A1a boot, graph floor demanded off" SPEC_EXPECT_GRAPH_SP=off -- "$d/a1a/serve.log"
 run a1a 1 "A1a boot, another graph floor demanded" SPEC_EXPECT_GRAPH_SP=264 -- "$d/a1a/serve.log"
 mk a1a_big 384 256 "136 136 384" 11000000000
@@ -84,7 +87,10 @@ run wrongraise 1 "graph floor 200 is not max(env 136, engine 128 + 1)" -- "$d/wr
 # env/spec_k7.env: off is a property of sourcing the profile
 got=$(env -i PATH="$PATH" bash -c "MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136; source $here/env/spec_k7.env; a=\${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}; MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0; source $here/env/spec_k7.env; echo \$a \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}" 2>&1)
 if [ "$got" = "136 unset" ]; then echo "ok   spec_k7.env: a re-source with the flag at 0 unsets the vLLM variable"; else echo "FAIL spec_k7.env re-source: got '$got' wanted '136 unset'"; fails=$((fails+1)); fi
-got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136 bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}" 2>&1)
+got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=264 MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0 bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}" 2>&1)
 if [ "$got" = "unset" ]; then echo "ok   spec_k7.env: a stray vLLM variable does not survive the profile at flag 0"; else echo "FAIL spec_k7.env stray variable: got '$got'"; fails=$((fails+1)); fi
+# the adopted default (S1-9 L11 gate): the profile arms the graph floor 136 on the production capture list, bytes unchanged
+got=$(env -i PATH="$PATH" bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset} \$MUSE_SPEC_GRAPH_CAP \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
+if [ "$got" = "136 256 11573411840 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199" ]; then echo "ok   spec_k7.env: the default profile is A1a (graph floor 136, cap 256, production bytes)"; else echo "FAIL spec_k7.env default profile: got '$got'"; fails=$((fails+1)); fi
 [ $fails = 0 ] && echo "ALL CASES PASSED" || echo "$fails case(s) FAILED"
 exit $((fails > 0))
