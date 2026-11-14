@@ -1,13 +1,15 @@
 #!/bin/bash
 # Server side, one GPU-lock acquisition: tests, medium all-reduce sweep, table generation, dispatch check, real-weight
 # concurrency A/B (bf16 exchange of the medium all-reduce off / on) and the GSM8K smoke of the "on" configuration.
-# usage: HOST_DIR=<host folder> r3c_chain.sh <tag> [stages]     stages (default all): test sweep reg disp e2e acc
+# usage: [HOST_DIR=<host folder>] [SRC=<vLLM tree>] r3c_chain.sh <tag> [stages]
+# stages (default all): test sweep reg disp e2e acc
 # Results: work/r3c-medium-ar/<tag>/ (rows, tuning.json, table.md, logs) and musetest/results/<tag>_conc_bx{0,1}, <tag>_acc.
 tag=$1; stages=${2:-"test sweep reg disp e2e acc"}
 H=${HOST_DIR:-/raid/vllm-runtime/host_topo_r3c-medium-ar}
 M=/raid/vllm-runtime/work/r3c-medium-ar
 W=/raid/vllm-runtime/work/host
-SRC=${SRC:-/raid/vllm-runtime/sm120-dev/src_r3c-medium-ar}
+# exported: py_topo.sh puts it on PYTHONPATH, and test_medium_bx.py (seq group) imports the vLLM Triton kernels from it
+export SRC=${SRC:-/raid/vllm-runtime/sm120-dev/src}
 R=/raid/vllm-runtime/musetest/results
 O=$M/$tag
 export HOST_DIR=$H
