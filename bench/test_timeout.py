@@ -1,4 +1,4 @@
-"""Throwaway test: when one rank skips a collective the others must abort with an error instead of hanging.
+"""Regression test: when one rank skips a collective the others must abort with an error instead of hanging.
 
 usage: py_topo.sh bench/test_timeout.py
 Rank 3 never calls the all-reduce; every other rank calls it with a 3 s spin timeout and must die (exit code 3)

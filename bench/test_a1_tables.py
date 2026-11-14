@@ -214,7 +214,7 @@ def run(rank, args):
         for name, ok in table_checks(C):
             ck("tables " + name, ok)
 
-    # sizes: the verify bands / prefill messages (docs/a1_table_retune.md) and every bound of the tables (and the next row size above)
+    # sizes: the verify bands / prefill messages (S1-9 retune of the large-message tables) and every bound of the tables (and the next row size above)
     band_T = (8, 16, 32, 64, 128, 192, 256, 320, 384, 512, 768, 1024)
     ar_sizes = set()
     for T in band_T:

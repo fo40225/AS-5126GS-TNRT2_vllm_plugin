@@ -3,7 +3,7 @@
 # dev venv against a vLLM source tree with the host folder on PYTHONPATH (muse_topo plugin discovery) and env/host.env.
 # usage: [SRC=<tree>] [GPU=<ids>] [HOST_DIR=<host folder>] runsrc_topo.sh <python args...>
 # The host folder defaults to the one this script lives in. Uses the shared dev caches (JIT builds of muse_c, Triton, and
-# muse_topo under $VLLM_CACHE_ROOT/muse_topo/<digest>); scratch output belongs to the caller (server: work/host/).
+# muse_topo under $VLLM_CACHE_ROOT/muse_topo/<digest>); scratch output belongs to the caller (see $MUSE_TEST_SCRATCH in scripts/py_topo.sh).
 HOST=${HOST_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 export CUDA_VISIBLE_DEVICES=${GPU:-0}
 export CUDA_HOME=/usr/local/cuda

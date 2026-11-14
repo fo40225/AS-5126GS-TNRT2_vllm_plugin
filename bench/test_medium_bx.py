@@ -1,8 +1,9 @@
 """Standalone 8-process tests of the bf16 exchange of the medium all-reduce (algorithm 2 with BX, r3c), no vLLM model.
 
 usage: [SRC=<vLLM tree>] py_topo.sh bench/test_medium_bx.py [--quick] [--groups a,b,...]
-SRC is needed by the seq group (it imports vLLM's Triton boundary / RMSNorm kernels from the tree); r3c_chain.sh and
-run_r3c.sh export it (default /raid/vllm-runtime/sm120-dev/src).
+SRC is needed by the seq group (it imports vLLM's Triton boundary / RMSNorm kernels from the tree; set it to
+/raid/vllm-runtime/sm120-dev/src on the server). The hard-correctness groups: --groups emu,bits,det,disp,seq,rsar
+(run it under scripts/locked_job.sh, with BENCH_WATCHDOG_S=900).
 Groups (each check prints PASS/FAIL once, aggregated over the 8 ranks):
   emu     algorithm 2 with bf16 exchange == torch emulation (both island partials rounded to bf16, one final rounding)
           for 64 KiB .. 4 MiB, several (grid, block, unroll), randn / mixed / zeros / negzeros (mostly -0.0) inputs

@@ -9,7 +9,7 @@
 #                                                              0.3 GiB shmem each) and, on node 3 the EngineCore (1.2 GiB), on node 7 the API server (1.3 GiB)
 #   LEFT_N  = A_N - NEED_N                                     predicted reclaimable memory left once the server is up
 # FAIL (exit 1) when any LEFT_N < MUSE_OFFLOAD_MIN_LEFT_MIB (default 4,096: the floor of the original G3 guard); WARN when LEFT_N < the margin M = 6.6 GiB of the
-# sizing formula (docs/s110_numa_offload.md section 4). Measured with the 0.32.0 45 GiB tier on node 7: 10.4 GiB left at READY (the 0.33.0 tier P* is 48.26 GiB per rank, node 7 binds it).
+# sizing formula (README section 5). Measured with the 0.32.0 45 GiB tier on node 7: 10.4 GiB left at READY (the 0.33.0 tier P* is 48.26 GiB per rank, node 7 binds it).
 # Only a server of ours may be running: workers already up are counted in neither A_N nor W_N here (a second server would make the numbers meaningless).
 # OOM protection (not done here): start the server session with `echo 1000 > /proc/self/oom_score_adj` so that an OOM kill of this launch hits the server and
 # never a foreign process (the S1-10 harness did this for every process of its session).

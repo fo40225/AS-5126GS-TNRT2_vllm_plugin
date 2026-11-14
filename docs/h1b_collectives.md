@@ -15,7 +15,7 @@ arguments).
 | `ag_flag_body`: the H1a flag all-gather as a device function over a virtual grid, with chunk offset / total size | `csrc/ag_body.cuh` (used by `flag.cu`, `large.cu`) |
 | host chunk loops `reduce_scatter`, `all_reduce_large`, `all_gather_large` | `csrc/bindings.cpp` |
 | dispatch tables, `supports()` / `all_reduce` / `reduce_scatter` / `all_gather` large paths | `collectives.py` |
-| tests `tests_h1b.py`, `test_timeout_large.py`; benchmarks `bench_h1b.py`, `ce_cut_probe.py`; runner `run_h1b.sh` | `bench/` |
+| tests `tests_h1b.py`, `test_timeout_large.py`; runner `run_h1b.sh` | `bench/` |
 
 ## Dataflow and arithmetic
 
@@ -71,7 +71,7 @@ class `deterministic_different` and the default OFF.
 **Since r3c the 2 MiB boundary statements in this document (above and in the dispatch table below) are the state of H1b.** With the
 flag on and `MUSE_TOPO_MEDIUM_BX` not 0 (the `env/host.env` defaults) the medium all-reduce (algorithm 2) also rounds the partials from
 64 KiB (`ar_bx_min`), so the exact / bf16-exchange boundary of the bf16 all-reduce is 64 KiB, not 2 MiB, and reduce_scatter and
-all_reduce agree bitwise from 128 KiB; the 2 MiB switch applies with `MUSE_TOPO_MEDIUM_BX=0` only (`docs/r3c_medium_ar.md`).
+all_reduce agree bitwise from 128 KiB; the 2 MiB switch applies with `MUSE_TOPO_MEDIUM_BX=0` only (README section 8).
 
 ## Dispatch (collectives.py)
 
@@ -79,18 +79,18 @@ all_reduce agree bitwise from 128 KiB; the 2 MiB switch applies with `MUSE_TOPO_
 |---|---|---|
 | all_reduce | nbytes < 2 MiB (and <= `max_bytes`, multiple of 64 B) | H1a algorithm 2 (unchanged) |
 | all_reduce | nbytes >= 2 MiB, multiple of 128 B, <= 2 GiB | large: fused reduce-scatter + all-gather pipeline, `_AR_LARGE_TABLE` |
-| reduce_scatter | T % 8 == 0, bf16/fp16/fp32, message >= 128 KiB, multiple of 128 B | large reduce-scatter, `_RS_TABLE` (`_RS_BX_TABLE` for bf16 while the bf16 exchange is on, S1-9 L9 A1: docs/a1_table_retune.md; otherwise `supports` is False -> NCCL) |
+| reduce_scatter | T % 8 == 0, bf16/fp16/fp32, message >= 128 KiB, multiple of 128 B | large reduce-scatter, `_RS_TABLE` (`_RS_BX_TABLE` for bf16 while the bf16 exchange is on, S1-9 L9 A1; otherwise `supports` is False -> NCCL) |
 | all_gather | shard < 256 KiB (<= 1 MiB) | H1a LL8 / flag kernels (unchanged) |
 | all_gather | shard >= 256 KiB, 16 B multiples (row bytes too for dim -1) | large all-gather chunk engine, `_AGL_TABLE` (any size, chunked) |
 
 (With the bf16 exchange on, bf16 all-reduces between 64 KiB and 64 MiB are served by algorithm 2 (messages above `max_bytes` as row slabs of at most 4 MiB) instead of this
-row, see `docs/r3c_medium_ar.md` and `docs/a1_table_retune.md`; the large pipeline remains the path of the exact exchange and of everything above 64 MiB.)
+row, see README section 8; the large pipeline remains the path of the exact exchange and of everything above 64 MiB.)
 
 Everything else (other dtypes, non-contiguous, odd sizes, world != 8) is rejected by `supports()` and falls back to NCCL.
-The tables were produced with `bench/bench_h1b.py --search` (coordinate descent over mode, chunk, blocks, threads, unroll, cut
+The tables were produced with a (not kept) benchmark search (coordinate descent over mode, chunk, blocks, threads, unroll, cut
 blocks, ramp, PDL per size, every candidate verified bitwise) and are in `collectives.py` with the measured numbers in comments.
 
-## Results (details: docs/h1b_latency.md)
+## Results
 
 CUDA graph, back-to-back, bf16, dispatch path, NCCL = vLLM PyNcclCommunicator with `NCCL_P2P_LEVEL=SYS`:
 
@@ -108,7 +108,7 @@ Medium sizes: all_reduce 2-8 MiB 1.14-1.31x (H1a algorithm below 2 MiB), reduce_
 out 3.0-1.4x. Workspace: no new allocation (the large algorithms reuse the H1a regions: 61.1 MiB per GPU in total, as before).
 
 Why not more: all_reduce moves per GPU and 1 MiB-per-block chunk 12 MiB over the island plus 3 MiB over the socket cut (fp32 partials 2 MiB,
-bf16 results 1 MiB); the cut carries ~9.8 GB/s per GPU for any transport (SM push from one block, copy engine; measured, docs/h1b_latency.md) and
+bf16 results 1 MiB); the cut carries ~9.8 GB/s per GPU for any transport (SM push from one block, copy engine; measured) and
 the SM stores saturate at ~45 GB/s per GPU, so a pure-copy kernel with this byte mix already needs 401 us per step; the shipped
 fused step runs at ~420 us. The H1a-style exact exchange cannot go below S/4 bytes of fp32 partials per GPU over the cut (the
 bf16 exchange halves that part). NCCL's ring moves 1.75 S over one cut link per direction at ~25 GB/s busbw; the 4 parallel

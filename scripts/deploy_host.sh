@@ -3,7 +3,7 @@
 # usage: [DEST=<server dir>] [FROM=<local dir>] scripts/deploy_host.sh [extra rsync args]
 # FROM defaults to the folder this script lives in; DEST defaults to /raid/vllm-runtime/host_topo. Experiments that must
 # not disturb the main mirror use another FROM copy and another DEST directory.
-# Note: this syncs the host folder only; tools/deploy.sh and tools/deploy_to.sh sync a vLLM source tree.
+# Note: this syncs the host folder only; tools/deploy.sh syncs the vLLM source tree.
 set -euo pipefail
 here=${FROM:-$(cd "$(dirname "$0")/.." && pwd)}
 dest=${DEST:-/raid/vllm-runtime/host_topo}

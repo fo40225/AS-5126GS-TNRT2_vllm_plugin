@@ -1,11 +1,11 @@
 #!/bin/bash
 # Server side: run a command under the shared GPU lock, detached, with a log and a DONE marker.
-# usage: locked_job.sh <tag> <timeout_s> <command...>   (log: work/host/logs/<tag>.log, marker: <tag>.DONE with rc)
-W=/raid/vllm-runtime/work/host
+# usage: locked_job.sh <tag> <timeout_s> <command...>   (log: $MUSE_TEST_SCRATCH/logs/<tag>.log, marker: <tag>.DONE with rc)
+W=${MUSE_TEST_SCRATCH:-/raid/vllm-runtime/work/plugin-tests}
 tag=$1; to=$2; shift 2
 mkdir -p $W/logs; rm -f $W/logs/$tag.DONE
 setsid nohup flock -w ${LOCK_WAIT_S:-43200} /raid/vllm-runtime/sm120-dev/gpu.lock bash -c '
-W=/raid/vllm-runtime/work/host
+W=${MUSE_TEST_SCRATCH:-/raid/vllm-runtime/work/plugin-tests}
 tag=$1; to=$2; shift 2
 echo "LOCK ACQUIRED $(date +%T)"
 for i in $(seq 1 60); do

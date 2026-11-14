@@ -1,4 +1,4 @@
-"""Throwaway test: when one rank skips a LARGE collective the others must abort with an error instead of hanging.
+"""Regression test: when one rank skips a LARGE collective the others must abort with an error instead of hanging.
 
 usage: py_topo.sh bench/test_timeout_large.py
 Rank 3 never calls the large all-reduce / reduce-scatter / all-gather; every other rank calls them one after another

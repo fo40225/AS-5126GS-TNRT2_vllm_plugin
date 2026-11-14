@@ -36,9 +36,9 @@ before the final add (half the cut bytes, class deterministic_different, still r
 deterministic). It applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm and, unless
 ``MUSE_TOPO_MEDIUM_BX=0``, to the bf16 all_reduce calls of the medium algorithm (algorithm 2, ``BX`` kernel variant)
 from ``ar_bx_min`` (64 KiB) up to ``max_bytes``, with the same arithmetic as the large algorithm, so every bf16
-all_reduce of at least 64 KiB gets the same bits whichever algorithm its size selects (docs/r3c_medium_ar.md); a bf16 message above
+all_reduce of at least 64 KiB gets the same bits whichever algorithm its size selects (README section 8); a bf16 message above
 ``max_bytes`` and up to 64 MiB runs as row slabs of at most 4 MiB through algorithm 2 (``_AR_BX_SLAB_BYTES``, faster than one call of the
-large algorithm, same bits, docs/a1_table_retune.md); fp16
+large algorithm, same bits); fp16
 and fp32 keep the exact exchange (an fp16 partial above 65504 would overflow) and the flag and the medium-exchange
 settings (``MUSE_TOPO_MEDIUM_BX``, ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES``, the tuning file) must be the same on all ranks.
 reduce_scatter always runs the large algorithm with the exchange when the flag is on (it needs at least
@@ -93,7 +93,7 @@ WORLD = 8
 # Size dispatch tables: (largest nbytes covered, algorithm, grid, block threads, unroll).
 # Measured on the AS-5126GS-TNRT2 box on 2026-10-23 with bench/bench_h1a.py --sweep (8 processes, CUDA graph of
 # back-to-back calls, bf16, NCCL_P2P_LEVEL=SYS baseline): the winning configuration of every measured size is applied
-# to the bucket that ends at that size (bench/make_table.py generates these literals; sizes up to 512 KiB (all_reduce)
+# to the bucket that ends at that size (the literals were generated from the sweep; sizes up to 512 KiB (all_reduce)
 # and 64 KiB (all_gather) come from the final kernels' sweep, larger sizes from the sweep before the store-on-arrival
 # change, whose best configurations are equivalent). Algorithm ids: all_reduce 1 = 2-phase sentinel, 2 = 3-phase
 # sentinel, 3 = 3-phase flag; all_gather 1 = LL8, 2 = flag. Algorithms 1 and 3 of all_reduce never won at any size
@@ -117,7 +117,7 @@ _AR_TABLE = [
 # exchange is on); same row format. Measured with bench/bench_medium.py on 2026-10-26 (8 processes, CUDA graph of back-to-back calls,
 # bf16 [T, 8192]; sweep of grid x block x unroll, every candidate verified bitwise against the torch emulation, best configuration
 # retimed with the full protocol, fewest threads within 1.5 %); the comments give the b2b time and, in brackets, the exact-exchange
-# time of the best _AR_TABLE-style configuration at the same size. docs/r3c_medium_ar.md has the full table.
+# time of the best _AR_TABLE-style configuration at the same size. The full table is not kept in this folder.
 _AR_BX_TABLE = [
     (65536, 2, 8, 128, 1),  # 64 KiB 6.7 us (exact 8.1)
     (98304, 2, 6, 256, 1),  # 96 KiB 7.7 (9.9)
@@ -166,9 +166,9 @@ _AG_TABLES = {
 }
 
 
-# Large-message configurations (bench/bench_h1b.py --search, coordinate descent per size, verified bitwise; AS-5126GS-TNRT2,
+# Large-message configurations (coordinate-descent search per size over mode / chunk / blocks / threads / unroll, verified bitwise; AS-5126GS-TNRT2,
 # 8 processes, CUDA graph of back-to-back calls, bf16 [T, 8192], NCCL_P2P_LEVEL=SYS baseline; 2026-10-23, details and the
-# measured tables in docs/h1b_latency.md). Rows end at the largest size they were measured at; larger sizes use the last.
+# measured tables in docs/h1b_collectives.md). Rows end at the largest size they were measured at; larger sizes use the last.
 # all_reduce: (largest nbytes covered, mode, chunk bytes, reduce-scatter blocks, all-gather blocks, block threads,
 # unroll, cut_rs, cut_ag); mode 1 = fused pipeline step, 0 = two launches per chunk; cut_x = 1: the socket-cut pushes of
 # the all-gather role come from one dedicated block (cut_rs = 1 / cut_ag = 2 variants were never faster: the cut is
@@ -188,7 +188,7 @@ _RS_TABLE = [
 ]
 # reduce_scatter with the bf16 exchange (bf16 inputs while bf16_exchange is on, the production setting): the 4-block row of _RS_TABLE (1 .. 4 MiB)
 # was tuned for the exact fp32 exchange (it moves twice the bytes across the socket cut, so fewer blocks were enough); with the bf16 partials 8 blocks
-# of 256 threads win there (S1-9 L9 A1, bench/bench_a1_tables.py, 8 processes, CUDA graph, dispatch path, warm / cold us per call, old row -> this row:
+# of 256 threads win there (S1-9 L9 A1, 8 processes, CUDA graph, dispatch path, warm / cold us per call, old row -> this row:
 # 1.5 MiB 46.1 / 50.7 -> 36.7 / 39.1, 2 MiB 60.3 / 66.2 -> 47.1 / 50.1, 3 MiB 87.8 / 96.3 -> 67.6 / 71.2, 4 MiB 115.3 / 127.1 -> 88.1 / 92.8). The old
 # rows up to 1 MiB and from 6 MiB to 128 MiB already had 8 blocks: unchanged within 1 %. Same arithmetic and bits for every geometry (bitwise against
 # the torch emulation of the contract on every size, identical output digests before / after).
@@ -212,7 +212,7 @@ _RS_MIN_BYTES = 128 << 10
 # bf16-exchange all-reduce above max_bytes (S1-9 L9 A1): row slabs of at most _AR_BX_SLAB_BYTES, each through the 2bx table, instead of one call of the
 # large algorithm. The slabs are bitwise identical to the large algorithm with the bf16 exchange (same arithmetic per element, rows are independent) and
 # faster per MiB: algorithm 2 moves the island partials once, the large algorithm also all-gathers the result across the cut (warm us per call, large
-# algorithm -> slabs: 12 MiB 566 -> 494, 16 MiB 741 -> 656, 24 MiB 1097 -> 988, 32 MiB 1452 -> 1314, 64 MiB 2915 -> 2617; docs/a1_table_retune.md).
+# algorithm -> slabs: 12 MiB 566 -> 494, 16 MiB 741 -> 656, 24 MiB 1097 -> 988, 32 MiB 1452 -> 1314, 64 MiB 2915 -> 2617).
 # Measured up to 64 MiB, which is the cap (each slab is one more kernel launch of CPU time; the 128 MiB prefill embedding all-reduce stays on
 # the large algorithm).
 _AR_BX_SLAB_BYTES = 4 << 20
@@ -289,7 +289,7 @@ class TopoComm:
         #     it (A/B switch). Valid: GEMV_PUSH_MODES (never 3 or 7).
         #   MUSE_TOPO_GEMV_VARIANT: geometry variant of the GEMV kernels (csrc/gemv_push.cu): unset = by the number of rows
         #     (GEMV_VARIANT_BY_ROWS), a number pins it. A variant with another number of warps per row sums in another order, so it is a
-        #     (deterministic) rounding change; V0 and V3 sum in the same order. For tuning: bench/bench_gemv_push.py --variants.
+        #     (deterministic) rounding change; V0 and V3 sum in the same order.
         #   MUSE_TOPO_GEMV_MAX_ROWS: largest decode batch (padded rows) the GEMV + gather kernels serve, clamped to 0 .. 8; above it the
         #     model keeps the cuBLAS GEMV and the r2d gather (0: never). Default GEMV_MAX_ROWS.
         #   MUSE_TOPO_GEMV_TRIGGER: see the comment at set_pdl below.
@@ -369,7 +369,7 @@ class TopoComm:
         # Trigger stage (MUSE_TOPO_GEMV_TRIGGER) of the all-reduce launches that are followed by a GEMV kernel: it lets that programmatic
         # successor start 1 = at the start of the all-reduce, 2 = when its last communication phase begins, 3 = when it has ended, 0 =
         # never (the GEMV kernel then starts when the all-reduce has completed). Its 8 MB of weight loads then overlap the tail of the
-        # all-reduce; at the start of the kernel they delay the all-reduce itself (measured: ~5 us, docs/r3b_gemv_push.md). Default 3, the
+        # all-reduce; at the start of the kernel they delay the all-reduce itself (measured: ~5 us). Default 3, the
         # stage of the measured arm; 2 is as good within the noise (S1-4b decision run, TPOT of 3 / 2: c1 9.214 / 9.209 ms, c4 14.788 / 14.937 ms,
         # mean(c1, c4) -0.60 % for 3, a margin the 1 % drift of the session does not resolve). It is a property of the LAUNCH (_trigger_stage): only the all-reduces that
         # precede a GEMV carry it, every other topo kernel keeps the implicit trigger at its exit, because a programmatic successor
@@ -383,7 +383,7 @@ class TopoComm:
                         "the stage has the effect of stage 1", self.gemv_trigger)
         self._c.set_gemv_variant(self._variant_for(1))
         # Where the fused collectives load the epilogue operands that do not depend on the collective (BndParams::ld_mode in
-        # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (bench_boundary_cold.py,
+        # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (cold-operand boundary benchmark,
         # 2026-10-24: all-reduce + boundary at T = 1 / 4 / 8: 12.1 / 14.6 / 18.8 us vs 12.8 / 15.3 / 19.3 for loading after the
         # collective and 12.7 / 16.4 / 20.1 for an L2 prefetch at the start plus loads after the collective).
         self._c.set_ld_mode(int(os.environ.get("MUSE_TOPO_BND_LOADS", "0")))
@@ -396,7 +396,7 @@ class TopoComm:
                     i.partner, self.workspace_bytes / 2**20, i.summary)
 
     def _load_tuning_file(self, path: str) -> None:
-        """Experiment hook (bench/make_table_medium.py writes the file): JSON with optional keys ``bx_table`` (rows
+        """Experiment hook (the JSON is written by an offline table generator that is not part of this folder): JSON with optional keys ``bx_table`` (rows
         of _AR_BX_TABLE), ``bx_min`` (bytes) and ``large_min_bx`` (bytes). Must be the same on every rank (a file that
         cannot be read or parsed on some rank makes every rank raise TopoUnavailable, see ``__init__``)."""
         if not path:
@@ -610,7 +610,7 @@ class TopoComm:
     AR_BOUNDARY_MAX_ROWS = 64   # the slice buffers hold 64 rows of a 16 KiB message
     AG_BOUNDARY_MAX_ROWS = 32   # unpooler shards [T, 1024] bf16 (LL8 slots of 64 KiB shards)
     AG_RMS_MAX_ROWS = 64        # pooler shards [T, 512] bf16
-    # ... and where they beat the two-step path (bench/bench_boundary.py, 2026-10-24: a single CTA per row serves a few rows well, while
+    # ... and where they beat the two-step path (boundary benchmark, 2026-10-24: a single CTA per row serves a few rows well, while
     # the tuned many-CTA kernels of the plain collectives win from 16 rows on: fused - two-step = -1.0 us at T <= 8 and +3.0 us at T = 16
     # for the all-reduce, -1.0 / +0.5 for the unpooler gather, -1.3 us up to T = 16 and +0.5 at T = 32 for the pooler gather).
     DISPATCH_MAX_ROWS = {"all_reduce_boundary": 8, "all_gather_boundary": 8, "all_gather_rmsnorm": 16}
@@ -620,7 +620,7 @@ class TopoComm:
     # K = 7 verify batch of speculative decoding) shows no gain: S1-4b decision run, real weights, TPOT at c8 with MAX_ROWS 8 / 4 /
     # router GEMV only / everything off = 19.992 / 19.897 / 19.793 / 19.738 ms (rule "8 only if not worse than 4 by more than 0.5 %"
     # was met by 0.02 % only), c6 22.972 / 23.005 / 22.841 / 23.071 ms, and the old layer-chain microbenchmark at T = 8 had the GEMV chain
-    # slower than cuBLAS (53.7 against 52.1 us; docs/r3b_gemv_push.md). The orchestrator's decision: 4.
+    # slower than cuBLAS (53.7 against 52.1 us). The orchestrator's decision: 4.
     GEMV_MAX_ROWS = 4
     GEMV_DEFAULT_PUSH = 1
     GEMV_DEFAULT_TRIGGER = 3
@@ -629,7 +629,7 @@ class TopoComm:
     # the watchdog traps the context (csrc/bindings.cpp rejects them too).
     GEMV_PUSH_MODES = (0, 1, 2, 4, 5, 6)
     # Geometry variant (csrc/gemv_push.cu) by the number of rows: V0 (128 CTAs) for one row, V3 (64 CTAs of 512 threads, half the activation
-    # traffic and half the pushing CTAs) from two rows on (bench/bench_gemv_push.py, hot L2: T = 2 layer chain 34.1 -> 33.1 us, T = 4 44.5 -> 41.5).
+    # traffic and half the pushing CTAs) from two rows on (GEMV-push benchmark, hot L2: T = 2 layer chain 34.1 -> 33.1 us, T = 4 44.5 -> 41.5).
     GEMV_VARIANT_BY_ROWS = {1: 0, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3}
     GEMV_KINDS = ("gemv_all_gather_rmsnorm", "gemv_all_gather_boundary")
     GEMV_POOLER_SHAPE = (512, 8192)     # weight rows of one rank x input width

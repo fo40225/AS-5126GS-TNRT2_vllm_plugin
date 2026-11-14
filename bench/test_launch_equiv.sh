@@ -98,6 +98,6 @@ if git -C "$here" cat-file -e "$base^{commit}" 2> /dev/null && mkdir -p "$d/base
   # the launch.env file adds nothing to the environment
   a=$(env -i PATH="$PATH" bash -c "a=\$(export -p | sort); source $here/env/launch.env; b=\$(export -p | sort); [ \"\$a\" = \"\$b\" ] && echo same" 2> /dev/null)
   if [ "$a" = same ]; then ok "env/launch.env exports nothing"; else bad "env/launch.env changes the exported environment"; fi
-else echo "skip: base commit $base not available in this checkout (the base-export proofs are recorded in muse_wf/s1-11/launch_impl.json)"; fi
+else echo "skip: base commit $base not available in this checkout (the main history must stay reachable for the base-export proofs)"; fi
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))

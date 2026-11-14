@@ -61,7 +61,7 @@ are bitwise identical on every rank (including the sign of zero), across runs, a
 The only deviation from raw IEEE behavior: a 32-bit payload word equal to `0xFFFFFFFF` (a NaN pattern, two bf16/fp16
 NaNs or one fp32 NaN) is replaced by `0xFFFFFFFE` before it is used, so NaN payloads may differ from NCCL's.
 
-Opt-in variant (r3c, `docs/r3c_medium_ar.md`, bf16 inputs only, `MUSE_TOPO_LARGE_BF16_EXCHANGE=1`): algorithm 2 has a `BX` kernel variant
+Opt-in variant (r3c, bf16 inputs only, `MUSE_TOPO_LARGE_BF16_EXCHANGE=1`): algorithm 2 has a `BX` kernel variant
 that rounds both island partials to bf16 before the final add, `out = round_bf16(bf16(P_0) + bf16(P_1))`; class
 `deterministic_different`. It halves the bytes of the partner exchange over the socket cut and is what the dispatch uses for bf16
 messages from 64 KiB on when the flag is set. The statement above ("across sizes and across algorithms") then holds among the bf16
@@ -116,7 +116,7 @@ construction.
 ## Results
 
 Full latency tables (all_reduce [T,8192] and [T,4096] for T = 1..512, all_gather pooler/unpooler shards for T = 1..256
-and the logits shard, NCCL baseline, FlashInfer comparison): `docs/h1a_latency.md`. Headline numbers (CUDA graph,
+and the logits shard, NCCL baseline, FlashInfer comparison). Headline numbers (CUDA graph,
 back-to-back / behind a 50 us kernel, bf16): all_reduce [1,8192] 5.4 / 5.4 us (NCCL 42.8 / 43.0), [1,4096] 5.0 / 5.1
 (NCCL 41.2 / 41.5), [8,8192] 11.5 / 11.3 (NCCL 47.3 / 47.6), [64,8192] 61 / 61 (NCCL 86), [512,8192] 477 / 480 (NCCL
 580 / 573); all_gather [1,512]->[1,4096] 3.6 us (NCCL 24.6), [1,1024]->[1,8192] 3.8 us (NCCL 25.9), logits
@@ -134,7 +134,7 @@ algorithm.
 ## Dispatch and tuning
 
 `muse_topo/collectives.py` holds the size dispatch tables (`_AR_TABLE`, `_AG_TABLES`): for every measured message size
-the winning (algorithm, grid, block, unroll) of `bench/bench_h1a.py --sweep` (`bench/make_table.py` prints the
+the winning (algorithm, grid, block, unroll) of the `bench/bench_h1a.py --sweep` measurement (an offline table generator, not kept, printed the
 literals). Findings that shaped them (2026-10-23, protocol: CUDA graph, back-to-back, bf16):
 
 * The sentinel protocol (all-reduce algorithms 1, 2) beats the flag protocol (algorithm 3) at every size: 5.5 vs 8.0 us
@@ -153,7 +153,7 @@ literals). Findings that shaped them (2026-10-23, protocol: CUDA graph, back-to-
   large-message algorithm), not a better decode kernel.
 * Programmatic dependent launch (`MUSE_TOPO_PDL=1`, kernels start with `griddepcontrol.wait`): -0.3 us in back-to-back
   graphs (the previous kernel is another collective), +0.1..0.2 us behind a normal kernel (spacer mode), so it stays off.
-* In-kernel timeline of all_reduce [1,8192] (`bench/trace_h1a.py`, MUSE_TOPO_TRACE=1 build, block 0 thread 0, mean over
+* In-kernel timeline of all_reduce [1,8192] (MUSE_TOPO_TRACE=1 build, block 0 thread 0, mean over
   ranks): start to phase-a sent 0.58 us (counter + input loads), island hop 1.10, reduction 0.14, partner hop 1.85
   (1.35 latency + serialization + rank skew), island hop 1.40, total 5.2 us; the graph node adds ~0.7 us of which most
   overlaps. all_gather [1,1024] (LL8, before the store-on-arrival change): push 0.45, partner hop + forward 1.4, forwarded copies from the island 1.0, output stores and exit 0.6 = 3.5 us.
@@ -168,18 +168,16 @@ literals). Findings that shaped them (2026-10-23, protocol: CUDA graph, back-to-
 | `test_timeout.py` | one rank skips a collective: the others trap with an error word within the timeout (3 s) instead of hanging |
 | `test_init_failure.py` | a build failure on one rank makes every rank raise `TopoUnavailable` (no hang) |
 | `check_ctx.py` | TopoComm creates no CUDA context on the other 7 GPUs |
-| `bench_h1a.py` | latency sweep vs NCCL (`--sweep` per-shape tuning, `--public` dispatch path), `make_table.py`, `summarize_h1a.py` |
-| `trace_h1a.py` | in-kernel phase timeline |
-| `host_relay_probe.py` | research probe of the cut transport through pinned host memory (see below) |
+| `bench_h1a.py` | latency sweep vs NCCL (`--sweep` per-shape tuning, `--public` dispatch path); kept as test support (`contract_ref_bx` is imported by `test_medium_bx.py` and `test_a1_tables.py`) |
 
 Run (server): `scripts/deploy_host.sh`, then
-`bash scripts/locked_job.sh <tag> <timeout_s> bash scripts/run_h1a.sh <tag> smoke tests timeout ctx bench_public`
-(takes the shared GPU lock; logs in `/raid/vllm-runtime/work/host/logs/<tag>.log`).
+`bash scripts/locked_job.sh <tag> <timeout_s> bash scripts/run_h1a.sh <tag> smoke tests timeout ctx`
+(takes the shared GPU lock; logs in `$MUSE_TEST_SCRATCH/logs/<tag>.log`, see `scripts/py_topo.sh`).
 
 ## Cut transport probe (negative result, input for the large-message track)
 
 Above [4,8192] the all-reduce is limited by the partner exchange across the socket cut (2S bytes per direction with
-the fp32 contract). `bench/host_relay_probe.py` measures the partner exchange alone (pairs r <-> r^4 exchange V bytes in
+the fp32 contract). The (not kept) host-relay probe measured the partner exchange alone (pairs r <-> r^4 exchange V bytes in
 both directions at once, 8 GPUs, eager launches, verified data) for four transports; GB/s are per GPU and per
 direction (x4 = aggregate over the cut), 2026-10-23, V = 8 MiB:
 

@@ -1,9 +1,6 @@
 # Topology of the 8x RTX PRO 6000 host (Supermicro AS-5126GS-TNRT2, 10.19.209.74)
 
-Measured 2026-10-23 with the scripts in `/raid/vllm-runtime/musetest/topo/` on the server (kept there, not in this folder:
-`p2p_ext.cu`, `topo_bench.py` with the stages `info link matrix sweep latency conc conc2 multi multi2 rule uplink host cechunk
-hier a2a a2a_rounds rd`, `locked.sh`, `stages_body.sh`, and the nccl-tests wrappers `nccl_body.sh`, `nccl_ll_body.sh`,
-`nccl_a2a_body.sh`; results in `.../topo/results/` and `.../topo/logs/`). Units: GB/s = 1e9 B/s, latencies in microseconds,
+Measured 2026-10-23 with benchmark programs that are not part of this folder (a CUDA P2P extension and a topology benchmark with the stages `info link matrix sweep latency conc conc2 multi multi2 rule uplink host cechunk hier a2a a2a_rounds rd`, plus nccl-tests wrappers); the raw results are not kept. Units: GB/s = 1e9 B/s, latencies in microseconds,
 256 MiB buffers, median of 3 unless noted. No clock or power-limit change was made (GPUs ran at ~2.3 GHz, 140-150 W during traffic).
 Everything here is what the code in `muse_topo/` is built on: `muse_topo/topology.py` derives the same layout from sysfs at run
 time and refuses to activate when it does not match.
@@ -97,7 +94,7 @@ per flow, 150 ms window, per-flow median of 5 iterations, 2 repeats; P2P only, N
   the same rates, so the store flavour is not the cause; CTA count does not matter from 4 up.
 * Beside intra-socket pushes (one 8-CTA push per GPU) a 1-CTA cut flow collapses to ~10-18 GB/s (4 x min; single flows 2.5-5.2 GB/s), while an
   8-CTA cut flow keeps 22.1.
-* Source: `muse_wf/s1-12/acell_results.md` (raw files under `/raid/vllm-runtime/work/s1-12/acell/`).
+* Source: the S1-12 A-cell measurement (raw files not kept).
 
 ### 2.4 The COLLAPSE RULE (the design constraint everything else follows from)
 
@@ -158,10 +155,10 @@ socket, exchange the partial with the cross-socket partner, all-gather inside th
 Without pipelining the hierarchy is NOT better (copy-engine phases summed: 7.23 ms, flat CE ring 6.94 ms); it only pays when the
 phases overlap. `muse_topo` implements that as a chunk-pipelined reduce-scatter + all-gather and, because its arithmetic contract
 exchanges fp32 partials, carries 3S/8 per GPU and direction across the cut (S/4 fp32 partials + S/8 bf16 results; the opt-in bf16
-exchange halves the partial part). Measured result: 7.1 ms at 128 MiB (1.30x), see `docs/h1b_latency.md`.
+exchange halves the partial part). Measured result: 7.1 ms at 128 MiB (1.30x), measured with the not-kept benchmark sweep.
 
 **Small messages are a latency problem.** For 16 KiB the floor is the 3.5 us of three dependent hops; NCCL needs 44.5 us (default
-LL128/Simple) or 19.6 us with forced LL. `muse_topo` reaches 5.4 us for `[1,8192]` bf16 (CUDA graph), see `docs/h1a_latency.md`.
+LL128/Simple) or 19.6 us with forced LL. `muse_topo` reaches 5.4 us for `[1,8192]` bf16 (CUDA graph).
 
 **Pathologies to design around**: (1) the collapse rule above; (2) CE serializes per source GPU; (3) SM stores waste link bandwidth
 (41.8-45 vs CE 55.6) and decay with CTA count; SM pull needs >= 4 CTAs x 512 threads; (4) paths via switches 1 and 3 are 8-15 % slower;
@@ -194,7 +191,7 @@ adds) 5.0 us at `[1,8192]`, 8.6 us at `[8,8192]`, 52.7 us at `[64,8192]`; vLLM C
 
 1. Islands = sockets; inside an island everything is all-to-all with SM push stores into the peer's IPC receive buffer (flat, scalable).
 2. Across the cut only the fixed partner r <-> r^4 talks (collapse-free), with one block (or few) pushing, since SM push peaks at 1 CTA
-   and the copy engine gave no gain in the end-to-end kernels (`bench/ce_cut_probe.py`, `bench/a2a_probe.py`, `bench/host_relay_probe.py`).
+   and the copy engine gave no gain in the end-to-end kernels (copy-engine, all-to-all and host-relay probes, not kept).
 3. Latency-bound sizes use the LL/sentinel protocols (no fences), bandwidth-bound sizes the flag protocol; the dispatch tables in
    `muse_topo/collectives.py` hold the measured winner per size.
 4. No remote atomics (not supported); no host-side per-call state (CUDA graphs); no collective may overlap a kernel that can occupy

@@ -24,14 +24,14 @@ group, so putting the host folder on ``PYTHONPATH`` is enough (no pip install). 
   ``all_gather_rmsnorm`` (new methods, the optional interface of ``vllm/models/muse_spark/nvidia/ops/fused_boundary.py``):
   the decode all-reduce / all-gathers of the Muse Spark layer with the element-wise kernel that follows them as an
   epilogue (``csrc/boundary.cuh``: bit-exact CUDA mirror of vLLM's Triton boundary and RMSNorm kernels), see
-  ``docs/r2d_fused_epilogue.md``. Gated by ``MUSE_TOPO_OPS`` containing ``boundary`` (default) and ``MUSE_TOPO_FUSED != 0``;
+  README section 8. Gated by ``MUSE_TOPO_OPS`` containing ``boundary`` (default) and ``MUSE_TOPO_FUSED != 0``;
   a call the kernels cannot serve (shape, dtype, contiguity: all rank-uniform; misaligned operands are staged through an aligned
   copy, never a reason to decline) returns ``None`` and the model runs the two steps itself.
 * ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary`` (same interface): the sharded pooler / unpooler GEMV of the
   decode layer (T <= MUSE_TOPO_GEMV_MAX_ROWS, 4 by default, at most 8) together with the gather that follows it. The GEMV kernel
   loads its weights while the all-reduce in front of it is still running, sums in the fixed fp32 order of ``csrc/gemv.cuh`` (class
   deterministic_different against the cuBLAS GEMV of the model) and pushes its columns to the partner and the island peers; the
-  gather kernel then forwards, collects and runs the epilogue (``docs/r3b_gemv_push.md``).
+  gather kernel then forwards, collects and runs the epilogue (README section 8).
 * ``destroy``: dumps the call counters and closes the topo communicator.
 
 Capability ``reduce_scatter_all_gather_matches_all_reduce`` (property of the patched ``CudaCommunicator``, a plain
@@ -98,7 +98,7 @@ Environment (all optional):
                              then declines every batch and the model runs the two steps); default 1
 ``MUSE_TOPO_GEMV``           0 keeps the sharded pooler / unpooler GEMV of the decode layer on cuBLAS (T <= MAX_ROWS otherwise runs
                              ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary``: the GEMV kernel of
-                             ``csrc/gemv_push.cu`` + the pushed gather kernel, see ``docs/r3b_gemv_push.md``); needs
+                             ``csrc/gemv_push.cu`` + the pushed gather kernel, see README section 8); needs
                              ``MUSE_TOPO_FUSED`` != 0; default 1
 ``MUSE_TOPO_GEMV_PUSH``      push mode of the GEMV kernel: 0 = it only stores its columns and the gather kernel pushes them, 1 = every CTA
                              pushes as soon as it is done (default), 2 = the last CTA pushes the block in coalesced stores; +4 loads the
