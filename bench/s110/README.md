@@ -11,6 +11,7 @@ The scripts of the S1-10 study (`docs/s110_numa_offload.md`), copied from the se
 | `analyze_s110.py`, `compare_s110.py`, `pairs_s110.py`, `cross_s110.py`, `chat_table_s110.py`, `sizing_table_s110.py` | result tables (adoption-rule metrics, determinism pairs, per-turn chat, sizing) |
 | `exact_boot_s110.sh`, `sitecustomize_s110.py`, `snap_diff.py`, `gpu_overhead_probe.py` | S1-7 stress boot with extra serve args, allocator probe + memory-history snapshot, snapshot diff, host-register / stream GPU-memory probe |
 | `pinned_bw.py`, `microbench.sh` | pinned-memory bandwidth microbench (local / remote node) |
-| `rules/` | the pre-registered adoption rule and its three amendments (md5 recorded before the boots they govern) |
+| `chk_driver.py`, `chk_worker.py` | the final-gate KV byte / single-stream checks of amendment 3 (D4'), `CHK=d4`: verdict JSON PASS / FAIL / ARTIFACT incl. the mandatory negative control; the S1-10R Phase 2 investigation modes `CHK=spec|ns256` are kept (see `docs/s110_numa_offload.md` section 10; logic test `bench/test_chk_d4_verdict.py`) |
+| `rules/` | the pre-registered adoption rule and its three amendments (md5 recorded before the boots they govern), the final rule `ADOPTION_RULE_FINAL.txt` with `_AMENDMENT1..3` (amendment 3 = D4', POST-HOC, 2026-11-11) |
 
 Usage: `setsid nohup flock -w 43200 /raid/vllm-runtime/sm120-dev/gpu.lock env TREE=<vllm tree> bash master_s110.sh <runs_file> &` (never take the lock twice; the header of `master_s110.sh` documents the RUNS line).

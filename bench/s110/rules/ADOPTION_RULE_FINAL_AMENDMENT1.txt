@@ -1,0 +1,11 @@
+S1-10 FINAL GATE ADOPTION RULE, AMENDMENT 1 (2026-11-07 ~20:50 server clock; before any A/B boot of the final gate; phase X is complete and clean, the first preemption smoke boot is read)
+Observation: gate S, first boot s110g_preempt_spec (24 prompts of 12,000 tokens, 300 output tokens, --num-gpu-blocks-override 24000 = 31,310 KV tokens): 0 preemptions in both storms (the scheduler
+admits only the ~2 prompts that fit into the pool and the decode growth is small, so nothing is ever preempted) and 3 of 24 outputs of storm 2 ended before 300 tokens (no ignore_eos on the smoke
+requests: an EOS token of a random-token prompt). The tier itself behaved: 105,696 blocks / 287,616 tokens loaded from it in storm 2, pending stores drained, 8 of 8 tier-hit / GPU-hit pairs bitwise equal.
+By the rule's own clause the boot is INCONCLUSIVE (no preemption), not a pass. The retry clause "repeat once with 2/3 of the blocks" cannot work for an admission-limited workload, so the smoke DESIGN
+(not a threshold) is changed before the retry boots:
+  gate S: 32 distinct random prompts of 2,500 tokens sent at once, twice, 600 greedy output tokens with ignore_eos (every request must return exactly 600 tokens), so that the running set outgrows the
+  pool DURING DECODE; spec ON boot with --num-gpu-blocks-override 24000 (31,310 tokens), ns256 ON boot with --num-gpu-blocks-override 5000; everything else (tier-consistency pairs, PASS criteria,
+  preemptions > 0 as proof, INCONCLUSIVE otherwise) unchanged. One retry boot per profile with these parameters; a second INCONCLUSIVE is reported as such and gate S then counts as NOT PASSED for adoption of the
+  speculative profile (the preemption path stays unproven: adoption is blocked, the configuration is shipped opt-in with that caveat).
+Files changed: bench/s110/preempt_smoke.py (defaults, ignore_eos), bench/s110/reuse_driver.py (send(): optional ignore_eos, default off: no other behaviour changes). Everything else of the rule unchanged.

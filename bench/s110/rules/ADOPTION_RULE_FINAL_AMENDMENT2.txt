@@ -1,0 +1,7 @@
+S1-10 FINAL GATE ADOPTION RULE, AMENDMENT 2 (2026-11-07 ~21:45 server clock; before any A/B boot of the final gate)
+Observation: the retry boot of gate S under Amendment 1 (s110g_preempt_spec_2: 32 prompts of 2,500 tokens, 600 greedy tokens with ignore_eos, 24000 blocks = 31,310 KV tokens, MAXLEN 24,576) again saw 0 preemptions
+(0 failed requests, 79,360 tokens loaded from the tier in storm 2, pending stores drained, 8 of 8 tier-hit / GPU-hit pairs bitwise equal): INCONCLUSIVE. The blocks the admission leaves free cover 600 tokens of decode growth.
+Design change only (no threshold): 2,000 output tokens per request (every request must return exactly 2,000) and a smaller pool with a shorter --max-model-len so that the growth cannot fit:
+  spec ON boot: --max-model-len 8192 --num-gpu-blocks-override 14000;  ns256 ON boot: --max-model-len 8192 --num-gpu-blocks-override 4000.
+  (about 6 / 7 of the prompts fit into the pool at admission, their decode growth needs ~3,000 / 900 blocks against ~1,800 / 130 free). A third INCONCLUSIVE is reported as such and gate S then counts as NOT PASSED
+  for the adoption of the speculative profile (see Amendment 1). Files changed: bench/s110/preempt_smoke.py (default --max-tokens 2000).
