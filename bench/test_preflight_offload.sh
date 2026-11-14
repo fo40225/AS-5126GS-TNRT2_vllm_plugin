@@ -12,6 +12,7 @@ check() { # desc want_rc want_msg [env...]
 }
 # the idle state (no server) derived from the 0.33.0 phase 3 A_N figures (server up: node 3 119,263, node 0 118,644, node 7 105,586, node 4 119,641 MiB) plus W_N
 # (two workers 8,192 MiB, node 3 + EngineCore 1,229, node 7 + API server 1,331); the shipped P* = 48.26 GiB leaves 6.9 GiB on node 7 (M = 6.6 GiB: no warning)
+# (the node 7 fixture is looser than A_7 + W_7 = 105,586 + 9,523 = 115,109 MiB, which would leave 6,759 MiB; the measured phase 3 preflight left on node 7 was 7,091-7,253 MiB)
 mkn 0 20000 106844; mkn 3 20000 108700; mkn 4 20000 107900; mkn 7 10000 105400
 check "shipped tier fits the 0.33.0 nodes" 0 "PREFLIGHT OK"
 mkn 7 10000 60000
