@@ -44,10 +44,13 @@
 # is read from vLLM's startup line "non-default args: {... 'max_num_scheduled_tokens': <n> ...}" and, next to a harness serve_cmd.txt, from the flag. SPEC_EXPECT_MNST=<n> (default: this shell's MUSE_SPEC_MNST, else 8192) | off|0 (no cap, the plain port) demands the state. Every "non-default args" line of the log (a relaunch
 # appended to serve.log, a second API server) must carry the cap. The KV bytes are expected not to depend on the cap (max_num_batched_tokens stays 8199; to be verified by the S1-14 A/B), and no KV token number is checked.
 # S1-10R Phase 0 (fused boundary): env/spec_k7.env exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 (spec only). The model and the communicator log NOTHING about this switch (vllm/envs.py reads it
-# into the fuses_boundary_collectives attributes of the layers, no log line), so the state cannot come from the serve.log. It is read from the environment snapshot a harness writes next to the log:
-# an env.txt (output of `env | grep -E '^(MUSE_|VLLM_MUSE|NCCL_|VLLM_PLUGINS)'`, as the S1-10R drivers write it); a line VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1> is the state, a snapshot that has other
-# VLLM_MUSE_SPARK_ lines but not this one means "unset" = the vLLM default 1. No env.txt (or one without any VLLM_MUSE_SPARK_ line) = unverified. SPEC_EXPECT_FB=0|1 demands the state (FAIL when it
-# cannot be confirmed); without it the expectation is the value exported in the checking shell (a shell that sourced env/spec_k7.env expects 0) and is only compared when the snapshot exists.
+# into the fuses_boundary_collectives attributes of the layers, no log line), so the state cannot come from the serve.log. Sources, in order: (1) /proc/<pid>/environ of the server, the value it really read
+# (pid from server.pid / serve.pid next to the log, else the last "APIServer pid=<n>" of the log; used only when the process is alive, its cmdline names vllm and the environ is readable by the checking user;
+# a missing variable there = the vLLM default 1); (2) the env.txt snapshot of the driver shell next to the log (output of `env | grep -E '^(MUSE_|VLLM_MUSE|NCCL_|VLLM_PLUGINS)'`): a line
+# VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1> is the state, a snapshot with other VLLM_MUSE_SPARK_ lines but not this one means unset = the vLLM default 1; the snapshot is the driver shell, which can differ
+# from what the server read; (3) neither = fb=unverified. SPEC_EXPECT_FB=0|1 demands the state and FAILS when it cannot be confirmed. PRODUCTION DRIVERS MUST PASS SPEC_EXPECT_FB=0: without it an unverifiable
+# boot (no readable pid, no env.txt) exits 0 with fb=unverified, so a boot that lost the export would pass; without SPEC_EXPECT_FB the expectation is the value exported in the checking shell (a shell that
+# sourced env/spec_k7.env expects 0) and is only compared when a source exists. The OK line carries fb=<0|1|unverified> (before the bytes note and the pool).
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
@@ -272,10 +275,34 @@ else
     echo "FAIL serve_cmd.txt has no --max-num-scheduled-tokens $mnst"; rc=1
   fi
 fi
-# fused boundary (S1-10R Phase 0): nothing is logged by the model, the state comes from the env.txt snapshot next to the log
+# fused boundary (S1-10R Phase 0): nothing is logged by the model. Source 1: /proc/<pid>/environ of the server (pid from <logdir>/server.pid or serve.pid, else the last "APIServer pid=<n>" of the log;
+# only used when the process is alive, its cmdline names vllm and the environ is readable by this user), the real value the server read. Source 2: the env.txt snapshot of the driver shell next to the log. Else unverified.
 fb=unverified
 fb_file=$(dirname "$log")/env.txt
-if [ -r "$fb_file" ]; then
+fb_src=
+fb_pid=
+for pf in "$(dirname "$log")/server.pid" "$(dirname "$log")/serve.pid"; do
+  if [ -z "$fb_pid" ] && [ -r "$pf" ]; then fb_pid=$(head -1 "$pf" | tr -d '[:space:]'); fi
+done
+[ -n "$fb_pid" ] || fb_pid=$(grep -a -o -E 'APIServer pid=[0-9]+' "$log" | tail -1 | sed -E 's/^[^=]*=//')
+case "$fb_pid" in ""|*[!0-9]*) fb_pid= ;; esac
+fb_text=
+if [ -n "$fb_pid" ] && [ -r "/proc/$fb_pid/environ" ] && tr '\0' ' ' < "/proc/$fb_pid/cmdline" 2>/dev/null | grep -a -q vllm; then
+  fb_text=$(tr '\0' '\n' < "/proc/$fb_pid/environ" 2>/dev/null) && fb_src="/proc/$fb_pid/environ" || fb_text=
+fi
+if [ -n "$fb_src" ]; then
+  # a readable process environment is authoritative: a missing variable means the vLLM default 1
+  if echo "$fb_text" | grep -a -q -E '^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY='; then
+    fb_raw=$(echo "$fb_text" | grep -a -E '^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=' | tail -1 | sed -E 's/^[^=]*=//')
+  else
+    fb_raw=1
+  fi
+  case "$fb_raw" in
+    0|1) fb=$fb_raw ;;
+    *) echo "FAIL $fb_src has VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY='$fb_raw' (not 0 or 1)"; rc=1; fb=invalid ;;
+  esac
+elif [ -r "$fb_file" ]; then
+  fb_src=$fb_file
   fb_raw=$(grep -a -E '^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=' "$fb_file" | tail -1 | sed -E 's/^[^=]*=//')
   if grep -a -q -E '^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=' "$fb_file"; then
     case "$fb_raw" in
@@ -293,9 +320,9 @@ if [ -z "$want_fb" ]; then
 fi
 if [ -n "$want_fb" ] && [ "$fb" != invalid ] && [ "$fb" != "$want_fb" ]; then
   if [ "$fb" = unverified ]; then
-    echo "FAIL the fused boundary state cannot be confirmed: no env.txt with VLLM_MUSE_SPARK_ variables next to $log, SPEC_EXPECT_FB=$want_fb demanded"; rc=1
+    echo "FAIL the fused boundary state cannot be confirmed: no readable server /proc/<pid>/environ and no env.txt with VLLM_MUSE_SPARK_ variables next to $log, $want_fb demanded"; rc=1
   else
-    echo "FAIL the fused boundary (VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY) is $fb in $fb_file, expected $want_fb"; rc=1
+    echo "FAIL the fused boundary (VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY) is $fb in $fb_src, expected $want_fb"; rc=1
   fi
 fi
 [ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt mnst=$mnst fb=$fb$cap_bytes_note ($pool)"

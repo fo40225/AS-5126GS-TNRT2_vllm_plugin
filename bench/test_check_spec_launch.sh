@@ -189,10 +189,36 @@ run prod 2 "garbage SPEC_EXPECT_FB" SPEC_EXPECT_FB=on -- "$d/prod/serve.log"
 out=$(env -i PATH="$PATH" bash "$check" "$d/fb0/serve.log" 2>&1); if echo "$out" | grep -q 'mnst=8192 fb=0'; then echo "ok   the OK line carries fb=0"; else echo "FAIL OK line: $out"; fails=$((fails+1)); fi
 out=$(env -i PATH="$PATH" bash "$check" "$d/prod/serve.log" 2>&1); if echo "$out" | grep -q 'mnst=8192 fb=unverified'; then echo "ok   the OK line says fb=unverified without an env.txt"; else echo "FAIL OK line: $out"; fails=$((fails+1)); fi
 # env/spec_k7.env: FB0 for the speculative profile only, a preset value is kept; host.env does not touch the variable
-got=$(env -i PATH="$PATH" bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-unset}" 2>&1)
-if [ "$got" = "0" ]; then echo "ok   spec_k7.env: the speculative profile exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0"; else echo "FAIL spec_k7.env FB default: got '$got' wanted 0"; fails=$((fails+1)); fi
-got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1 bash -c "source $here/env/spec_k7.env; env | grep ^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=" 2>&1)
+# the export is checked in the environment of a child process (a shell variable alone never reaches vllm serve); the profile file can be replaced for a mutation run (SPEC_ENV_FILE)
+envf=${SPEC_ENV_FILE:-$here/env/spec_k7.env}
+got=$(env -i PATH="$PATH" bash -c "source $envf; env | grep ^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=" 2>&1)
+if [ "$got" = "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0" ]; then echo "ok   spec_k7.env: the speculative profile exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 to child processes"; else echo "FAIL spec_k7.env FB default: got '$got' wanted VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1 bash -c "source $envf; env | grep ^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=" 2>&1)
 if [ "$got" = "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1" ]; then echo "ok   spec_k7.env: a preset FB=1 is kept and exported (the FB1 arm of an A/B)"; else echo "FAIL spec_k7.env FB preset: got '$got'"; fails=$((fails+1)); fi
+for v in true maybe 2 -1 on; do
+  got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=$v bash -c "source $envf && echo sourced" 2>&1)
+  if echo "$got" | grep -q sourced || ! echo "$got" | grep -q "must be 0 or 1"; then echo "FAIL spec_k7.env FB preset '$v' was accepted: $got"; fails=$((fails+1)); else echo "ok   spec_k7.env: FB preset '$v' is rejected"; fi
+done
+got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY= bash -c "source $envf; env | grep ^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=" 2>&1)
+if [ "$got" = "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0" ]; then echo "ok   spec_k7.env: an empty preset becomes 0"; else echo "FAIL spec_k7.env empty FB preset: got '$got'"; fails=$((fails+1)); fi
+# /proc/<pid>/environ of a live process whose cmdline names vllm beats a stale env.txt (pid from server.pid)
+live() { # <dir> <FB value or empty for unset>
+  mkdir -p "$d/$1"; cp "$d/prod/serve.log" "$d/prod/serve_cmd.txt" "$d/$1/"
+  if [ -n "$2" ]; then env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=$2 bash -c 'exec -a "vllm serve" sleep 120' & else env -i PATH="$PATH" bash -c 'exec -a "vllm serve" sleep 120' & fi
+  livepid=$!; echo $livepid > "$d/$1/server.pid"; sleep 0.3
+}
+live pid0 0; p0=$livepid
+printf '%s\n' 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1' > "$d/pid0/env.txt"
+run pid0 0 "live server env FB=0 wins over a stale env.txt FB=1, 0 demanded" SPEC_EXPECT_FB=0 -- "$d/pid0/serve.log"
+run pid0 1 "live server env FB=0, 1 demanded" SPEC_EXPECT_FB=1 -- "$d/pid0/serve.log"
+out=$(env -i PATH="$PATH" bash "$check" "$d/pid0/serve.log" 2>&1); if echo "$out" | grep -q 'mnst=8192 fb=0'; then echo "ok   live server env gives fb=0"; else echo "FAIL live OK line: $out"; fails=$((fails+1)); fi
+live pid1 ""; p1=$livepid
+printf '%s\n' 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0' > "$d/pid1/env.txt"
+run pid1 1 "live server env without the variable (= default 1) beats env.txt FB=0, 0 demanded" SPEC_EXPECT_FB=0 -- "$d/pid1/serve.log"
+run pid1 0 "live server env without the variable = 1, 1 demanded" SPEC_EXPECT_FB=1 -- "$d/pid1/serve.log"
+mkdir -p "$d/pidx"; cp "$d/prod/serve.log" "$d/prod/serve_cmd.txt" "$d/pidx/"; echo 999999999 > "$d/pidx/server.pid"
+run pidx 1 "dead pid in server.pid, no env.txt, 0 demanded: unverified" SPEC_EXPECT_FB=0 -- "$d/pidx/serve.log"
+kill $p0 $p1 2>/dev/null; wait $p0 $p1 2>/dev/null
 got=$(env -i PATH="$PATH" bash -c "source $here/env/host.env; echo \${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-unset}" 2>&1)
 if [ "$got" = "unset" ]; then echo "ok   host.env (non-speculative lines): the fused boundary variable stays unset = vLLM default 1"; else echo "FAIL host.env FB: got '$got'"; fails=$((fails+1)); fi
 [ $fails = 0 ] && echo "ALL CASES PASSED" || echo "$fails case(s) FAILED"
