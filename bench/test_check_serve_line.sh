@@ -70,6 +70,10 @@ common_muts = [
     ("model", "'model': 'unsloth", "'model': 'other", None, None),
 ]
 
+# the kv-transfer JSON as serve_cmd.txt holds it (shell-quoted): the two fields that a deletion must not hide from the log comparison
+KVC = r'\"kv_connector\":\"SimpleCPUOffloadConnector\"\,'
+KVR = r'\"kv_role\":\"kv_both\"\,'
+
 def log_line(log):
     return [l for l in log.splitlines() if "non-default args" in l][0]
 
@@ -96,6 +100,17 @@ for state in ("spec_1", "spec_0", "ns256_1", "ns256_0", "ns128_1", "ns128_0"):
             argv = [new if x == val else x for x in live(sc)]
         if argv != live(sc):
             check("%s: live command line only: %s" % (state, name), 1, run(argv, sc, log, sc), r"live command line differs")
+
+    # review p2 r2 F3: kv_connector / kv_role deleted from the kv-transfer JSON in ALL copies of the line (live, serve_cmd.txt, derivation) while the log keeps them
+    if "SimpleCPUOffloadConnector" in sc:
+        for field, frag in (("kv_connector", KVC), ("kv_role", KVR)):
+            assert frag in sc, frag
+            ed = sc.replace(frag, "")
+            check("%s: %s deleted from the line (all copies), log unchanged: FAIL" % (state, field), 1, run(live(ed), ed, log, ed), r"kv_transfer_config differs: %s: line .*no %s" % (field, field))
+        # the same edit on the line AND the log (a boot that really ran without them) is consistent for this leg
+        ed = sc.replace(KVC, "").replace(KVR, "")
+        elog = log.replace("kv_connector='SimpleCPUOffloadConnector'", "kv_connector=None").replace("kv_role='kv_both'", "kv_role=None")
+        check("%s: both fields deleted from the line and None in the log: this leg passes" % state, 0, run(live(ed), ed, elog, ed), r"^OK")
 
     # the line the process runs vs the file: one argument dropped / added / reordered
     L = live(sc)

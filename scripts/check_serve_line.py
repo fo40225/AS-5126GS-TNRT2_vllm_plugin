@@ -6,7 +6,8 @@ Three legs, all must hold (exit 0), any difference is a FAIL (exit 1):
      interpreter and the vllm script) equals serve_cmd.txt, argument by argument;
   2. with --derived: serve_cmd.txt equals, byte for byte, the serve line a clean `env -i` dry run of the same script derives from the env files at check time;
   3. the "non-default args" line(s) of the startup log, vLLM's own parse of the arguments, carry exactly the options of that command line with the same values
-     (scalars, the JSON of --speculative-config / --limit-mm-per-prompt and the three fields of --kv-transfer-config), and no option that is not on it.
+     (scalars, the JSON of --speculative-config / --limit-mm-per-prompt and the three fields of --kv-transfer-config, and no kv_connector / kv_role in the
+     log's KVTransferConfig that the command line lacks), and no option that is not on it.
 usage: check_serve_line.py --serve-cmd FILE (--pid PID | --cmdline-file FILE) --log FILE [--derived FILE]
 """
 import argparse
@@ -121,6 +122,16 @@ def kv_transfer_fields(text, want):
             got = ast.literal_eval(m.group(1)) if m else None
             if got != v:
                 bad.append("%s: line %r, command line %r" % (k, got, v))
+    # a key that is NOT on the command line must not be set in vLLM's parse either (S1-11 review p2 r2 F3): a connector or a role that the line lacks but the log
+    # carries means the line was edited while the boot ran another configuration. Only kv_connector and kv_role are read (the other fields of the repr are
+    # generated defaults: engine_id, kv_port, ...).
+    for k in ("kv_connector", "kv_role"):
+        if k in want:
+            continue
+        m = re.search(r"\b%s=('[^']*'|\"[^\"]*\"|[^,)\s]+)" % re.escape(k), text)
+        got = ast.literal_eval(m.group(1)) if m else None
+        if got is not None:
+            bad.append("%s: line %r, but the command line has no %s" % (k, got, k))
     return bad
 
 
