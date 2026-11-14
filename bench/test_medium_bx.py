@@ -1,17 +1,24 @@
 """Standalone 8-process tests of the bf16 exchange of the medium all-reduce (algorithm 2 with BX, r3c), no vLLM model.
 
-usage: py_topo.sh bench/test_medium_bx.py [--quick] [--groups a,b,...]
+usage: [SRC=<vLLM tree>] py_topo.sh bench/test_medium_bx.py [--quick] [--groups a,b,...]
+SRC is needed by the seq group (it imports vLLM's Triton boundary / RMSNorm kernels from the tree); r3c_chain.sh and
+run_r3c.sh export it (default /raid/vllm-runtime/sm120-dev/src).
 Groups (each check prints PASS/FAIL once, aggregated over the 8 ranks):
   emu     algorithm 2 with bf16 exchange == torch emulation (both island partials rounded to bf16, one final rounding)
           for 64 KiB .. 4 MiB, several (grid, block, unroll), randn / mixed / zeros / negzeros (mostly -0.0) inputs
-  bits    random bit patterns (NaN, inf, subnormals, all-ones words): algorithm 2 BX == large algorithm BX bitwise
+  bits    random bit patterns (NaN, inf, subnormals, all-ones words) and mostly -0.0 inputs (sign of zero):
+          algorithm 2 BX == large algorithm BX bitwise
   det     rank-identical bits, run-to-run, eager == CUDA graph replay, batch invariance against the large algorithm
   disp    the dispatch (comm.all_reduce): which sizes / dtypes take the bf16 exchange, env switches, fp16/fp32 exact,
           the max_bytes edge (8 MiB takes algorithm 2, 8 MiB + 128 B the large algorithm) and the algorithm chosen
   seq     random mixed sequences of medium BX / exact / small / large all-reduces and all-gathers in one CUDA graph
           (epoch alignment of the shared call counter, buffer parity), and decode-layer sequences that interleave the
-          BX all-reduce with the fused all_reduce_boundary / all_gather_boundary / all_gather_rmsnorm kernels on the
-          shared regions (T = 8, 4 and a random mix), eager and graph replays against the Triton / torch references
+          BX all-reduce with the fused all_reduce_boundary / all_gather_boundary / all_gather_rmsnorm kernels (only
+          all_reduce_boundary shares the a2/b2/c2 regions with it; the gather kernels share the epoch counter) in
+          the real decode order (T = 8, 4 and a random mix), eager and graph replays against the Triton / torch
+          references
+  rsar    comm.reduce_scatter(x) == the matching rows of comm.all_reduce(x), 128 KiB .. 4 MiB, with the medium
+          exchange on (and not before the 2 MiB switch with it off)
   acc     accuracy vs the fp64 sum: BX vs the exact path vs NCCL (informational, plus a no-bias check)
 """
 import argparse
@@ -66,12 +73,14 @@ def run(rank, args):
 
     def seq_decode(bank):
         """Decode-layer sequences: the BX all-reduce next to the fused all_reduce_boundary / all_gather_rmsnorm /
-        all_gather_boundary kernels, which share the a2/b2/c2 regions and the epoch counter with it (the real T = 8
-        decode step is: embedding all-reduce, then per layer attn-out all-reduce + boundary (exact), pooler all-gather +
-        RMSNorm, MoE-out all-reduce (64 KiB: BX), unpooler all-gather + boundary, and the logits all-gather). Every
-        output is compared with its reference, once from the eager warm-up and once after 3 replays of a CUDA graph:
-        the fused kernels with vLLM's Triton kernels applied to the exact contract / the concatenated shards, the
-        all-reduces with the exact contract or the BX emulation, the all-gathers with the concatenation."""
+        all_gather_boundary kernels. Only all_reduce_boundary runs on the a2/b2/c2 regions of the BX all-reduce;
+        the two gather kernels use other regions and share just the epoch counter with it. The real T = 8 decode
+        step is: embedding all-reduce, then per layer attn-out all-reduce + boundary (exact), pooler all-gather +
+        RMSNorm, MoE-out all-reduce (64 KiB: BX), unpooler all-gather + boundary, and the logits all-gather. Every
+        output is compared with its reference, once from the eager warm-up and once after 3 replays of a CUDA
+        graph: the fused kernels with vLLM's Triton kernels applied to the exact contract / the concatenated
+        shards, the all-reduces with the exact contract or the BX emulation, the all-gathers with the
+        concatenation."""
         from vllm.models.muse_spark.common.ops.fused_rmsnorm import fused_norm_residual_norm_fwd, fused_rmsnorm_fwd
 
         D = 8192
@@ -141,8 +150,8 @@ def run(rank, args):
                 o2 = comm.all_gather_rmsnorm(pool[rank], w4, 1e-6, 1.0)
                 o3 = comm.all_reduce(moe[rank])
                 f4 = torch.empty_like(st2)
-                o4, n4 = comm.all_gather_boundary(unpool[rank], st2, alpha, beta, pre_w, pw, post_eps, pre_eps, post_gain,
-                                                  pre_gain, out_fp32=f4)
+                o4, n4 = comm.all_gather_boundary(unpool[rank], st2, alpha, beta, pre_w, pw, post_eps, pre_eps,
+                                                  post_gain, pre_gain, out_fp32=f4)
                 outs.extend([o1, n1, f1, o2, o3, o4, n4, f4])
 
             refs = bnd_ref(contract_ref(attn, members), st1, weighted)
@@ -194,7 +203,8 @@ def run(rank, args):
             items = []
             for k in range(14):
                 if rng2.random() < 0.6:
-                    items.append(layer_item(rng2.choice([1, 2, 3, 4, 5, 8]), 4000 + 100 * trial + 7 * k, rng2.random() < 0.5))
+                    T = rng2.choice([1, 2, 3, 4, 5, 8])
+                    items.append(layer_item(T, 4000 + 100 * trial + 7 * k, rng2.random() < 0.5))
                 else:
                     items.append(bank_item(rng2.choice(bank)))
             run_plan(f"random mix {trial}", items)
@@ -211,7 +221,7 @@ def run(rank, args):
                 exact = contract_ref(xs, members)
                 if kind == "negzeros":
                     neg0 = int((emu.view(torch.int16) == -32768).sum().item())
-                    ck(f"{kib} KiB negzeros: {neg0} of {emu.numel()} results are -0.0 (the input exercises the sign of zero)",
+                    ck(f"{kib} KiB negzeros: {neg0} of {emu.numel()} results are -0.0 (exercises the sign of zero)",
                        neg0 >= emu.numel() // 4)
                 x = xs[rank]
                 good = True
@@ -233,24 +243,32 @@ def run(rank, args):
                 del xs, emu, exact
             free()
 
-    # ---- 2. random bit patterns: same bits as the large algorithm with BX ------------------------------------------
+    # ---- 2. random bit patterns and mostly -0.0: same bits as the large algorithm with BX ---------------------------
     if "bits" in groups:
         for kib in [64, 256, 1024, 2048] if not args.quick else [256, 1024]:
             shape = shape_for(kib * KIB)
-            x = rand_bits(shape, rank, 410 + kib, dev, torch.bfloat16)
-            ref = comm._all_reduce_large(x, None, 1, bx=True)
-            ref0 = comm._all_reduce_large(x, None, 0, bx=True)
-            out = torch.empty_like(x)
-            bx_call(x, out, (8, 256, 1))
-            torch.cuda.synchronize()
-            ck(f"{kib} KiB random bits: ar2 BX == large BX (fused) bitwise", bits_equal(out, ref))
-            ck(f"{kib} KiB random bits: ar2 BX == large BX (two-launch) bitwise", bits_equal(out, ref0))
-            out2 = torch.empty_like(x)
-            bx_call(x, out2, (3, 64, 2))
-            torch.cuda.synchronize()
-            ck(f"{kib} KiB random bits: ar2 BX other geometry == first", bits_equal(out, out2))
-            del x, ref, ref0
-            free()
+            for kind in ("random bits", "negzeros"):
+                if kind == "random bits":
+                    x = rand_bits(shape, rank, 410 + kib, dev, torch.bfloat16)
+                else:  # sign of zero: most results are -0.0 only if both island partials are -0
+                    x = make_input(rank, shape, 420 + kib, dev, torch.bfloat16, "negzeros")
+                ref = comm._all_reduce_large(x, None, 1, bx=True)
+                ref0 = comm._all_reduce_large(x, None, 0, bx=True)
+                out = torch.empty_like(x)
+                bx_call(x, out, (8, 256, 1))
+                torch.cuda.synchronize()
+                if kind == "negzeros":
+                    neg0 = int((ref.view(torch.int16) == -32768).sum().item())
+                    ck(f"{kib} KiB negzeros: {neg0} of {ref.numel()} results are -0.0 (exercises the sign of zero)",
+                       neg0 >= ref.numel() // 4)
+                ck(f"{kib} KiB {kind}: ar2 BX == large BX (fused) bitwise", bits_equal(out, ref))
+                ck(f"{kib} KiB {kind}: ar2 BX == large BX (two-launch) bitwise", bits_equal(out, ref0))
+                out2 = torch.empty_like(x)
+                bx_call(x, out2, (3, 64, 2))
+                torch.cuda.synchronize()
+                ck(f"{kib} KiB {kind}: ar2 BX other geometry == first", bits_equal(out, out2))
+                del x, ref, ref0
+                free()
 
     # ---- 3. determinism --------------------------------------------------------------------------------------------
     if "det" in groups:
@@ -288,10 +306,10 @@ def run(rank, args):
             del xs
             free()
 
-    # ---- 4. dispatch -------------------------------------------------------------------------------------------------
+    # ---- 4. dispatch -----------------------------------------------------------------------------------------------
     if "disp" in groups:
-        # (label, nbytes, shape): the KiB sizes plus the max_bytes edge: exactly max_bytes (a full phase-a slot) is the last
-        # message of algorithm 2, one 128-byte pack more is the first one of the large algorithm
+        # (label, nbytes, shape): the KiB sizes plus the max_bytes edge: exactly max_bytes (a full phase-a slot) is the
+        # last message of algorithm 2, one 128-byte pack more is the first one of the large algorithm
         cases = [(f"{kib} KiB", kib * KIB, shape_for(kib * KIB)) for kib in [32, 64, 128, 512, 1024, 2048, 4096, 8192]]
         edge = comm.max_bytes + 128
         assert comm.max_bytes == 8192 * KIB, comm.max_bytes
@@ -373,7 +391,45 @@ def run(rank, args):
         del bank
         free()
 
-    # ---- 6. accuracy ------------------------------------------------------------------------------------------
+    # ---- 6. reduce_scatter vs the rows of all_reduce ----------------------------------------------------------------
+    if "rsar" in groups:
+        # reduce_scatter always runs the large algorithm with the bf16 exchange (flag on). With the medium exchange on,
+        # the bf16 all-reduce rounds the same two island partials (algorithm 2 BX), so its rows block is the
+        # reduce_scatter result from 128 KiB on. With the medium exchange off the all-reduce below 2 MiB is exact and
+        # the equality is gone (why the plugin capability reduce_scatter_all_gather_matches_all_reduce stays off while
+        # the flag is on).
+        paths = []
+        comm._note = lambda op, x, algo: paths.append((op, algo))
+        for kib in [128, 256, 512, 1024, 2048, 4096] if not args.quick else [128, 1024]:
+            shape = shape_for(kib * KIB)
+            tb = shape[0] // WORLD
+            mine = slice(rank * tb, (rank + 1) * tb)
+            for kind in ("randn", "mixed"):
+                xs = [make_input(r, shape, 1100 + kib, dev, torch.bfloat16, kind) for r in range(WORLD)]
+                x = xs[rank]
+                assert comm.supports("reduce_scatter", x), (kib, shape)
+                del paths[:]
+                comm.medium_bx, comm.bf16_exchange = True, True
+                rs = comm.reduce_scatter(x)
+                ar = comm.all_reduce(x)
+                ag = comm.all_gather(rs, 0)
+                comm.medium_bx = False
+                ar_off = comm.all_reduce(x)
+                comm.medium_bx = True
+                torch.cuda.synchronize()
+                ck(f"{kib} KiB {kind}: medium BX on: reduce_scatter {paths[0]} == rows of all_reduce {paths[1]}",
+                   paths[:2] == [("reduce_scatter", "large"), ("all_reduce", "2bx")] and bits_equal(rs, ar[mine]))
+                ck(f"{kib} KiB {kind}: medium BX on: all_gather(reduce_scatter) == all_reduce", bits_equal(ag, ar))
+                ck(f"{kib} KiB {kind}: medium BX on: all_reduce == BX emulation",
+                   bits_equal(ar, contract_ref_bx(xs, members)))
+                same_off = bits_equal(rs, ar_off[mine])
+                ck(f"{kib} KiB {kind}: medium BX off: reduce_scatter == rows of all_reduce is {same_off} "
+                   f"(true only from {comm.ar_large_min >> 20} MiB)", same_off == (kib * KIB >= comm.ar_large_min))
+                del xs, rs, ar, ag, ar_off
+            free()
+        del comm._note
+
+    # ---- 7. accuracy ------------------------------------------------------------------------------------------
     if "acc" in groups:
         for kind in ("randn", "mixed"):
             shape = shape_for(1024 * KIB)
@@ -412,7 +468,7 @@ def run(rank, args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--groups", default="emu,bits,det,disp,seq,acc")
+    ap.add_argument("--groups", default="emu,bits,det,disp,seq,rsar,acc")
     ap.add_argument("--port", type=int, default=29723)
     args = ap.parse_args()
     mp.spawn(worker, args=(args,), nprocs=WORLD, join=True)

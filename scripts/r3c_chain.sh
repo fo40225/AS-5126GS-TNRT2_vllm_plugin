@@ -22,7 +22,7 @@ ok_kernel=1
 if has test; then
   say "stage test"
   # hard correctness groups gate the real-weight stages; the accuracy group (soft thresholds, informational) runs apart
-  BENCH_WATCHDOG_S=1200 bash ../scripts/py_topo.sh test_medium_bx.py --groups emu,bits,det,disp,seq > "$O/test_medium.log" 2>&1
+  BENCH_WATCHDOG_S=1200 bash ../scripts/py_topo.sh test_medium_bx.py --groups emu,bits,det,disp,seq,rsar > "$O/test_medium.log" 2>&1
   rc=$?; say "test_medium_bx (hard groups) rc=$rc"; tail -4 "$O/test_medium.log"; grep '^FAIL' "$O/test_medium.log" | head
   [ "$rc" != 0 ] && ok_kernel=0
   BENCH_WATCHDOG_S=600 bash ../scripts/py_topo.sh test_medium_bx.py --groups acc > "$O/test_medium_acc.log" 2>&1

@@ -3,7 +3,8 @@
 Reference = ``TopoComm.all_reduce`` followed by vLLM's Triton ``fused_norm_residual_norm_fwd`` (the unfused production path):
 the fused kernel must give the same bits for ``out`` (bf16), ``new_stream`` (fp32) and ``out_fp32`` on every rank, eager and in
 a CUDA graph, for T = 1..64, both boundary variants (post-norm without weight / weight-first post-norm), mixed with other
-collectives (counter and double-buffer alignment).
+collectives (counter and double-buffer alignment). The bf16 exchange is pinned off in the test (it would turn the
+unfused reference of T = 4 .. 8 into a bf16-exchange all-reduce, which the always-exact fused kernel does not match).
 
 usage (server, under the GPU lock): GPU=0,1,2,3,4,5,6,7 SRC=<vllm tree> scripts/py_topo.sh bench/test_ar_boundary.py [--quick]
 """
@@ -55,7 +56,9 @@ def run(rank, args):
     from muse_topo import TopoComm
     from vllm.models.muse_spark.common.ops.fused_rmsnorm import fused_norm_residual_norm_fwd
 
-    comm = TopoComm(cpu_group, dev, rank, WORLD)
+    # The reference is the exact comm.all_reduce, which the fused kernel always matches. env/host.env turns the bf16
+    # exchange on (large and medium all-reduces, T = 4 .. 8 included): pin it off whatever the environment says.
+    comm = TopoComm(cpu_group, dev, rank, WORLD, bf16_exchange=False)
     log(rank, "TopoComm up:", comm.info.summary)
     Ts = [1, 2, 3, 4, 5, 8, 9, 16, 24, 33, 48, 64] if not args.quick else [1, 8, 64]
     alpha, beta, post_w, pre_w = make_params(dev, 5)
