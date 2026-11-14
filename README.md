@@ -55,6 +55,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │                                （放在 PYTHONPATH 上就會被 vLLM 找到，不需要 pip install）
 ├── env/host.env                 主機環境變數：NCCL_P2P_LEVEL=SYS、MUSE_TOPO_ENABLE=1、bf16 exchange 與 NCCL graph file（2026-10-24 起預設 ON），其他選項以註解列出
 ├── env/spec_k7.env              speculative decoding（RadixArk DFlash2 K=7）專用的 launch profile：`--max-cudagraph-capture-size 256` 與 `--max-num-batched-tokens 8199` 與 `--max-num-scheduled-tokens 8192`（S1-14 F2，2026-11-10：vLLM 0.33.0 的 DFlash draft slots 為 0，MNBT 8199 會排出 8199-token 的 chunk 而失去對齊，32k 冷 prefill 約 +2.0 %；cap 把 chunk 壓回 8192，MNBT 不變，KV bytes 依原始碼預期不變（待 S1-14 A/B 實測：KV blocks 572,276 per rank、READY MiB）；`MUSE_SPEC_MNST` 可覆寫，0 = 不加旗標；`check_spec_launch.sh` 由 `non-default args` log 行與 serve_cmd.txt 檢查，`SPEC_EXPECT_MNST`）（S1-9 L5：K=7 下 chunk 對齊成 8192 tokens，16k / 32k TTFT -3.5 / -2.7 %；`MUSE_SPEC_MNBT` 可覆寫）搭配 `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`，另設 `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1`（S1-9 lever 2：speculative 下的 prefill microbatch overlap，opt-in），另 export `VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2`（S1-9 L4：DFlash2 aux projection 由 target forward 在各 rank 的 rows 上做，vLLM 預設），並 export `VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2` 與 `VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL=cutlass`（S1-9 L7：DFlash2 draft 的 30 個 linear 與 candidate head 以 FP8 權重（e4m3，per-channel scale，cutlass W8A8）運行，vLLM 預設；pooled c1/c16/c32 +1.50 %、STEADY c1 -3.2 %、AL 不變），並 export `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136`（S1-9 L11：FULL decode CUDA graph 的 capture 內改走 sequence parallel（reduce-scatter + all-gather、row-sharded GEMM），17..32 個 request 的 verify batch 不再 replicated；`MUSE_SPEC_GRAPH_SP_MIN_TOKENS` 可覆寫，0 = 關；STEADY c20..c32 -1.9..-7.0 %、real greedy c24 / c28 / c32 +0.9 / +2.3 / +2.3 %，capture list 與 KV bytes 不變；需要含該功能的 vLLM tree；capture list 拉到 384（`MUSE_SPEC_GRAPH_CAP`，A1b）未通過 gate，見 `docs/s19_spec_launch.md`），並提供該組合的 exact KV bytes `MUSE_SPEC_KV_BYTES`：FC_SHARD=2 且 FP8=2 時 11720212480（1,649,935 tokens，S1-13：vLLM 0.33.0 線重新推導，0.32.0 時為 11573411840 / 1,629,269 tokens），FP8=1 時 11781017600（1,658,495 tokens），FP8=0 時 11134914560（1,567,538 tokens），FC_SHARD≠2 時 10373877760（FP8=1 / FP8=0 / FC_SHARD≠2 三個值仍是 0.32.0 推導，未在 0.33.0 重新推導）；旗標、kernel 與 bytes 必須成對，由 `check_spec_launch.sh` 從 boot log 的 FP8 success line 讀出狀態並檢查（未設 r2e 旗標的 speculative launch 維持 10526351360；只在 host.env 之後 source，見 `docs/s19_spec_launch.md`）　S1-10R Phase 2b（2026-11-11）：Phase 0 曾在此 profile export `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`（只依 c1 的 AL），Phase 2b 依預先登記的規則改回：此檔不再設定也不 export 該變數，speculative launch 跑 vLLM 預設 1（fused boundary ON，與 host `3192c6dd77` 相同）。證據（real greedy tok/s，gsm80 + mtbench80，兩個 boot 合併）：c1 FB1 242.69 vs FB0 247.07（FB0 +1.80 %），c2 FB1 362.55 vs FB0 356.24（FB0 -1.74 %，系統性：兩個 boot 差在 0.1 % 內），c2 未達「>= FB1 - 0.5 %」所以 revert；STEADY c1 17.30 / 17.20、c2 22.40 / 22.55、c16 55.84 / 55.58 ms；FB0 會移除 all_gather_boundary、all_gather_rmsnorm、all_reduce_boundary、gemv_all_gather_boundary、gemv_all_gather_rmsnorm，T = 16 時只少 pooler 的 all_gather_rmsnorm（c2 的損失）；後續 S1-17：保留 pooler 各 kind（T <= 16），只把 ar / ag boundary 限制在 T <= 4（預期、未量測：FB0 實測 c1 +1.80 % 只是上限；ns c8 +1.20 % 是 S1-14 F1 相對 CTL 的退步，不是實測增益）；`check_spec_launch.sh` 保留 `fb=` 偵測，正式 profile 的預期為 FB=1（`SPEC_EXPECT_FB` 未設 = 1，`SPEC_EXPECT_FB=1` 亦可；偵測到 0 而未傳 `SPEC_EXPECT_FB=0` 即 FAIL）
+├── env/offload.env              NUMA-local KV CPU offload（S1-10）：`--numa-bind` + SimpleCPUOffloadConnector，每個 rank 45 GiB（48,318,382,080 B）的 pinned tier；在 `env/host.env` 之後、`env/spec_k7.env` 之前 source，同時設定 offload 開啟時的 exact `--kv-cache-memory-bytes`（speculative 11,525,693,440）
 ├── scripts/
 │   ├── deploy_host.sh           本機 -> 伺服器 mirror 的 rsync（只同步本資料夾）
 │   ├── run_src_topo.sh          /raid/vllm-runtime/musetest/run_src.sh 的副本：把本資料夾加進 PYTHONPATH、source env/host.env，
@@ -67,6 +68,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── run_h2.sh                vLLM plugin 的驗證序列（steps：plugin e2e_* compare ops bench* real_* ...）
 │   ├── prefill_chain.sh         一次 lock 內依序啟動多組 server 設定、量單一 request 的 prefill latency（microbatched prefill 的 A/B；搭配 bench/prefill_probe.py）
 │   ├── check_spec_launch.sh     由 serve log 確認 speculative launch profile 有生效（SP floor 384、graph 上限 256、chunk 8199、S1-14 F2：`--max-num-scheduled-tokens 8192`；S1-9 L11：graph floor 136 行與「flagged FULL decode graph」行，graph floor 已設但沒有 FULL decode graph 達到該 floor 的 launch 視為失效；不符就 exit 1）　S1-10R Phase 0：fused boundary 沒有任何 log 行，狀態改優先讀 server 行程的 `/proc/<pid>/environ`（pid 來自 `server.pid` / `serve.pid` 或 log 的 `APIServer pid=`），其次是 serve.log 旁的 `env.txt`（driver shell 的快照）；兩者都沒有則為 unverified（`SPEC_EXPECT_FB=0|1`；正式 profile 預期 FB=1（未設 = 1；FB0 arm 才傳 `SPEC_EXPECT_FB=0`，Phase 2b）；OK 行帶有 `fb=<0|1|unverified>`）
+│   ├── check_offload_launch.sh  由 serve log / serve_cmd.txt 確認 offload 有生效（8 個 worker 的 NUMA binding、scheduler 與 worker 的 CPU block 數一致、layout、沒有 `enable_mm_embeds is True`、KV bytes 不超過 offload-on 上限；S1-10）
 │   ├── run_r3c.sh               medium all-reduce（r3c）的驗證 / 量測步驟（steps：medium_test h1a_quick h1b_quick bench_* ...）
 │   ├── r3c_chain.sh             r3c 在一次 GPU lock 內的完整序列：測試、sweep、產生 table、dispatch 檢查、real-weight concurrency A/B、GSM8K smoke
 │   └── conc_sweep.sh            real weights、單一 server session 的 concurrency sweep（random 512/128，可重複；r2 sweep script 的參數化副本）
@@ -86,6 +88,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
 │   ├── r3b_gemv_push.md         decode 的 pooler / unpooler GEMV 與 all-gather 融合（r3b）：算術與精度、protocol、環境變數、S1-4a 量測
 │   ├── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
+│   ├── s110_numa_offload.md     S1-10：NUMA-local KV CPU offload — connector 2x2 比較、每個 rank 的 tier 大小公式與量測、offload 開啟後的 exact GPU KV bytes、determinism、CPU bytes per token
 │   └── a1_table_retune.md       S1-9 L9 A1：bf16 exchange 下 dispatch table 的逐 size 重調（verify band c1 .. c128 與 prefill chunk 的 message size、reduce-scatter 8 blocks、2bx slabs、方法與 bitwise 證明）；S1-9 L10 model-level gate（2 x 2 factorial）通過，已合併
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
@@ -184,6 +187,14 @@ vLLM 繼續使用 NCCL（不會 crash）。看每個 collective 實際走哪條�
 ### 4.5 關閉與 A/B
 
 `MUSE_TOPO_ENABLE=0` 即回到純 NCCL（同一條啟動路徑）。只關 large-message 演算法：`MUSE_TOPO_LARGE=0`；只讓部分 op 走 topo：`MUSE_TOPO_OPS=all_reduce`。
+
+### 4.6 NUMA-local KV CPU offload（S1-10，選用；細節 `docs/s110_numa_offload.md`）
+
+`source env/host.env; source env/offload.env; source env/spec_k7.env`（speculative；`offload.env` 必須在 `spec_k7.env` 之前，因為它設定 `MUSE_SPEC_KV_BYTES_OVERRIDE`），再把 `$MUSE_OFFLOAD_SERVE_ARGS`
+（`--numa-bind --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both",...}'`）接在 `vllm serve` 後面，KV bytes 用 `$MUSE_SPEC_KV_BYTES`（11,525,693,440）。開機後跑 `scripts/check_offload_launch.sh <serve.log>`。
+結果（real weights、spec profile）：64k / 118k prompt 的 re-admission TTFT 6.30 / 12.44 s -> 0.29 / 0.47 s；比 GPU pool 大 1.6 倍的 working set 循環讀取時 TTFT p50 5.9 -> 0.24 s、throughput 10.9k -> 217k prompt tokens/s；
+沒有 reuse 時 decode -0.5 %（三次 boot 的 gmean）。需要 vLLM branch 的 `receives_remote_kv` 修正（沒有的話 kv_both connector 會把 text-only launch 切到 multimodal embedding 路徑，多 128 MiB GPU memory）。
+`MUSE_OFFLOAD=0` 回到沒有 offload 的 launch。native `OffloadingConnector` 已量測、不採用（每個 worker pin 整個 region：boot +100 s .. +21 分鐘、GPU page table 8 倍、decode -1.2 .. -2.1 %）。
 
 ## 5. 設定一覽與 accuracy class
 
@@ -425,6 +436,7 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 * 實測拓樸與瓶頸：`docs/topology.md`；演算法與 API：`docs/h1a_collectives.md`、`docs/h1b_collectives.md`；latency 表：`docs/h1a_latency.md`、`docs/h1b_latency.md`；
   plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；pooler / unpooler GEMV 與 all-gather 融合：`docs/r3b_gemv_push.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
   speculative launch 的 graph 上限 / sequence-parallel floor 組合與 prefill overlap（S1-9 lever 1、lever 2）：`docs/s19_spec_launch.md`；S1-10R Phase 0（spec profile 關閉 fused boundary）與 Phase 2b（2026-11-11，改回 fused boundary ON）亦在同一檔案。
+  NUMA-local KV CPU offload（connector 比較、tier 大小公式、GPU KV bytes、determinism；S1-10）：`docs/s110_numa_offload.md`，量測工具 `bench/s110/`，檢查 `scripts/check_offload_launch.sh`（測試 `bench/test_check_offload_launch.sh`）。
 * 伺服器上的資料（不在本資料夾）：benchmark 結果 `/raid/vllm-runtime/musetest/results/<tag>/`；測試 / benchmark 的 log 與 jsonl `/raid/vllm-runtime/work/host/`；
   JIT cache `/raid/vllm-runtime/sm120-dev/vllm_cache/muse_topo/`；拓樸量測 script 與原始結果 `/raid/vllm-runtime/musetest/topo/`；NCCL 量測 `/raid/vllm-runtime/musetest/nccl/`。
 * 歷史：H1a（小訊息演算法）、H1b（large-message 演算法）、H2 / H2b（vLLM plugin）、review fixes（64-bit counter / flags、supports() 與 kernel 一致、fp16 的 bf16 exchange 溢位、對齊與 stream 規則，2026-10-24）、H3（本資料夾的定稿）。
