@@ -300,3 +300,135 @@ the eager bits, the FP8 head's cross-rank top-k returns the aimed token of every
 
 **Not done / limits.** The eager rows above 256 draft rows (c33 and up) gain a fraction of the microbench prediction (two Python-wrapped ops per FP8 linear, ~40-55 us of CPU per layer; measured +0.7 .. 1.5 % STEADY at c40 .. c128 against -1.5 % predicted at c64);
 a fused act-quant or one composite custom op is the follow-up. Marlin and the per-M torch rowwise GEMM switching were not built into the default.
+
+## S1-9 L11: sequence parallel inside the FULL decode graphs (A1a / A1b), OFF by default
+
+**Status: implemented and tested, microbenched, NOT adopted: the gate (3 sessions, real prompts, guards, GSM8K, determinism, exact bytes) has not run.**
+`env/spec_k7.env` and `scripts/check_spec_launch.sh` carry the switches; with both at their defaults the sourced environment, `MUSE_SPEC_SERVE_ARGS`, the KV bytes and every boot check
+are the production ones (checked: the `env` dump after sourcing is identical to host 3cc7825, and a feature-tree boot with the flags unset is the `off_OFF` row below).
+
+### What it changes
+
+The vLLM branch (muse/s19-graphsp, 3 commits on 6da60b3062) shards the residual stream inside the FULL decode CUDA graphs from a floor of its own,
+
+    VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=<n>   (default 0 = off; raised to 129, the muse decode engine's 128 tokens + 1)
+
+for the warm-up and the capture pass of a decode-only FULL graph (`ForwardContext.full_decode_graph`, set by `ModelCudaGraphManager`); eager batches, mixed batches and the PIECEWISE
+graphs keep `sm120_sequence_parallel_min_tokens` (max(MIN_TOKENS 384, 257, cap + 1), unchanged). The model, every decoder layer and every attention output projection take their decision
+in one function, so they cannot disagree on a batch. Below 129 tokens the stream stays replicated (the muse decode kernel serves T <= 128 and cannot take the sharded path:
+`sm120_nvfp4_moe.py:816` assert). A verify batch is T = 8c: n = 136 shards c17..c32 inside the graphs the profile captures anyway (A1a, cap 256, no new graph size: pool 0.95 -> 0.92 GiB), and a larger
+capture list (`--max-cudagraph-capture-size 384`: the default grid adds 272..384 in steps of 16) puts c33..c48 into FULL graphs too (A1b).
+
+| requests | T | CTL (production) | A1a (`MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136`) | A1b (A1a + `MUSE_SPEC_GRAPH_CAP=384`) |
+|---|---|---|---|---|
+| 1..16 | 8..128 | FULL graph, replicated, fused decode kernels | the same | the same |
+| 17..32 | 136..256 | FULL graph, replicated | FULL graph, sequence-parallel | the same as A1a |
+| 33..47 | 264..376 | eager, replicated (launch-bound, ~93 ms floor) | the same | FULL graph (padded to the step-16 size), sequence-parallel |
+| 48 | 384 | eager, sequence-parallel | the same | FULL graph, sequence-parallel |
+| 49..64 | 392..512 | eager, sequence-parallel | the same | the same (eager above the cap) |
+| mixed / prefill batches | 257..384 | eager, replicated (257..383), SP (384) | the same | PIECEWISE graph, replicated (the cap moves the eager floor to cap + 1 = 385) |
+
+Accuracy class: rounding level, deterministic (row-sharded GEMMs, reduce-scatter + all-gather instead of an all-reduce: the class of the stream above 384 tokens that production already runs eagerly);
+with the host plugin's collectives the reduce-scatter + gather equals the all-reduce bitwise (tested below).
+
+### Launch lines
+
+    A1a:  MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136 source env/spec_k7.env      -> VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136, graphs <= 256, bytes 11,573,411,840 (safe, not exact: the pool shrinks 24 MiB)
+    A1b:  MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136 MUSE_SPEC_GRAPH_CAP=384 MUSE_SPEC_KV_BYTES_OVERRIDE=<S1-7 bytes of the cap> source env/spec_k7.env     (a cap above 256 without the override logs a warning: the bytes are the cap-256 ones)
+    check: SPEC_EXPECT_GRAPH_SP=136 [SPEC_CAP_MAX_BYTES=<bytes>] scripts/check_spec_launch.sh serve.log [385 384]
+
+`check_spec_launch.sh` reads the graph-floor line of the boot log ("sequence parallel inside FULL decode CUDA graphs for batches of at least <g> tokens ..."), not the env; the floor on it must be the eager floor
+of the first line (cap + 1 above a cap of 383); a graph floor at or below 128, a set vLLM env without the line, or a cap above 256 without `SPEC_CAP_MAX_BYTES` FAIL (`bench/test_check_spec_launch.sh`: 21 synthetic-log cases).
+
+### Graph safety (host plugin collectives inside the FULL graphs)
+
+The muse_topo kernels keep their state on the device only (a 64-bit per-GPU call counter selects the double-buffered receive slots and the flag tags; no host state per call), so the
+reduce-scatter / all-gather of the sharded stream are captured and replayed like the all-reduces before them. Evidence of this item (all with the host plugin's collectives, MUSE_TOPO_ENABLE=1, asserted):
+- `test_sharded_stream_replays_from_a_full_decode_graph` (8 GPUs): the attention-output reduce-scatter + gather captured at 136, 137, 200, 256, 263, 264, 272, 376, 384, 400 and 512 tokens (multiples of 8 and padded rows):
+  the graph replays the bits of the warm-up pass (single call and a chain of three layers' worth), 20,000 replays at 136 and 272 tokens next to eager calls of other sizes (flagged and not, so the counter parity
+  alternates between graph and eager launches) give the same bits again, every rank holds the same bits, reduce-scatter + gather == all-reduce bitwise (NCCL: rel. L2 4.6e-3, graph == eager as well), an eager forward of
+  the same projection stays replicated below 384 tokens.
+- `test_sharded_branch_*` (real router, pooler, unpooler, NVFP4 / BF16 / Marlin experts, packed latent, EP): now also 136, 137, 200, 264, 272, 400 tokens, captured and replayed == eager.
+- Real boots: the op summary of a graph-floor boot lists `reduce_scatter(dim=0) shape=(136..256, 4096 / 8192) bfloat16 capturing=True -> topo` (A1a: 16 sizes x 2 shapes; cap 384: 24 sizes) and the matching
+  `all_gather` shapes (17..., 8192 bf16 etc.), 0 `-> nccl`, 0 errors / tracebacks / OOM in every boot, and the per-size op log reads `capturing=False` (the FULL warm-up) before `capturing=True` at 136, 272 and 384 although
+  the PIECEWISE graphs are captured first: the PIECEWISE passes (mixed batches) are never sharded.
+
+### Tests (feature tree 2fd5205acc = muse/s19-graphsp, server tree src_s19-graphsp, host mirror host_topo_s19-graphsp)
+
+| suite | feature tree | production tree (6da60b3062) |
+|---|---|---|
+| Muse suite (tests/kernels/{moe,core}/test_muse_spark*.py, 1 GPU) | 3666 passed / 200 skipped / 0 failed | 3645 / 199 (L7): +21 new CPU tests, +1 skip = the new 8-GPU test on 1 GPU |
+| SP file, 8 GPUs, NCCL | 99 passed | 77 (L10) + 22 new |
+| SP file, 8 GPUs, host plugin | 97 passed, 2 failed (world-2 variants of test_sharded_branch_*: `NCCL error: unhandled system error` under host.env) | the same 2 fail on the production tree |
+| r2e file (test_muse_spark_sm120_prefill_overlap.py), 8 GPUs | 53 passed / 8 skipped; with MUSE_R2E_REAL_CONFIG=1 (NCCL and host plugin) 61 passed | - |
+| tests/v1/spec_decode + target-dependent AR speculator | 100 failed / 490 passed / 11 skipped, failing set identical to production's (diff empty vs L6 spec_base.failed) | 100 |
+| tests/v1/cudagraph + worker cudagraph / ubatch / attn_utils files | 12 failed / 277 passed / 2 skipped | 12 failed / 270 passed / 2 skipped, failing set identical |
+| bench/test_check_spec_launch.sh (host, no GPU) | 24 cases pass | - |
+
+### Microbench in real boots (STEADY step ms, c requests with long outputs, 3 x 10 s windows per cell, engine counters, GPU 0 clocks sampled; round-6 driver `drive_r6.py`)
+
+Protocol: production speculative line (host.env + env/spec_k7.env of the host mirror, FP8 draft 2, FC shard 2, r2e, MNBT 8199, real weights, TP8 + EP8), 3 boot groups, every group boots CTL / A1a / A1b384 back to back
+(order rotated: CTL-A1a-A1b, A1b-CTL-A1a, A1a-A1b-CTL), cells c1 (cold), c16, 20, 24, 28, 32, 33, 36, 40, 44, 47, 48, 49, 50, 56, 64, c1 again (after the sequence-parallel band); differences are paired inside the boot group
+(boot-to-boot level shifts of 1.3 % exist: c1 is 17.25 or 17.02 ms per boot state). CTL = the production tree (sm120-dev/src = 6da60b3062) at 11,573,411,840 bytes; A1a = feature tree, graph floor 136, cap 256, the same bytes;
+A1b384 = feature tree, graph floor 136, `--max-cudagraph-capture-size 384` at **10,774,691,840 bytes (-762 MiB: the pool grows 216 MiB; exact bytes are the gate's S1-7 job)**. All 9 boots clean (0 errors / OOM, check_spec_launch OK,
+FP8 draft 8/8, level 4 8/8).
+
+| cell | CTL ms (mean of 3 boots) | A1a - CTL ms (%) | A1b384 - CTL ms (%) |
+|---|---|---|---|
+| c1 cold | 17.25 | -0.07 (-0.4%) | -0.07 (-0.4%) |
+| c1 after the SP band | 17.25 | -0.07 (-0.4%) | -0.23 (-1.3%) |
+| c16 | 55.59 | -0.24 (-0.4%) | -0.38 (-0.7%) |
+| c20 | 65.87 | -1.03 (-1.6%) | -1.40 (-2.1%) |
+| c24 | 70.96 | -2.71 (-3.8%) | -2.86 (-4.0%) |
+| c28 | 76.99 | -4.49 (-5.8%) | -4.83 (-6.3%) |
+| **c32** | 82.29 | **-6.08 (-7.4%)** [-5.82 -6.41 -6.01] | -6.27 (-7.6%) [-6.20 -6.22 -6.40] |
+| c33 | 88.81 | +0.08 (+0.1%) | **-9.48 (-10.7%)** [-9.73 -9.16 -9.54] |
+| c36 | 92.52 | -0.56 (-0.6%) | **-12.34 (-13.3%)** |
+| c40 | 95.55 | -0.41 (-0.4%) | **-12.28 (-12.9%)** [-12.34 -11.92 -12.58] |
+| c44 | 100.51 | -0.33 (-0.3%) | **-14.07 (-14.0%)** |
+| c47 | 103.84 | -0.33 (-0.3%) | **-13.26 (-12.8%)** |
+| c48 | 94.16 | -0.37 (-0.4%) [+1.48 -1.46 -1.14: noise of the launch-bound eager cell] | **-4.20 (-4.5%)** [-3.91 -4.77 -3.92] |
+| c49 / c50 | 94.54 / 94.73 | -0.29 / +0.00 | -0.29 / -0.09 (eager above the cap, like CTL) |
+| c56 / c64 | 98.33 / 104.44 | -0.21 / -0.23 | -0.52 / -0.47 (inside the window noise) |
+
+The round-6 probe numbers reproduce (probe: A1a c32 -6.0, c28 -4.1, c24 -2.4, c20 -1.4; A1b c33 -9.3, c36 -11.7, c40 -12.2, c44 -13.7, c47 -12.9, c48 -4.2, c56 -1.3, c64 -1.6 ms). c1 / c16 guards: no regression (c1 never above CTL by more than 0.01 ms in any boot; the boot
+state shows as 17.25 or 17.02 / 17.03 ms: CTL 17.25 in 6 of 6 c1 cells, A1a 17.25 in 4 of 6 (17.02 / 17.03 in the second group), A1b384 17.02 / 17.03 in 4 of 6 (and 17.02 in both group-4 cells), A1b400 17.25 / 17.26; the state is per boot and was not attributed to the arm). Acceptance length in the STEADY cells (tokens per draft, greedy, informational):
+c32 CTL 4.43 / A1a 4.63 / A1b 4.55, c40 4.32 / 4.31 / 4.50, c48 4.39 / 4.37 / 4.40, c64 4.38 / 4.40 / 4.42 (rounding-level numerics move the greedy continuations; no loss).
+Flags-off feature tree (`off_OFF`, one boot): c1 17.25 / 17.25, c16 55.31, c32 82.21, c40 95.73, c48 94.56, c64 104.33 ms = CTL within noise; idle 94,165 MiB, pool 0.95 GiB, no graph-floor line: default off is production.
+
+### Capture list for A1b: memory (pool boots at 10,774,691,840 bytes; idle MiB per GPU, normalised to the production bytes by +762 MiB) and the choice of 384
+
+| arm | capture list | graph pool | idle at the boot bytes | idle at production bytes | vs CTL |
+|---|---|---|---|---|---|
+| CTL | 1..256 | 0.95 GiB | 93,403 | 94,165 (= production's own) | - |
+| A1a | 1..256 | 0.92 GiB | 93,379 | 94,141 | -24 MiB |
+| cap 384 | default grid, 272..384 step 16 (8 new sizes) | 1.16 GiB | 93,619 | 94,381 | +216 MiB (about -2.0 % KV at equal headroom: -31.9k of 1,629k tokens per rank) |
+| cap 400 | 272..400 (9 new) | 1.18 GiB | 93,639 | 94,401 | +236 MiB |
+| cap 512 | 272..512 (17 new) | 1.43 GiB | 93,901 | 94,663 | +498 MiB (about -4.5 % KV) |
+| explicit step-8 list 264..384 | 16 new sizes | 1.34 GiB | 93,807 | 94,569 | +404 MiB |
+
+Cap 384 is the set to gate: the gain sits in c33..c48 (-9.5 .. -14 ms, c48 -4.2), group 4 (CTL / A1b384 / A1b400, STEADY c40 .. c56) shows nothing for the extra sizes (A1b400 c49 +0.30, c50 -0.88, c52 +0.02 ms against CTL; the launch-bound eager SP cells
+c49 .. c64 already sit at the GPU line, 94 .. 104 ms), and the pool grows with every size (a step-8 list costs 0.18 GiB more than the step-16 grid for the odd request counts' padding, ~0.4 ms, not measured as a gain here). The cap also moves the eager floor to cap + 1 = 385 and puts
+mixed batches of 257 .. 384 tokens into PIECEWISE graphs (replicated): measured only through the real-prompt rows below. The exact A1b bytes need the S1-7 procedure (stress REPS = 2); the estimate above is the pool delta only.
+
+### Real-prompt smoke (informational: ONE boot group g5, closed loop, n = 4c requests, 256 tokens, natural EOS, cold prefill by salts, greedy, 3 repeats per cell; boot-state offset up to 1.3 %; not the gate)
+
+| c | CTL out tok/s | A1a vs CTL | A1b384 vs CTL | TTFT ms CTL / A1a / A1b384 |
+|---|---|---|---|---|
+| 24 | 1060 | +3.4 % | +4.2 % | 790 / 771 / 777 |
+| 28 | 1153 | +4.2 % | +5.3 % | 852 / 803 / 790 |
+| 32 | 1201 | +2.8 % | +4.0 % | 927 / 927 / 906 |
+| 36 | 1215 | +1.8 % | +7.2 % | 1106 / 1036 / 996 |
+| 40 | 1280 | +0.9 % | +7.9 % | 1135 / 1092 / 1071 |
+| 44 | 1341 | +0.4 % | +6.3 % | 1176 / 1154 / 1133 |
+| 48 | 1407 | +0.7 % | +4.4 % | 1209 / 1182 / 1150 |
+
+(probe, SP also in the PIECEWISE passes: c24 +0.8, c28 +3.4, c32 +4.0 with A1a; c36 +5.9, c40 +5.5, c44 +6.7, c48 +2.9 with A1b). No failed requests, TTFT not worse in any cell, acceptance length 4.45 .. 4.58 for CTL and 4.46 .. 4.60 for A1a / A1b (never more than 0.02 below CTL in a cell).
+KV trade of A1b384 (estimate): -2.0 % KV tokens per rank against +4.4 .. +7.9 % real-prompt tok/s at c36 .. c48 (c33..c47 band) in this one session.
+
+### Not done here (the gate, SG_COMMON template)
+
+3 counterbalanced sessions with the pre-registered rule, real-prompt c28 .. c48 (primary) and guards c1 / c16 cold AND after SP-band traffic, c56 .. c128, TTFT 8k / 16k / 32k and low-c TTFT of 300 .. 3000-token prompts, churn,
+non-speculative c1 / c64, GSM8K-with-speculation 200x2 c64, offline two-cold-process determinism, the S1-7 exact bytes of A1a (the pool is 24 MiB smaller than production's) and of A1b384; merge and deploy of vLLM branch then host folder.
+`MUSE_SPEC_GRAPH_SP_MIN_TOKENS` stays 0 and `MUSE_SPEC_GRAPH_CAP` 256 in the shipped profile until then. The graph floor needs FULL decode CUDA graphs (the default cudagraph mode); with PIECEWISE only it does nothing and
+the boot log still prints the floor line. Under `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=auto` the row gate admits few sizes, so most graph batches stay replicated (the branch's default is the forced mode).
