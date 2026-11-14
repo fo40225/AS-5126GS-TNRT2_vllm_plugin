@@ -262,19 +262,20 @@ class TopoComm:
         # fused collective + epilogue kernels (all_reduce_boundary, all_gather_boundary, all_gather_rmsnorm)
         self.fused = os.environ.get("MUSE_TOPO_FUSED", "1") != "0"
         # GEMV + all-gather in one call (gemv_all_gather_rmsnorm / gemv_all_gather_boundary, csrc/gemv_push.cu): MUSE_TOPO_GEMV=0
-        # keeps the model on the cuBLAS GEMV + all_gather_rmsnorm / all_gather_boundary kernels. MUSE_TOPO_GEMV_PUSH: 1 = every GEMV CTA
-        # sends its columns to the partner and the island peers as soon as it has them, 2 = the last CTA to finish sends the whole block
-        # in coalesced stores, 0 = the GEMV kernel (own summation order, early weight loads) only stores and the gather kernel pushes; +4 loads the
-        # weights behind the wait for the predecessor kernel instead of before it (A/B switch).
+        # keeps the model on the cuBLAS GEMV + all_gather_rmsnorm / all_gather_boundary kernels. The other knobs are parsed and checked by
+        # _read_gemv_env below (a bad value on one rank is reported through the stage-1 agreement, like the medium-algorithm tuning):
+        #   MUSE_TOPO_GEMV_PUSH: 1 = every GEMV CTA sends its columns to the partner and the island peers as soon as it has them, 2 = the
+        #     last CTA to finish sends the whole block in coalesced stores, 0 = the GEMV kernel (own summation order, early weight loads)
+        #     only stores and the gather kernel pushes; +4 loads the weights behind the wait for the predecessor kernel instead of before
+        #     it (A/B switch). Valid: GEMV_PUSH_MODES (never 3 or 7).
+        #   MUSE_TOPO_GEMV_VARIANT: geometry variant of the GEMV kernels (csrc/gemv_push.cu): unset = by the number of rows
+        #     (GEMV_VARIANT_BY_ROWS), a number pins it. A variant with another number of warps per row sums in another order, so it is a
+        #     (deterministic) rounding change; V0 and V3 sum in the same order. For tuning: bench/bench_gemv_push.py --variants.
+        #   MUSE_TOPO_GEMV_MAX_ROWS: largest decode batch (padded rows) the GEMV + gather kernels serve, clamped to 0 .. 8; above it the
+        #     model keeps the cuBLAS GEMV and the r2d gather (0: never). Default GEMV_MAX_ROWS.
+        #   MUSE_TOPO_GEMV_TRIGGER: see the comment at set_pdl below.
         self.gemv = self.fused and os.environ.get("MUSE_TOPO_GEMV", "1") != "0"
-        self.gemv_push = int(os.environ.get("MUSE_TOPO_GEMV_PUSH", "1"))
-        # Geometry variant of the GEMV kernels (csrc/gemv_push.cu): unset = by the number of rows (GEMV_VARIANT_BY_ROWS), a number pins it.
-        # A variant with another number of warps per row sums in another order, so it is a (deterministic) rounding change; V0 and V3 sum in
-        # the same order. For tuning: bench/bench_gemv_push.py --variants.
-        v_env = os.environ.get("MUSE_TOPO_GEMV_VARIANT")
-        self.gemv_variant: int | None = int(v_env) if v_env else None  # None: by rows (GEMV_VARIANT_BY_ROWS)
-        # Largest decode batch (padded rows) the GEMV + gather kernels serve; above it the model keeps the cuBLAS GEMV and the r2d gather.
-        self.gemv_max_rows = int(os.environ.get("MUSE_TOPO_GEMV_MAX_ROWS", str(self.GEMV_MAX_ROWS)))
+        self._set_gemv_defaults()
         self.bf16_exchange = (os.environ.get("MUSE_TOPO_LARGE_BF16_EXCHANGE", "0") == "1"
                               if bf16_exchange is None else bool(bf16_exchange))
         self.ar_large_min = _AR_LARGE_MIN
@@ -290,6 +291,11 @@ class TopoComm:
             self._load_tuning_file(os.environ.get("MUSE_TOPO_AR_TUNING_FILE", ""))
         except Exception as e:
             tuning_error = f"medium all_reduce tuning (MUSE_TOPO_MEDIUM_BX_MIN_BYTES / MUSE_TOPO_AR_TUNING_FILE): {e!r}"
+        try:
+            self._read_gemv_env()
+        except Exception as e:
+            err = f"GEMV settings (MUSE_TOPO_GEMV_PUSH / _VARIANT / _MAX_ROWS / _TRIGGER): {e!r}"
+            tuning_error = f"{tuning_error}; {err}" if tuning_error else err
         self.ag_large_min = _AG_LARGE_MIN
         self.rs_min_bytes = _RS_MIN_BYTES
         self._closed = True
@@ -341,15 +347,21 @@ class TopoComm:
             reason, exc = repr(e), e
         self._agree(cpu_group, reason, "IPC exchange", exc)
         i = self.info
+        # Trigger stage (MUSE_TOPO_GEMV_TRIGGER) of the all-reduce launches that are followed by a GEMV kernel: it lets that programmatic
+        # successor start 1 = at the start of the all-reduce, 2 = when its last communication phase begins, 3 = when it has ended, 0 =
+        # never (the GEMV kernel then starts when the all-reduce has completed). Its 8 MB of weight loads then overlap the tail of the
+        # all-reduce; at the start of the kernel they delay the all-reduce itself (measured: ~5 us, docs/r3b_gemv_push.md). Default 3, the
+        # stage of the measured arm; 2 is as good within the noise (S1-4b decision run, TPOT of 3 / 2: c1 9.214 / 9.209 ms, c4 14.788 / 14.937 ms,
+        # mean(c1, c4) -0.60 % for 3, a margin the 1 % drift of the session does not resolve). It is a property of the LAUNCH (_trigger_stage): only the all-reduces that
+        # precede a GEMV carry it, every other topo kernel keeps the implicit trigger at its exit, because a programmatic successor
+        # (a kernel launched with programmatic stream serialization) of a kernel that triggers early has to call griddepcontrol.wait before
+        # it reads the output. Only ar2_kernel and ar2_bnd_kernel fire stages 2 and 3; the other all-reduce kernels (ar1, large / medium
+        # reduce_scatter, flag) ignore them, and the GEMV kernel then starts at their completion. With MUSE_TOPO_PDL=1 every kernel
+        # triggers at its start already, so the stages 2 and 3 have no effect. Identical on every rank.
         self._c.set_pdl(os.environ.get("MUSE_TOPO_PDL", "0") == "1")
-        # The all-reduce kernels in front of a gemv_push_kernel let it start (it is the only programmatic successor): 1 = at their start,
-        # 2 = when their last phase begins, 3 = when it ends, 0 = never (the GEMV kernel then starts when the all-reduce has completed). Its
-        # 8 MB of weight loads then overlap the tail of the all-reduce; at the start of the kernel they delay the all-reduce itself
-        # (measured: ~5 us, docs/r3b_gemv_push.md). Default 3, the stage of the measured arm; 2 is as good within the noise (c1 equal, c4 1 %
-        # better inside the repeat spread). Only ar2_kernel and ar2_bnd_kernel fire stages 2 and 3; the other all-reduce kernels
-        # (ar1, large / medium reduce_scatter, flag) do not, and the GEMV kernel then starts at their completion. Identical on every rank.
-        self.gemv_trigger = int(os.environ.get("MUSE_TOPO_GEMV_TRIGGER", "3"))
-        self._c.set_trigger(self.gemv_trigger if self.gemv else 0)
+        if self.gemv and self.gemv_trigger >= 2 and os.environ.get("MUSE_TOPO_PDL", "0") == "1":
+            logger.info("muse_topo: MUSE_TOPO_PDL=1 with MUSE_TOPO_GEMV_TRIGGER=%d: the kernels trigger their successors at their start, so "
+                        "the stage has the effect of stage 1", self.gemv_trigger)
         self._c.set_gemv_variant(self._variant_for(1))
         # Where the fused collectives load the epilogue operands that do not depend on the collective (BndParams::ld_mode in
         # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (bench_boundary_cold.py,
@@ -512,6 +524,7 @@ class TopoComm:
         self._order_stream()
         x, out, user_out = self._stage(x, out)
         nbytes = x.numel() * x.element_size()
+        trigger = self._trigger_stage(x.shape[0]) if self._unpooler_input(x) else 0  # the all-reduce in front of the unpooler GEMV
         large_ar = self.ar_large_min_bx if self._medium_bx(x, nbytes) else self.ar_large_min
         if self._large_ok(nbytes) and (nbytes > self.max_bytes or nbytes >= large_ar):
             self._note("all_reduce", x, "large")
@@ -520,10 +533,10 @@ class TopoComm:
         if self._medium_bx(x, nbytes):
             algo, grid, block, unroll = _pick(self.ar_bx_table, nbytes)[1:]
             self._note("all_reduce", x, "2bx")
-            return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out, bx=True), user_out)
+            return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out, bx=True, trigger=trigger), user_out)
         algo, grid, block, unroll = _pick(_AR_TABLE, nbytes)[1:]
         self._note("all_reduce", x, algo)
-        return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out), user_out)
+        return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out, trigger=trigger), user_out)
 
     def _medium_bx(self, x: torch.Tensor, nbytes: int) -> bool:
         """Whether this all_reduce takes the bf16 exchange of the medium algorithm (bf16 input, the size window of
@@ -531,7 +544,7 @@ class TopoComm:
         every rank as long as those settings are (see the module docstring)."""
         return self.bf16_exchange and self.medium_bx and x.dtype == torch.bfloat16 and nbytes >= self.ar_bx_min
 
-    def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None, bx=False):
+    def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None, bx=False, trigger=0):
         if out is None:
             out = torch.empty_like(x)
         nbytes = x.numel() * x.element_size()
@@ -540,7 +553,7 @@ class TopoComm:
             grid = max(1, min(max_grid, items))
         if grid is None:
             grid = max(1, min(max_grid, _cdiv(items, block * unroll)))
-        self._c.all_reduce(x, out, algo, grid, block, unroll, int(bool(bx) and x.dtype == torch.bfloat16))
+        self._c.all_reduce(x, out, algo, grid, block, unroll, int(bool(bx) and x.dtype == torch.bfloat16), int(trigger))
         return out
 
     # ------------------------------------------------------------------------------------------------
@@ -556,8 +569,19 @@ class TopoComm:
     # for the all-reduce, -1.0 / +0.5 for the unpooler gather, -1.3 us up to T = 16 and +0.5 at T = 32 for the pooler gather).
     DISPATCH_MAX_ROWS = {"all_reduce_boundary": 8, "all_gather_boundary": 8, "all_gather_rmsnorm": 16}
     # The GEMV + gather kernels (csrc/gemv_push.cu) serve 1 .. 8 rows (the activations are re-read by every CTA, which costs more than the
-    # weights beyond that).
-    GEMV_MAX_ROWS = 8
+    # weights beyond that); MUSE_TOPO_GEMV_MAX_ROWS (clamped to 0 .. 8) sets the largest padded decode batch they are used for. The default
+    # is 4: the padded batches 1, 2 and 4 gain (c1 -4.2 %, c4 -3.2 % with the router GEMV), the padded batch 8 (c5 .. c8, also the
+    # K = 7 verify batch of speculative decoding) shows no gain: S1-4b decision run, real weights, TPOT at c8 with MAX_ROWS 8 / 4 /
+    # router GEMV only / everything off = 19.992 / 19.897 / 19.793 / 19.738 ms (rule "8 only if not worse than 4 by more than 0.5 %"
+    # was met by 0.02 % only), c6 22.972 / 23.005 / 22.841 / 23.071 ms, and the old layer-chain microbenchmark at T = 8 had the GEMV chain
+    # slower than cuBLAS (53.7 against 52.1 us; docs/r3b_gemv_push.md). The orchestrator's decision: 4.
+    GEMV_MAX_ROWS = 4
+    GEMV_DEFAULT_PUSH = 1
+    GEMV_DEFAULT_TRIGGER = 3
+    # Push modes of the GEMV kernel: 0, 1, 2, each with +4 (weights loaded behind the wait). 3 and 7 are no modes: the kernel pushes in mode 1
+    # and 2 only, but the gather kernel skips its own first stage whenever (push & 3) != 0, so the peers would spin on words nobody sends until
+    # the watchdog traps the context (csrc/bindings.cpp rejects them too).
+    GEMV_PUSH_MODES = (0, 1, 2, 4, 5, 6)
     # Geometry variant (csrc/gemv_push.cu) by the number of rows: V0 (128 CTAs) for one row, V3 (64 CTAs of 512 threads, half the activation
     # traffic and half the pushing CTAs) from two rows on (bench/bench_gemv_push.py, hot L2: T = 2 layer chain 34.1 -> 33.1 us, T = 4 44.5 -> 41.5).
     GEMV_VARIANT_BY_ROWS = {1: 0, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3}
@@ -574,6 +598,15 @@ class TopoComm:
     @staticmethod
     def _aligned(t):
         return t if t.data_ptr() % 16 == 0 else t.clone()
+
+    @classmethod
+    def _aligned_static(cls, *ts):
+        """``_aligned`` of the operands that never change (model parameters, None stays None) and whether any of them needed a copy.
+        The GEMV kernel and the gather kernel behind it read these before griddepcontrol.wait, i.e. possibly before the kernel in front
+        of them has completed, which is right for a parameter but not for a copy that was made just now: such a call launches the GEMV
+        kernel without programmatic stream serialization (it then starts after the copy). The production parameters are aligned."""
+        out = tuple(None if t is None else cls._aligned(t) for t in ts)
+        return out, any(o is not t for o, t in zip(out, ts))
 
     def supports_boundary_rows(self, kind: str, num_tokens: int) -> bool:
         """Batch-size gate of the fused kernels that the model asks before it has the tensors: ``kind`` is
@@ -651,8 +684,10 @@ class TopoComm:
         user_f32, out_fp32 = self._stage_out(out_fp32)
         out = torch.empty_like(x)
         new_stream = torch.empty_like(stream)
+        # the pooler GEMV follows (a decode batch the GEMV kernels serve): let it start at the trigger stage
+        trigger = self._trigger_stage(x.shape[0])
         self._c.all_reduce_boundary(x, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, float(post_eps),
-                                    float(pre_eps), float(post_gain), float(pre_gain))
+                                    float(pre_eps), float(post_gain), float(pre_gain), trigger)
         self._unstage_out(user_f32, out_fp32)
         return out, new_stream
 
@@ -695,6 +730,59 @@ class TopoComm:
     # ------------------------------------------------------------------------------------------------
     # sharded GEMV fused with the all-gather that follows it (csrc/gemv_push.cu, ag_bnd.cu with ``pushed``)
     # ------------------------------------------------------------------------------------------------
+    @property
+    def gemv_push(self) -> int:
+        """Push mode of the GEMV kernel (``GEMV_PUSH_MODES``); assigning another value raises ValueError."""
+        return self._gemv_push
+
+    @gemv_push.setter
+    def gemv_push(self, mode: int) -> None:
+        mode = int(mode)
+        if mode not in self.GEMV_PUSH_MODES:
+            raise ValueError(f"GEMV push mode {mode} is not valid (valid: {self.GEMV_PUSH_MODES}; 3 and 7 would hang the gather kernel)")
+        self._gemv_push = mode
+
+    def _set_gemv_defaults(self) -> None:
+        self.gemv_push = self.GEMV_DEFAULT_PUSH
+        self.gemv_variant: int | None = None  # None: by rows (GEMV_VARIANT_BY_ROWS)
+        self.gemv_trigger = self.GEMV_DEFAULT_TRIGGER
+        self.gemv_max_rows = self.GEMV_MAX_ROWS
+
+    def _read_gemv_env(self) -> None:
+        """Parse and check MUSE_TOPO_GEMV_PUSH / _VARIANT / _MAX_ROWS / _TRIGGER (ValueError on a bad value; __init__ reports it
+        through the stage-1 agreement, so a bad value on one rank cannot leave the others blocked)."""
+        env = os.environ
+        self.gemv_push = int(env.get("MUSE_TOPO_GEMV_PUSH", str(self.GEMV_DEFAULT_PUSH)))
+        v_env = env.get("MUSE_TOPO_GEMV_VARIANT")
+        if v_env:
+            v = int(v_env)
+            if not 0 <= v <= 3:
+                raise ValueError(f"MUSE_TOPO_GEMV_VARIANT={v} is not valid (0 .. 3, or unset for by rows)")
+            self.gemv_variant = v
+        trigger = int(env.get("MUSE_TOPO_GEMV_TRIGGER", str(self.GEMV_DEFAULT_TRIGGER)))
+        if not 0 <= trigger <= 3:
+            raise ValueError(f"MUSE_TOPO_GEMV_TRIGGER={trigger} is not valid (0 .. 3)")
+        self.gemv_trigger = trigger
+        rows = int(env.get("MUSE_TOPO_GEMV_MAX_ROWS", str(self.GEMV_MAX_ROWS)))
+        self.gemv_max_rows = max(0, min(rows, 8))  # the kernels serve 1 .. 8 rows
+        if self.gemv_max_rows != rows:
+            logger.info("muse_topo: MUSE_TOPO_GEMV_MAX_ROWS=%d clamped to %d (the GEMV kernels serve 0 .. 8 rows)", rows, self.gemv_max_rows)
+
+    def _trigger_stage(self, rows: int) -> int:
+        """Trigger stage (``gemv_trigger``) for an all-reduce launch of ``rows`` rows that feeds a GEMV kernel; 0 where none can follow.
+
+        The stage lets the programmatic successor of the all-reduce start before the all-reduce has completed, which is only correct for
+        a successor that calls griddepcontrol.wait before it reads the output (the GEMV kernel does). So it is a property of the
+        LAUNCH, given to the two all-reduces that precede a GEMV of a decode batch the GEMV kernels serve (``rows`` <= ``gemv_max_rows``):
+        ``all_reduce_boundary`` (the pooler GEMV follows) and ``all_reduce`` of the MoE latent, bf16 ``[rows, 4096]`` (the unpooler GEMV
+        follows, see :meth:`_unpooler_input`). Every other all-reduce (the embedding all-reduce, large batches, prefill, other models)
+        keeps the implicit trigger at its exit. A function of shape and dtype only, so the same on every rank."""
+        return self.gemv_trigger if self.gemv and 1 <= rows <= self.gemv_max_rows else 0
+
+    def _unpooler_input(self, x: torch.Tensor) -> bool:
+        """Whether ``x`` has the shape of the all-reduce output that the unpooler GEMV reads: bf16 ``[T, 4096]``."""
+        return x.dim() == 2 and x.shape[1] == self.GEMV_UNPOOLER_SHAPE[1] and x.dtype == torch.bfloat16
+
     def set_gemv_variant(self, v: int | None) -> None:
         """Pin the geometry variant of the GEMV kernels (the same on all ranks, between calls); None: choose by the number of rows."""
         self.gemv_variant = None if v is None else int(v)
@@ -730,10 +818,11 @@ class TopoComm:
         reduced. Returns the normalized [T, 4096] bf16 rows."""
         self._order_stream()
         self._c.set_gemv_variant(self._variant_for(x.shape[0]))
-        x, w, norm_w = self._aligned(x), self._aligned(w), self._aligned(norm_w)
+        x = self._aligned(x)
+        (w, norm_w), staged = self._aligned_static(w, norm_w)
         shard = torch.empty((x.shape[0], self.GEMV_POOLER_SHAPE[0]), dtype=torch.bfloat16, device=x.device)
         out = torch.empty((x.shape[0], 4096), dtype=torch.bfloat16, device=x.device)
-        self._c.gemv_all_gather_rmsnorm(x, w, shard, out, norm_w, float(eps), float(gain), self.gemv_push)
+        self._c.gemv_all_gather_rmsnorm(x, w, shard, out, norm_w, float(eps), float(gain), self.gemv_push, int(not staged))
         return out
 
     def gemv_all_gather_boundary(self, x, w, stream, alpha, beta, pre_w, post_w, post_eps, pre_eps, post_gain, pre_gain,
@@ -742,14 +831,15 @@ class TopoComm:
         :meth:`all_gather_boundary`), same contract as :meth:`gemv_all_gather_rmsnorm`; returns ``(out, new_stream)``."""
         self._order_stream()
         self._c.set_gemv_variant(self._variant_for(x.shape[0]))
-        x, w, stream, alpha, beta, pre_w = (self._aligned(t) for t in (x, w, stream, alpha, beta, pre_w))
-        post_w = None if post_w is None else self._aligned(post_w)
+        x, stream = self._aligned(x), self._aligned(stream)
+        (w, alpha, beta, pre_w, post_w), staged = self._aligned_static(w, alpha, beta, pre_w, post_w)
         user_f32, out_fp32 = self._stage_out(out_fp32)
         shard = torch.empty((x.shape[0], self.GEMV_UNPOOLER_SHAPE[0]), dtype=torch.bfloat16, device=x.device)
         out = torch.empty(stream.shape, dtype=torch.bfloat16, device=stream.device)
         new_stream = torch.empty_like(stream)
         self._c.gemv_all_gather_boundary(x, w, shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w,
-                                         float(post_eps), float(pre_eps), float(post_gain), float(pre_gain), self.gemv_push)
+                                         float(post_eps), float(pre_eps), float(post_gain), float(pre_gain), self.gemv_push,
+                                         int(not staged))
         self._unstage_out(user_f32, out_fp32)
         return out, new_stream
 

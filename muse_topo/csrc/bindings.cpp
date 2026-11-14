@@ -158,10 +158,20 @@ struct Comm {
     ld_mode = m;
   }
   void set_pdl(bool on) { c.pdl = on ? 1 : 0; }
-  // Kernels that are not programmatic dependents themselves still let a programmatic successor (gemv_push_kernel) start at once.
-  void set_trigger(int stage) {
+  // The context of ONE all-reduce launch that is followed by a gemv_push_kernel (Ctx::trigger, topo_types.h): the trigger stage is a
+  // property of the launch, never of the communicator, so every other kernel keeps the implicit trigger at its exit and a programmatic
+  // successor of it (any kernel launched with programmatic stream serialization) is released only when the kernel has completed.
+  Ctx ctx_with_trigger(int stage) const {
     TORCH_CHECK(stage >= 0 && stage <= 3, "bad trigger stage ", stage);
-    c.trigger = stage;
+    Ctx cc = c;
+    cc.trigger = stage;
+    return cc;
+  }
+  // Push modes of gemv_push_kernel: 0, 1, 2, each with +4 (late weight loads). 3 (and 7) would make the gather kernel wait for words that
+  // nobody sends (the kernel pushes in mode 1 and 2 only, the gather kernel skips its own first stage when (push & 3) != 0): the watchdog
+  // would trap every rank.
+  static void check_push_mode(int push) {
+    TORCH_CHECK(push >= 0 && push <= 6 && (push & 3) != 3, "gemv: bad push mode ", push, " (valid: 0, 1, 2, 4, 5, 6)");
   }
   // Geometry variant of the GEMV kernels (gemv_push.cu); the summation order depends on it.
   int gemv_variant = 0;
@@ -331,8 +341,10 @@ struct Comm {
     CK(cudaGetLastError());
   }
 
-  void all_reduce(const at::Tensor& x, at::Tensor out, int algo, int grid, int block, int unroll, int bx) {
+  // trigger: the stage at which this launch lets a programmatic successor (gemv_push_kernel) start, see ctx_with_trigger (0: never)
+  void all_reduce(const at::Tensor& x, at::Tensor out, int algo, int grid, int block, int unroll, int bx, int trigger) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && out.is_contiguous() && out.sizes() == x.sizes(), "bad tensors");
+    const Ctx tc = ctx_with_trigger(trigger);
     c10::cuda::CUDAGuard g(x.device());
     const int64_t nbytes = x.numel() * x.element_size();
     const int dt = dtype_code(x);
@@ -341,14 +353,14 @@ struct Comm {
     TORCH_CHECK(!bx || algo == 2, "bf16 exchange is only defined for all-reduce algorithm 2");
     if (algo == 1) {
       TORCH_CHECK(nbytes % 16 == 0 && nbytes <= c.L.a1_slot, "ar1: size not supported");
-      launch_ar1(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, s);
+      launch_ar1(tc, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, s);
     } else if (algo == 2) {
       TORCH_CHECK(nbytes % 64 == 0 && nbytes / 4 <= c.L.a2_slot, "ar2: size not supported");
       TORCH_CHECK(!bx || dt == kBF16, "bf16 exchange is only defined for bf16 inputs");
-      launch_ar2(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, bx, s);
+      launch_ar2(tc, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, bx, s);
     } else if (algo == 3) {
       TORCH_CHECK(nbytes % 64 == 0 && nbytes / 4 <= c.L.a2_slot && grid <= kMaxBlocks, "ar2 flag: size not supported");
-      launch_ar2_flag(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, s);
+      launch_ar2_flag(tc, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, s);
     } else {
       throw std::runtime_error("unknown all-reduce algorithm");
     }
@@ -359,9 +371,10 @@ struct Comm {
   void all_reduce_boundary(const at::Tensor& x, const at::Tensor& stream, at::Tensor new_stream, at::Tensor out,
                            c10::optional<at::Tensor> out_fp32, const at::Tensor& alpha, const at::Tensor& beta,
                            c10::optional<at::Tensor> post_w, const at::Tensor& pre_w, double post_eps, double pre_eps,
-                           double post_gain, double pre_gain) {
+                           double post_gain, double pre_gain, int trigger) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(1) == 8192,
                 "ar boundary: x must be a contiguous bf16 [T, 8192] CUDA tensor");
+    const Ctx tc = ctx_with_trigger(trigger);
     const int rows = static_cast<int>(x.size(0));
     TORCH_CHECK(rows >= 1 && rows <= 64, "ar boundary: 1 <= T <= 64 rows, got ", rows);
     TORCH_CHECK(static_cast<int64_t>(rows) * 256 * 16 <= c.L.a2_slot && static_cast<int64_t>(rows) * 256 * 32 <= c.L.b2_par,
@@ -402,22 +415,22 @@ struct Comm {
     a.post_gain = static_cast<float>(post_gain);
     a.pre_gain = static_cast<float>(pre_gain);
     a.ld_mode = ld_mode;
-    launch_ar2_bnd(c, x.data_ptr(), a, rows, at::cuda::getCurrentCUDAStream());
+    launch_ar2_bnd(tc, x.data_ptr(), a, rows, at::cuda::getCurrentCUDAStream());
     CK(cudaGetLastError());
   }
 
   // all-gather (column concatenation) of the bf16 unpooler shards [T, 1024] fused with the Muse Spark residual boundary
-  // (boundary.cuh, epi 0); T <= 32 (LL8 slots)
-  void ag_boundary_impl(const at::Tensor& shard, const at::Tensor& stream, at::Tensor new_stream, at::Tensor out,
-                        c10::optional<at::Tensor> out_fp32, const at::Tensor& alpha, const at::Tensor& beta,
-                        c10::optional<at::Tensor> post_w, const at::Tensor& pre_w, double post_eps, double pre_eps,
-                        double post_gain, double pre_gain, int pushed) {
+  // (boundary.cuh, epi 0); T <= 32 (LL8 slots). Two halves, so that a caller that has launched something before can validate first:
+  // ag_boundary_params checks every operand and fills the parameters (it launches nothing), ag_boundary_launch launches.
+  BndParams ag_boundary_params(const at::Tensor& shard, const at::Tensor& stream, at::Tensor new_stream, at::Tensor out,
+                               c10::optional<at::Tensor> out_fp32, const at::Tensor& alpha, const at::Tensor& beta,
+                               c10::optional<at::Tensor> post_w, const at::Tensor& pre_w, double post_eps, double pre_eps,
+                               double post_gain, double pre_gain) const {
     TORCH_CHECK(shard.is_cuda() && shard.is_contiguous() && shard.scalar_type() == at::kBFloat16 && shard.dim() == 2 &&
                     shard.size(1) == 1024,
                 "ag boundary: shard must be a contiguous bf16 [T, 1024] CUDA tensor");
     const int rows = static_cast<int>(shard.size(0));
     TORCH_CHECK(rows >= 1 && rows <= 32 && 2 * shard.numel() * 2 <= c.L.g_slot, "ag boundary: 1 <= T <= 32 rows, got ", rows);
-    c10::cuda::CUDAGuard g(shard.device());
     const int64_t n = static_cast<int64_t>(rows) * 8192;
     auto chk32 = [&](const at::Tensor& t, int64_t k, const char* what) {
       TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kFloat && t.numel() == k, "ag boundary: bad ", what);
@@ -454,26 +467,30 @@ struct Comm {
     a.post_gain = static_cast<float>(post_gain);
     a.pre_gain = static_cast<float>(pre_gain);
     a.ld_mode = ld_mode;
-    launch_ag_bnd(c, shard.data_ptr(), a, rows, pushed, at::cuda::getCurrentCUDAStream());
+    return a;
+  }
+  void ag_boundary_launch(const at::Tensor& shard, const BndParams& a, int pushed) {
+    c10::cuda::CUDAGuard g(shard.device());
+    launch_ag_bnd(c, shard.data_ptr(), a, static_cast<int>(shard.size(0)), pushed, at::cuda::getCurrentCUDAStream());
     CK(cudaGetLastError());
   }
   void all_gather_boundary(const at::Tensor& shard, const at::Tensor& stream, at::Tensor new_stream, at::Tensor out,
                            c10::optional<at::Tensor> out_fp32, const at::Tensor& alpha, const at::Tensor& beta,
                            c10::optional<at::Tensor> post_w, const at::Tensor& pre_w, double post_eps, double pre_eps,
                            double post_gain, double pre_gain) {
-    ag_boundary_impl(shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, post_eps, pre_eps, post_gain,
-                     pre_gain, 0);
+    const BndParams a = ag_boundary_params(shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, post_eps, pre_eps,
+                                           post_gain, pre_gain);
+    ag_boundary_launch(shard, a, 0);
   }
 
   // all-gather (column concatenation) of the bf16 pooler shards [T, 512] fused with the pre_expert_norm RMSNorm (epi 1);
-  // T <= 64; returns into `out` [T, 4096]
-  void ag_rmsnorm_impl(const at::Tensor& shard, at::Tensor out, const at::Tensor& w, double eps, double gain, int pushed) {
+  // T <= 64; returns into `out` [T, 4096]. The same two halves as above.
+  RmsParams ag_rmsnorm_params(const at::Tensor& shard, at::Tensor out, const at::Tensor& w, double eps, double gain) const {
     TORCH_CHECK(shard.is_cuda() && shard.is_contiguous() && shard.scalar_type() == at::kBFloat16 && shard.dim() == 2 &&
                     shard.size(1) == 512,
                 "ag rmsnorm: shard must be a contiguous bf16 [T, 512] CUDA tensor");
     const int rows = static_cast<int>(shard.size(0));
     TORCH_CHECK(rows >= 1 && rows <= 64 && 2 * shard.numel() * 2 <= c.L.g_slot, "ag rmsnorm: 1 <= T <= 64 rows, got ", rows);
-    c10::cuda::CUDAGuard g(shard.device());
     TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kBFloat16 && out.numel() == shard.numel() * 8,
                 "ag rmsnorm: bad out");
     TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kBFloat16 && w.numel() == 4096, "ag rmsnorm: bad w");
@@ -485,16 +502,27 @@ struct Comm {
     a.w = w.data_ptr();
     a.eps = static_cast<float>(eps);
     a.gain = static_cast<float>(gain);
-    launch_ag_rms(c, shard.data_ptr(), a, rows, pushed, at::cuda::getCurrentCUDAStream());
+    return a;
+  }
+  void ag_rmsnorm_launch(const at::Tensor& shard, const RmsParams& a, int pushed) {
+    c10::cuda::CUDAGuard g(shard.device());
+    launch_ag_rms(c, shard.data_ptr(), a, static_cast<int>(shard.size(0)), pushed, at::cuda::getCurrentCUDAStream());
     CK(cudaGetLastError());
   }
   void all_gather_rmsnorm(const at::Tensor& shard, at::Tensor out, const at::Tensor& w, double eps, double gain) {
-    ag_rmsnorm_impl(shard, out, w, eps, gain, 0);
+    const RmsParams a = ag_rmsnorm_params(shard, out, w, eps, gain);
+    ag_rmsnorm_launch(shard, a, 0);
   }
 
   // GEMV of the sharded projection (kind 0 pooler, 1 unpooler; gemv_push.cu) into `shard`, with `push` also the first stage of the
-  // all-gather. The two halves of one collective call: launch_gemv_push, then the pushed gather kernel.
-  void gemv_push_check(const at::Tensor& x, const at::Tensor& w, const at::Tensor& shard, int kind) {
+  // all-gather. The two halves of one collective call: launch_gemv_push, then the pushed gather kernel. Everything is validated, the
+  // gather's operands included, before the first launch: a call that throws after the GEMV kernel has pushed would leave tagged words in the
+  // peers' slots and the call counter behind, and the next collective would consume them. `pdl` 0 launches the GEMV kernel without
+  // programmatic stream serialization (it then starts when the kernels in front of it have completed): for a call whose operands were
+  // staged by a kernel just in front (a copy of a misaligned weight), because the GEMV kernel and the gather kernel read their weights before
+  // griddepcontrol.wait.
+  void gemv_push_check(const at::Tensor& x, const at::Tensor& w, const at::Tensor& shard, int kind, int push) const {
+    check_push_mode(push);
     const int K = kind == 0 ? 8192 : 4096, N = kind == 0 ? 512 : 1024;
     TORCH_CHECK(kind == 0 || kind == 1, "gemv: bad kind ", kind);
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(1) == K,
@@ -511,35 +539,33 @@ struct Comm {
                 "gemv: misaligned operand");
     TORCH_CHECK(2 * shard.numel() * 2 <= c.L.g_slot, "gemv: shard larger than the all-gather slots");
   }
-  void gemv_push(const at::Tensor& x, const at::Tensor& w, at::Tensor shard, int kind, int push) {
-    TORCH_CHECK(push >= 0 && push <= 7, "gemv: bad push mode ", push);
-    gemv_push_check(x, w, shard, kind);
+  void gemv_push_launch(const at::Tensor& x, const at::Tensor& w, at::Tensor shard, int kind, int push, int pdl) {
     c10::cuda::CUDAGuard g(x.device());
-    launch_gemv_push(c, kind, gemv_variant, x.data_ptr(), w.data_ptr(), shard.data_ptr(), static_cast<int>(x.size(0)), push,
+    launch_gemv_push(c, kind, gemv_variant, x.data_ptr(), w.data_ptr(), shard.data_ptr(), static_cast<int>(x.size(0)), push, pdl != 0,
                      at::cuda::getCurrentCUDAStream());
     CK(cudaGetLastError());
   }
+  void gemv_push(const at::Tensor& x, const at::Tensor& w, at::Tensor shard, int kind, int push, int pdl) {
+    gemv_push_check(x, w, shard, kind, push);
+    gemv_push_launch(x, w, shard, kind, push, pdl);
+  }
   void gemv_all_gather_rmsnorm(const at::Tensor& x, const at::Tensor& w, at::Tensor shard, at::Tensor out,
-                               const at::Tensor& nw, double eps, double gain, int push) {
-    gemv_push_check(x, w, shard, 0);
-    c10::cuda::CUDAGuard g(x.device());
-    launch_gemv_push(c, 0, gemv_variant, x.data_ptr(), w.data_ptr(), shard.data_ptr(), static_cast<int>(x.size(0)), push,
-                     at::cuda::getCurrentCUDAStream());
-    CK(cudaGetLastError());
-    ag_rmsnorm_impl(shard, out, nw, eps, gain, (push & 3) != 0);
+                               const at::Tensor& nw, double eps, double gain, int push, int pdl) {
+    gemv_push_check(x, w, shard, 0, push);
+    const RmsParams a = ag_rmsnorm_params(shard, out, nw, eps, gain);
+    gemv_push_launch(x, w, shard, 0, push, pdl);
+    ag_rmsnorm_launch(shard, a, (push & 3) != 0);
   }
   void gemv_all_gather_boundary(const at::Tensor& x, const at::Tensor& w, at::Tensor shard, const at::Tensor& stream,
                                 at::Tensor new_stream, at::Tensor out, c10::optional<at::Tensor> out_fp32,
                                 const at::Tensor& alpha, const at::Tensor& beta, c10::optional<at::Tensor> post_w,
                                 const at::Tensor& pre_w, double post_eps, double pre_eps, double post_gain, double pre_gain,
-                                int push) {
-    gemv_push_check(x, w, shard, 1);
-    c10::cuda::CUDAGuard g(x.device());
-    launch_gemv_push(c, 1, gemv_variant, x.data_ptr(), w.data_ptr(), shard.data_ptr(), static_cast<int>(x.size(0)), push,
-                     at::cuda::getCurrentCUDAStream());
-    CK(cudaGetLastError());
-    ag_boundary_impl(shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, post_eps, pre_eps, post_gain,
-                     pre_gain, (push & 3) != 0);
+                                int push, int pdl) {
+    gemv_push_check(x, w, shard, 1, push);
+    const BndParams a = ag_boundary_params(shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, post_eps, pre_eps,
+                                           post_gain, pre_gain);
+    gemv_push_launch(x, w, shard, 1, push, pdl);
+    ag_boundary_launch(shard, a, (push & 3) != 0);
   }
 
   // x: [T, w] shard (any dtype, bit exact); out: [8T, w] (layout 1) or [T, 8w] (layout 0)
@@ -577,14 +603,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init<int, int, int, int, int, std::vector<std::vector<int>>, std::vector<int>, std::vector<int>,
                     std::vector<int64_t>, int64_t, int64_t, int64_t, int64_t, double, int>())
       .def("all_reduce", &Comm::all_reduce, py::arg("x"), py::arg("out"), py::arg("algo"), py::arg("grid"),
-           py::arg("block"), py::arg("unroll"), py::arg("bx") = 0)
+           py::arg("block"), py::arg("unroll"), py::arg("bx") = 0, py::arg("trigger") = 0)
       .def("all_reduce_boundary", &Comm::all_reduce_boundary)
       .def("all_gather_boundary", &Comm::all_gather_boundary)
       .def("all_gather_rmsnorm", &Comm::all_gather_rmsnorm)
-      .def("gemv_push", &Comm::gemv_push)
+      .def("gemv_push", &Comm::gemv_push, py::arg("x"), py::arg("w"), py::arg("shard"), py::arg("kind"), py::arg("push"),
+           py::arg("pdl") = 1)
       .def("gemv_all_gather_rmsnorm", &Comm::gemv_all_gather_rmsnorm)
       .def("gemv_all_gather_boundary", &Comm::gemv_all_gather_boundary)
-      .def("set_trigger", &Comm::set_trigger)
       .def("set_gemv_variant", &Comm::set_gemv_variant)
       .def("all_gather", &Comm::all_gather)
       .def("reduce_scatter", &Comm::reduce_scatter)

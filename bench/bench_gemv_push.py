@@ -40,6 +40,8 @@ def run(rank, args):
     from muse_topo import TopoComm
 
     comm = TopoComm(cpu_group, dev, rank, WORLD)
+    default_trigger = comm.gemv_trigger
+    comm.gemv_max_rows = 8  # the bench times the kernels at every T; the trigger stage of the all-reduce in front follows this gate
     g = torch.Generator(device=dev)
     g.manual_seed(5)
     alpha = (torch.rand(D, generator=g, device=dev) * 0.9 + 0.1).float()
@@ -101,7 +103,7 @@ def run(rank, args):
             comm.gemv_push = {"push": 1, "last": 2, "late": 5}.get(variant.split("_")[0], 0)
             if "_v" in variant:
                 comm.set_gemv_variant(int(variant.split("_v")[1].split("_")[0]))
-                comm._c.set_trigger(int(variant.split("_t")[-1]))
+                comm.gemv_trigger = int(variant.split("_t")[-1])
             if args.cold:
                 def one(call=call):
                     flush.zero_()
@@ -115,7 +117,7 @@ def run(rank, args):
             row[name] = round(med_over_ranks(per, cpu_group) - base_flush, 2)
         comm.gemv_push = 1
         comm.set_gemv_variant(None)
-        comm._c.set_trigger(comm.gemv_trigger)
+        comm.gemv_trigger = default_trigger
         rows.append(row)
         log(rank, json.dumps(row))
     if rank == 0 and args.out:

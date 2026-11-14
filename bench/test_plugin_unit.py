@@ -194,8 +194,24 @@ def main():
             super().__init__(ok)
             self.params_ok = params_ok
 
+        gemv, gemv_max_rows = True, 4
+
         def supports_boundary_rows(self, kind, n):
+            if kind in ("gemv_all_gather_rmsnorm", "gemv_all_gather_boundary"):  # TopoComm: self.gemv and 1 <= n <= gemv_max_rows
+                return self.ok and self.gemv and 1 <= n <= self.gemv_max_rows
             return self.ok and 1 <= n <= 64
+
+        def supports_gemv_all_gather_boundary(self, x, w, stream):
+            return self.ok
+
+        def supports_gemv_all_gather_rmsnorm(self, x, w):
+            return self.ok
+
+        def gemv_all_gather_boundary(self, *a, **k):
+            return ("topo_gagb", k.get("out_fp32"))
+
+        def gemv_all_gather_rmsnorm(self, *a, **k):
+            return "topo_gagr"
 
         def supports_all_reduce_boundary(self, x, stream):
             return self.ok
@@ -240,6 +256,67 @@ def main():
         assert vp._all_reduce_residual_boundary(dc, x, x, **kw) is None
         assert vp._all_gather_residual_boundary(dc, x, x, **kw) is None
         assert vp._all_gather_rmsnorm(dc, x, x, 1e-6, 1.0) is None
+    # the GEMV + gather kinds (same wrappers, plus the weight): routing, the row gate of the communicator, the declines, the counters
+    w = torch.zeros(4, 64, dtype=torch.bfloat16)
+    dc = fused_dc()
+    for kind in ("gemv_all_gather_boundary", "gemv_all_gather_rmsnorm"):
+        assert vp._supports_fused_residual_boundary(dc, kind, 1) and vp._supports_fused_residual_boundary(dc, kind, 4)
+        assert not vp._supports_fused_residual_boundary(dc, kind, 5) and not vp._supports_fused_residual_boundary(dc, kind, 0)
+    assert vp._gemv_all_gather_residual_boundary(dc, x, w, x, out_fp32=x, **kw) == ("topo_gagb", x)
+    assert vp._gemv_all_gather_rmsnorm(dc, x, w, x, 1e-6, 1.0) == "topo_gagr"
+    assert dc.topo_trace.counts[("gemv_all_gather_boundary", None, (4, 64), torch.bfloat16, 0x1234, False, "topo")] == 1
+    assert dc.topo_trace.counts[("gemv_all_gather_rmsnorm", None, (4, 64), torch.bfloat16, 0x1234, False, "topo")] == 1
+    dc = fused_dc()
+    dc.topo_comm.gemv = False  # MUSE_TOPO_GEMV=0: every GEMV kind declines, the other fused kinds stay
+    assert not vp._supports_fused_residual_boundary(dc, "gemv_all_gather_boundary", 1)
+    assert not vp._supports_fused_residual_boundary(dc, "gemv_all_gather_rmsnorm", 1)
+    assert vp._supports_fused_residual_boundary(dc, "all_gather_rmsnorm", 1)
+    assert vp._gemv_all_gather_residual_boundary(dc, x, w, x, **kw) is None and vp._gemv_all_gather_rmsnorm(dc, x, w, x, 1e-6, 1.0) is None
+    dc = fused_dc()
+    big = torch.zeros(5, 64, dtype=torch.bfloat16)  # more rows than MAX_ROWS: the model keeps the cuBLAS GEMV
+    assert vp._gemv_all_gather_residual_boundary(dc, big, w, big, **kw) is None and vp._gemv_all_gather_rmsnorm(dc, big, w, x, 1e-6, 1.0) is None
+    for dc in (fused_dc(ok=False), fused_dc(params_ok=False), fused_dc(ops=("all_reduce", "all_gather")),
+               types.SimpleNamespace(topo_comm=None, topo_trace=None, topo_ops=frozenset()), types.SimpleNamespace()):
+        assert vp._gemv_all_gather_residual_boundary(dc, x, w, x, **kw) is None
+        assert vp._gemv_all_gather_rmsnorm(dc, x, w, x, 1e-6, 1.0) is None
+    # the MUSE_TOPO_GEMV_* knobs of TopoComm: defaults, clamping, and the values that must be rejected (the stage-1 agreement reports them)
+    from muse_topo.collectives import TopoComm
+
+    def knobs(**env):
+        saved = {k: os.environ.pop(k, None) for k in ("MUSE_TOPO_GEMV_PUSH", "MUSE_TOPO_GEMV_VARIANT", "MUSE_TOPO_GEMV_MAX_ROWS",
+                                                      "MUSE_TOPO_GEMV_TRIGGER")}
+        os.environ.update(env)
+        try:
+            tc = TopoComm.__new__(TopoComm)
+            tc._set_gemv_defaults()
+            tc._read_gemv_env()
+            return tc
+        finally:
+            for k in saved:
+                os.environ.pop(k, None)
+            os.environ.update({k: v for k, v in saved.items() if v is not None})
+
+    tc = knobs()
+    assert (tc.gemv_push, tc.gemv_variant, tc.gemv_trigger, tc.gemv_max_rows) == (1, None, 3, 4) and TopoComm.GEMV_MAX_ROWS == 4
+    assert knobs(MUSE_TOPO_GEMV_MAX_ROWS="16").gemv_max_rows == 8 and knobs(MUSE_TOPO_GEMV_MAX_ROWS="-3").gemv_max_rows == 0
+    assert knobs(MUSE_TOPO_GEMV_MAX_ROWS="8").gemv_max_rows == 8 and knobs(MUSE_TOPO_GEMV_MAX_ROWS="0").gemv_max_rows == 0
+    assert knobs(MUSE_TOPO_GEMV_VARIANT="3").gemv_variant == 3 and knobs(MUSE_TOPO_GEMV_TRIGGER="0").gemv_trigger == 0
+    for mode in (0, 1, 2, 4, 5, 6):
+        assert knobs(MUSE_TOPO_GEMV_PUSH=str(mode)).gemv_push == mode
+    for name, bad in (("PUSH", "3"), ("PUSH", "7"), ("PUSH", "-1"), ("PUSH", "8"), ("PUSH", "one"), ("VARIANT", "4"), ("VARIANT", "-1"),
+                      ("TRIGGER", "4"), ("TRIGGER", "-1"), ("MAX_ROWS", "eight"), ("MAX_ROWS", "")):
+        try:
+            knobs(**{f"MUSE_TOPO_GEMV_{name}": bad})
+            raise AssertionError(f"MUSE_TOPO_GEMV_{name}={bad!r} was accepted")
+        except ValueError:
+            pass
+    tc = knobs()
+    for bad in (3, 7, -1, 8, 12):  # assigning a mode that would hang the gather kernel
+        try:
+            tc.gemv_push = bad
+            raise AssertionError(f"push mode {bad} was accepted")
+        except ValueError:
+            assert tc.gemv_push == 1
     assert not vp._supports_fused_residual_boundary(fused_dc(ops=("all_reduce",)), "all_gather_rmsnorm", 1)
     assert not vp._supports_fused_residual_boundary(types.SimpleNamespace(), "all_gather_rmsnorm", 1)
     assert "boundary" in vp._ALL_OPS

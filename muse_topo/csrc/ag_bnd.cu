@@ -65,9 +65,10 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, c
 #pragma unroll
   for (int k = 0; k < NW; ++k) {
     const int w = row * WPR + tid + bnd::kRowThreads * k;
-    // PUSHED: written by the programmatic predecessor, so a strong load that stays behind griddepcontrol.wait (a read-only load of an
-    // __restrict__ pointer may be hoisted above it).
-    x[k] = PUSHED ? ld_u32(in + w) : in[w];
+    // The shard was written by the kernel in front, which may be a programmatic predecessor (PUSHED: gemv_push_kernel; otherwise any kernel
+    // when MUSE_TOPO_PDL=1, and gemv_push_kernel with push mode 0): a strong load that stays behind griddepcontrol.wait (a read-only load of
+    // an __restrict__ pointer may be hoisted above it).
+    x[k] = ld_u32(in + w);
     if (!PUSHED) st_v2(txp + w, x[k], tag);
   }
 #pragma unroll

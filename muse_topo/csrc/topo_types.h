@@ -60,7 +60,11 @@ struct RmsParams {
 struct Ctx {
   int rank, island, ipos, opos, partner;
   int pdl;  // 1: launch with programmatic stream serialization (kernels then start with griddepcontrol.wait)
-  int trigger;  // 1 / 2 / 3: the all-reduce kernels in front of a gemv_push_kernel let that programmatic successor start at their start / when their last phase begins / ends (0: never)
+  // Per launch (Comm::ctx_with_trigger), 0 for every kernel but the all-reduce launches that precede a gemv_push_kernel: 1 / 2 / 3 let that
+  // programmatic successor start at the start of the kernel / when its last communication phase begins / has ended (0: never, the implicit
+  // trigger at the exit of the kernel). A successor launched with programmatic stream serialization must call griddepcontrol.wait before it
+  // reads anything the kernel writes (docs/r3b_gemv_push.md, Protocol).
+  int trigger;
   int members[2][kIsland];  // ranks of each island in arithmetic (ascending rank) order
   int owners[kIsland];      // my island: owners[j] = rank that owns slice j (partner order)
   int partner_of[kWorld];
@@ -129,8 +133,9 @@ void launch_ag_rms(const Ctx& c, const void* shard, const RmsParams& a, int rows
 // [1024, 4096]^T -> shard [T, 1024]), T <= 8, bf16, in the fixed fp32 order of gemv.cuh. The shard is stored (rows of this rank's
 // columns); with `push` the kernel also sends it to the partner and the three island peers in the LL8 format of the all-gather
 // (the first stage of ag_bnd_kernel), as the first half of a collective whose second half is launch_ag_bnd / launch_ag_rms with
-// `pushed` set. Launched as a programmatic dependent: the weights are loaded before griddepcontrol.wait.
-void launch_gemv_push(const Ctx& c, int kind, int variant, const void* x, const void* w, void* shard, int rows, int push,
+// `pushed` set. Launched as a programmatic dependent (`pdl`; false: after the kernels in front of it have completed): the weights are
+// loaded before griddepcontrol.wait.
+void launch_gemv_push(const Ctx& c, int kind, int variant, const void* x, const void* w, void* shard, int rows, int push, bool pdl,
                       cudaStream_t s);
 void launch_ar2_flag(const Ctx& c, int dtype, const void* in, void* out, int64_t nbytes, int grid, int block,
                      cudaStream_t s);

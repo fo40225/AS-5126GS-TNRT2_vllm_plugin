@@ -173,7 +173,7 @@ __device__ __forceinline__ uint64_t epoch_begin(const Ctx& c, uint32_t& old) {
     pdl_wait();      // the previous grid (and its counter update) has completed
     pdl_trigger();   // let the next collective's blocks become resident; they wait for this grid to finish
   } else if (c.trigger == 1) {
-    pdl_trigger();   // not a programmatic dependent itself; only a programmatic successor (gemv_push_kernel) starts early
+    pdl_trigger();   // an all-reduce launched with a trigger stage: its programmatic successor (gemv_push_kernel) starts early
   }
   const uint64_t e = ld_u64(c.ctl);
   uint32_t one;
@@ -190,9 +190,12 @@ __device__ __forceinline__ void epoch_end(const Ctx& c, uint64_t e, uint32_t old
   }
 }
 
-// Ctx::trigger = 2 / 3: the all-reduce kernels in front of a gemv_push_kernel (ar2_kernel, ar2_bnd_kernel) let it start when their last phase
-// begins / ends, so that its 8 MB burst of weight loads does not compete with the latency-critical first phases of the all-reduce
-// (trigger = 1, at the start of the kernel, delayed the all-reduce by ~5 us: docs/r3b_gemv_push.md).
+// Ctx::trigger = 2 / 3: the all-reduce launches in front of a gemv_push_kernel (ar2_kernel, ar2_bnd_kernel) let it start when their last
+// communication phase begins / has ended, so that its 8 MB burst of weight loads does not compete with the latency-critical first phases of the
+// all-reduce (trigger = 1, at the start of the kernel, delayed the all-reduce by ~5 us: docs/r3b_gemv_push.md). Stage 3 is the point after the
+// last phase's polling loop and before the epilogue (the output of the kernel, and in ar2_bnd_kernel its boundary, is not complete yet): the
+// successor must call griddepcontrol.wait before it reads anything of it. Ctx::trigger is 0 except in the launches that are followed by a
+// gemv_push_kernel (Comm::ctx_with_trigger), so no other kernel changes its programmatic-launch behaviour.
 __device__ __forceinline__ void trigger_stage(const Ctx& c, int stage) {
   if (c.trigger == stage) pdl_trigger();
 }

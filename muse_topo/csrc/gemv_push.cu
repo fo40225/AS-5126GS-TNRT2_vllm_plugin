@@ -7,10 +7,12 @@
 // and runs its epilogue. The block is also stored in plain form (the second kernel reads its own columns from there).
 //
 // Launch contract: this kernel and the one after it are the two halves of ONE collective call. This one is a programmatic dependent of the kernel
-// in front of it in the stream (any topo kernel with Ctx::trigger, or a plain kernel: then it simply starts after it): the weights, which do not
-// depend on anything, are loaded before griddepcontrol.wait; the activations x and the call epoch are read behind it. It lets its own
-// programmatic successor start at once (the pushed ag_bnd kernel, which waits for this grid to complete). It does not advance the call counter;
-// the second kernel does (epoch_begin_pushed).
+// in front of it in the stream (an all-reduce launched with a trigger stage, Ctx::trigger, or a plain kernel: then it simply starts after it): the
+// weights, which do not depend on anything, are loaded before griddepcontrol.wait; the activations x and the call epoch are read behind it. The
+// weights must therefore be final when the kernel in front of it STARTS to trigger: static model parameters are; a copy made just in front of the
+// call (a misaligned weight staged by TopoComm) is not, and such a call is launched without the programmatic attribute (`pdl` = false: the kernel
+// then starts after the copy has completed). It lets its own programmatic successor start at once (the pushed ag_bnd kernel, which waits for this
+// grid to complete). It does not advance the call counter; the second kernel does (epoch_begin_pushed).
 //
 // Arithmetic: gemv.cuh (fixed fp32 order, one bf16 rounding). Not the order of cuBLAS: deterministic_different against the cuBLAS gemv.
 #include "common.cuh"
@@ -117,38 +119,38 @@ __global__ void __launch_bounds__(G::W * 32)
 }
 
 template <class G, int T>
-static void run_gemv_push(const Ctx& c, const void* x, const void* w, void* shard, int push, cudaStream_t s) {
-  launch_kp(gemv_push_kernel<G, T>, true, dim3(G::N / (G::W / G::WPR)), dim3(G::W * 32), s, c,
+static void run_gemv_push(const Ctx& c, const void* x, const void* w, void* shard, int push, bool pdl, cudaStream_t s) {
+  launch_kp(gemv_push_kernel<G, T>, pdl, dim3(G::N / (G::W / G::WPR)), dim3(G::W * 32), s, c,
             static_cast<const __nv_bfloat16*>(x), static_cast<const __nv_bfloat16*>(w), static_cast<uint32_t*>(shard), push);
 }
 
 template <class G>
-static void dispatch_rows(const Ctx& c, const void* x, const void* w, void* shard, int rows, int push, cudaStream_t s) {
+static void dispatch_rows(const Ctx& c, const void* x, const void* w, void* shard, int rows, int push, bool pdl, cudaStream_t s) {
   switch (rows) {
-    case 1: run_gemv_push<G, 1>(c, x, w, shard, push, s); break;
-    case 2: run_gemv_push<G, 2>(c, x, w, shard, push, s); break;
-    case 3: run_gemv_push<G, 3>(c, x, w, shard, push, s); break;
-    case 4: run_gemv_push<G, 4>(c, x, w, shard, push, s); break;
-    case 5: run_gemv_push<G, 5>(c, x, w, shard, push, s); break;
-    case 6: run_gemv_push<G, 6>(c, x, w, shard, push, s); break;
-    case 7: run_gemv_push<G, 7>(c, x, w, shard, push, s); break;
-    case 8: run_gemv_push<G, 8>(c, x, w, shard, push, s); break;
+    case 1: run_gemv_push<G, 1>(c, x, w, shard, push, pdl, s); break;
+    case 2: run_gemv_push<G, 2>(c, x, w, shard, push, pdl, s); break;
+    case 3: run_gemv_push<G, 3>(c, x, w, shard, push, pdl, s); break;
+    case 4: run_gemv_push<G, 4>(c, x, w, shard, push, pdl, s); break;
+    case 5: run_gemv_push<G, 5>(c, x, w, shard, push, pdl, s); break;
+    case 6: run_gemv_push<G, 6>(c, x, w, shard, push, pdl, s); break;
+    case 7: run_gemv_push<G, 7>(c, x, w, shard, push, pdl, s); break;
+    case 8: run_gemv_push<G, 8>(c, x, w, shard, push, pdl, s); break;
     default: break;  // rejected by the caller (bindings.cpp)
   }
 }
 
-void launch_gemv_push(const Ctx& c, int kind, int variant, const void* x, const void* w, void* shard, int rows, int push,
+void launch_gemv_push(const Ctx& c, int kind, int variant, const void* x, const void* w, void* shard, int rows, int push, bool pdl,
                       cudaStream_t s) {
   if (kind == 0) {
-    if (variant == 1) dispatch_rows<PoolerV1>(c, x, w, shard, rows, push, s);
-    else if (variant == 2) dispatch_rows<PoolerV2>(c, x, w, shard, rows, push, s);
-    else if (variant == 3) dispatch_rows<PoolerV3>(c, x, w, shard, rows, push, s);
-    else dispatch_rows<PoolerV0>(c, x, w, shard, rows, push, s);
+    if (variant == 1) dispatch_rows<PoolerV1>(c, x, w, shard, rows, push, pdl, s);
+    else if (variant == 2) dispatch_rows<PoolerV2>(c, x, w, shard, rows, push, pdl, s);
+    else if (variant == 3) dispatch_rows<PoolerV3>(c, x, w, shard, rows, push, pdl, s);
+    else dispatch_rows<PoolerV0>(c, x, w, shard, rows, push, pdl, s);
   } else {
-    if (variant == 1) dispatch_rows<UnpoolerV1>(c, x, w, shard, rows, push, s);
-    else if (variant == 2) dispatch_rows<UnpoolerV2>(c, x, w, shard, rows, push, s);
-    else if (variant == 3) dispatch_rows<UnpoolerV3>(c, x, w, shard, rows, push, s);
-    else dispatch_rows<UnpoolerV0>(c, x, w, shard, rows, push, s);
+    if (variant == 1) dispatch_rows<UnpoolerV1>(c, x, w, shard, rows, push, pdl, s);
+    else if (variant == 2) dispatch_rows<UnpoolerV2>(c, x, w, shard, rows, push, pdl, s);
+    else if (variant == 3) dispatch_rows<UnpoolerV3>(c, x, w, shard, rows, push, pdl, s);
+    else dispatch_rows<UnpoolerV0>(c, x, w, shard, rows, push, pdl, s);
   }
 }
 
