@@ -8,9 +8,21 @@ RUNNING server (/v1/completions with a token-id prompt, greedy, max_tokens 16, s
           1. two long prompts (A = 64k, B = 118k tokens) are sent cold and immediately again (GPU hit),
           2. pass 1 over D documents of --doc-len tokens (cold; D * doc-len = --ws-factor x the GPU pool, so it evicts A and B),
           3. A and B again (re-admission: CPU-tier hit with offload, recompute without),
-          4. passes 2..N over the same documents in the same order with a fresh random question suffix (LRU of the GPU pool
-             hits nothing; an offload tier that holds the working set hits everything).
+          4. passes 2..N over the same documents with the SAME 64-token suffix as pass 1, i.e. byte-identical prompts (the logprob sha of
+             a document is comparable across passes). --order cyclic (default) re-sends them in the same order, so the LRU of the GPU pool
+             hits nothing by construction and an offload tier that holds the working set hits everything; --order random draws a fresh
+             permutation per pass (a tier smaller than the working set then hits the fraction it holds).
+          THIS IS THE BEST CASE of a tier (every pass re-sends whole stored prompts, no background decode, cyclic order): its TTFT and
+          tokens/s ratios are an UPPER BOUND of what mixed traffic gains. `rag` is the less favourable workload.
           --clients requests are in flight (closed loop). Per request: TTFT, total time, prompt length, metric deltas per pass.
+  rag     Retrieval-style traffic on the documents of `cycle` (same seeds): Zipf(--zipf-s) popularity over a random ranking of the documents,
+          a FRESH random question suffix (32..256 tokens) per request (the hit is the document prefix, the suffix is computed), --clients
+          requests in flight, and --bg background decoders (random 256-token prompts, 384 output tokens, streamed, closed loop) running
+          the whole time: reports the TTFT of the rag requests and the output tokens/s and inter-token latency of the background decoders
+          while loads and stores share the PCIe links with the collectives. Reported, not a gate.
+  tiercheck  (after a cycle with --order random over more documents than the tier holds) correctness of the full-tier regime: for sampled
+          documents the GPU cache is reset and the document is sent twice; when the first send was a full external hit (>= 98 % of the
+          prompt from the tier) the pair (tier hit, GPU hit of the same length) must be bitwise equal (tokens and logprob values).
   chat    --convs conversations of --turns turns, round-robin over the conversations (the reuse distance of a history is
           the whole working set): turn k sends history(k-1) + --turn-tokens new tokens + --reply-tokens of the assistant
           reply (random ids), so every turn reuses the previous prompt as its prefix.
@@ -19,9 +31,10 @@ Hit proof: the /metrics counters of the prefix caches (vllm:prefix_cache_*, vllm
 both connectors (vllm:simple_kv_offload_*, vllm:kv_offload_*) are diffed per pass. The TTFT alone proves nothing.
 Stores are asynchronous: wait_stores() waits until the connector's pending-store gauges are 0 and its counters stand still.
 
-usage: reuse_driver.py --port 8100 --model M --out FILE.json --pool-tokens N [--scenario cycle|chat|smoke, comma separated]
-       [--doc-len 32768] [--ws-factor 1.5] [--passes 3] [--clients 4] [--ab-lens 65536,117964]
+usage: reuse_driver.py --port 8100 --model M --out FILE.json --pool-tokens N [--scenario cycle|chat|smoke|rag|tiercheck, comma separated]
+       [--doc-len 32768] [--ws-factor 1.5] [--passes 3] [--clients 4] [--ab-lens 65536,117964] [--order cyclic|random]
        [--convs 64] [--turns 5] [--turn-tokens 6000] [--reply-tokens 128] [--seed-base 777000] [--max-docs N]
+       [--rag-requests 160] [--zipf-s 1.0] [--bg 64] [--check-docs 24]
 """
 import argparse
 import hashlib
@@ -186,6 +199,7 @@ class Run:
         self.recs = []
         self.lock = threading.Lock()
         self.info = {"args": vars(a), "passes": {}}
+        self.docs = None
 
     def one(self, prompt, label, pas, idx):
         r = send(self.a.port, self.a.model, prompt)
@@ -242,7 +256,7 @@ class Run:
     # ------------------------------------------------------------------ cycle
     def cycle(self):
         a = self.a
-        lens = [int(x) for x in a.ab_lens.split(",") if x]
+        lens = [int(x) for x in a.ab_lens.split(",") if x.strip().isdigit() and int(x) > 0]   # --ab-lens none: no 64k / 118k singles
         base = a.seed_base
         # warm-up: a short prompt so first-use costs stay out of the rows
         send(a.port, a.model, gen_tokens(base - 1, 2048), max_tokens=4)
@@ -256,17 +270,143 @@ class Run:
         if a.max_docs:
             ndocs = min(ndocs, a.max_docs)
         docs = [gen_tokens(base + 5000 + i, a.doc_len) for i in range(ndocs)]
-        self.info["cycle"] = {"docs": ndocs, "doc_len": a.doc_len, "working_set_tokens": ndocs * a.doc_len, "pool_tokens": a.pool_tokens}
+        self.docs = docs
+        self.info["cycle"] = {"docs": ndocs, "doc_len": a.doc_len, "working_set_tokens": ndocs * a.doc_len, "pool_tokens": a.pool_tokens,
+                              "order": a.order}
         print("REUSE_CYCLE docs=%d doc_len=%d working_set=%d pool=%d" % (ndocs, a.doc_len, ndocs * a.doc_len, a.pool_tokens), flush=True)
         for p in range(1, a.passes + 1):
             suff = [gen_tokens(base + 70000 + i, 64) for i in range(ndocs)]  # same suffix in every pass: the sha is comparable
-            prompts = [docs[i] + suff[i] for i in range(ndocs)]
-            self.run_pass("cycle_p%d" % p, prompts, ["doc%d_p%d" % (i, p) for i in range(ndocs)], a.clients)
+            order = list(range(ndocs))
+            if a.order == "random" and p > 1:
+                random.Random(base + 31 * p).shuffle(order)
+            prompts = [docs[i] + suff[i] for i in order]
+            self.run_pass("cycle_p%d" % p, prompts, ["doc%d_p%d" % (i, p) for i in order], a.clients)
             w = wait_stores(a.port)
             print("REUSE_WAIT_STORES after_p%d %.1fs" % (p, w), flush=True)
             if p == 1:
                 for L in lens:
                     self.timed_single(longs[L] + gen_tokens(base + 900 + L, 64), "ab_readmit_%d" % L)
+
+    # ------------------------------------------------------------------ rag
+    def _docs(self):
+        """The documents of `cycle` (same seeds), generated here when `cycle` did not run in this process."""
+        a = self.a
+        if getattr(self, "docs", None) is None:
+            ndocs = max(2, int(math.ceil(a.ws_factor * a.pool_tokens / a.doc_len)))
+            if a.max_docs:
+                ndocs = min(ndocs, a.max_docs)
+            self.docs = [gen_tokens(a.seed_base + 5000 + i, a.doc_len) for i in range(ndocs)]
+        return self.docs
+
+    def _bg_decoder(self, k, stop, out):
+        """One closed-loop background decoder: random 256-token prompts, 384 streamed output tokens; records (t_first, t_last, n_tokens)."""
+        a = self.a
+        n = 0
+        while not stop.is_set():
+            n += 1
+            body = json.dumps({"model": a.model, "prompt": gen_tokens(a.seed_base + 8_000_000 + k * 100000 + n, 256), "max_tokens": 384,
+                               "temperature": 0, "stream": True, "stream_options": {"include_usage": True}, "ignore_eos": True})
+            c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=1800)
+            t_first = t_last = None
+            ntok = 0
+            try:
+                c.request("POST", "/v1/completions", body=body, headers={"Content-Type": "application/json"})
+                r = c.getresponse()
+                while True:
+                    line = r.readline()
+                    if not line:
+                        break
+                    if not line.startswith(b"data: "):
+                        continue
+                    payload = line[6:].strip()
+                    if payload == b"[DONE]":
+                        break
+                    now = time.perf_counter()
+                    try:
+                        d = json.loads(payload)
+                    except ValueError:
+                        continue
+                    if d.get("choices"):
+                        if t_first is None:
+                            t_first = now
+                        t_last = now
+                    if d.get("usage"):
+                        ntok = d["usage"].get("completion_tokens", ntok)
+                with self.lock:
+                    out.append((t_first, t_last, ntok, r.status))
+            except Exception as e:  # noqa: BLE001
+                with self.lock:
+                    out.append((t_first, t_last, ntok, -1))
+            finally:
+                c.close()
+
+    def rag(self):
+        a = self.a
+        docs = self._docs()
+        nd = len(docs)
+        rng = random.Random(a.seed_base + 424242)
+        rank = list(range(nd))
+        rng.shuffle(rank)                                  # popularity rank -> document
+        w = [1.0 / (r + 1) ** a.zipf_s for r in range(nd)]
+        picks = [rank[i] for i in rng.choices(range(nd), weights=w, k=a.rag_requests)]
+        prompts = [docs[d] + gen_tokens(a.seed_base + 6_000_000 + j, rng.randrange(32, 257)) for j, d in enumerate(picks)]
+        distinct = len(set(picks))
+        print("REUSE_RAG docs=%d requests=%d distinct=%d zipf_s=%.2f bg=%d" % (nd, len(picks), distinct, a.zipf_s, a.bg), flush=True)
+        stop = threading.Event()
+        bg = []
+        ths = [threading.Thread(target=self._bg_decoder, args=(k, stop, bg), daemon=True) for k in range(a.bg)]
+        [t.start() for t in ths]
+        if a.bg:
+            time.sleep(20.0)                               # let the background batch form
+        w0 = time.perf_counter()
+        s = self.run_pass("rag", prompts, ["rag%d_doc%d" % (j, d) for j, d in enumerate(picks)], a.clients)
+        w1 = time.perf_counter()
+        stop.set()
+        # background decoders: tokens and inter-token latency inside the window [w0, w1], pro-rated by the overlap of each request
+        tok = 0.0
+        itl = []
+        for (t0, t1, n, st) in list(bg):
+            if t0 is None or t1 is None or n < 2 or t1 <= t0:
+                continue
+            ov = min(t1, w1) - max(t0, w0)
+            if ov <= 0:
+                continue
+            tok += n * ov / (t1 - t0)
+            itl.append(1000.0 * (t1 - t0) / (n - 1))
+        wall = w1 - w0
+        s["bg"] = {"decoders": a.bg, "window_s": round(wall, 1), "out_tok_per_s": round(tok / wall, 1) if wall > 0 else None,
+                   "itl_ms_p50": pct(itl, 50), "itl_ms_p99": pct(itl, 99), "requests_seen": len(itl)}
+        s["rag"] = {"docs": nd, "requests": len(picks), "distinct_docs": distinct, "zipf_s": a.zipf_s}
+        self.info["passes"]["rag"] = s
+        print("REUSE_RAG_DONE %s" % json.dumps(s, sort_keys=True), flush=True)
+        # let the background decoders finish their last request
+        for t in ths:
+            t.join(timeout=120)
+
+    # ------------------------------------------------------------------ tiercheck
+    def tiercheck(self):
+        a = self.a
+        docs = self._docs()
+        nd = len(docs)
+        base = a.seed_base
+        pick = random.Random(base + 777).sample(range(nd), min(a.check_docs, nd))
+        res = []
+        for i in pick:
+            prompt = docs[i] + gen_tokens(base + 70000 + i, 64)       # the prompt the cycle passes stored
+            w = wait_stores(a.port)
+            n = reset_gpu_cache(a.port)
+            r1 = self.timed_single(prompt, "tc%d_tier" % i)
+            h = sum(v for k, v in r1["metric_delta"].items() if k.startswith("vllm:external_prefix_cache_hits_total"))
+            r2 = self.timed_single(prompt, "tc%d_gpu" % i)
+            full = h >= 0.98 * len(prompt)
+            res.append({"doc": i, "external_hit_tokens": h, "prompt_len": len(prompt), "full_tier_hit": full,
+                        "equal": bool(full and r1["text_sha"] == r2["text_sha"] and r1["lp_sha"] == r2["lp_sha"] and r1["toks"] == r2["toks"] and r1["vals"] == r2["vals"]),
+                        "ttft_tier": r1["ttft_s"], "ttft_gpu": r2["ttft_s"], "reset_tries": n, "wait_stores_s": w})
+        comparable = [x for x in res if x["full_tier_hit"]]
+        self.info["tiercheck"] = {"checked": len(res), "comparable_pairs": len(comparable), "equal_pairs": sum(1 for x in comparable if x["equal"]),
+                                  "partial_or_miss": len(res) - len(comparable), "rows": res}
+        print("REUSE_TIERCHECK checked=%d comparable=%d equal=%d partial_or_miss=%d" % (len(res), len(comparable), sum(1 for x in comparable if x["equal"]),
+                                                                                          len(res) - len(comparable)), flush=True)
 
     # ------------------------------------------------------------------ smoke
     def smoke(self):
@@ -327,6 +467,11 @@ def main():
     ap.add_argument("--turn-tokens", type=int, default=6000)
     ap.add_argument("--reply-tokens", type=int, default=128)
     ap.add_argument("--seed-base", type=int, default=777000)
+    ap.add_argument("--order", default="cyclic", choices=["cyclic", "random"])
+    ap.add_argument("--rag-requests", type=int, default=160)
+    ap.add_argument("--zipf-s", type=float, default=1.0)
+    ap.add_argument("--bg", type=int, default=64)
+    ap.add_argument("--check-docs", type=int, default=24)
     a = ap.parse_args()
     run = Run(a)
     for sc in a.scenario.split(","):
@@ -336,6 +481,10 @@ def main():
             run.chat()
         elif sc == "smoke":
             run.smoke()
+        elif sc == "rag":
+            run.rag()
+        elif sc == "tiercheck":
+            run.tiercheck()
         else:
             print("unknown scenario %s" % sc, file=sys.stderr)
             return 2

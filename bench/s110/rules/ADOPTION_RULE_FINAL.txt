@@ -1,0 +1,95 @@
+S1-10 FINAL GATE ADOPTION RULE (offload ON vs offload OFF)
+Pre-registered 2026-11-07, before ANY gate boot (the study boots of 2026-11-07 morning were under the earlier rule ADOPTION_RULE.txt + 3 amendments, bench/s110/rules/; they chose
+{SimpleCPUOffloadConnector eager, --numa-bind, 45 GiB per rank} and are NOT re-decided here). The md5 of this file and of every file that implements it is recorded in
+PROGRESS.md and /tmp/muse_wf/s1-10/ADOPTION_RULE_FINAL.md5 before the first boot. Template: SG_COMMON "Adoption-rule template" (CTL boot of the production tree, every arm at its own
+exact --kv-cache-memory-bytes, flag and bytes together). Written in answer to the adversarial review of the study (findings: reuse upper bound, cold-prefill cost never tabulated,
+tier-full regime and preemption path never exercised, ns128 bytes unconfirmed, fail-open launch checks).
+
+QUESTION. Does the NUMA-local KV CPU offload configuration (SimpleCPUOffloadConnector eager + --numa-bind + exact cpu bytes, launched from env/offload.env) belong in the production
+speculative launch profile? It does iff it gives the prefix-reuse benefit at no measurable cost to the traffic that does not reuse, without memory risk, and without changing outputs.
+
+PRODUCTION UNDER TEST. vLLM branch sm120-muse-spark-open 268c64b0e2 (server sm120-dev/src) + host main 6f47eb1790 (server host_topo). Speculative profile = RadixArk DFlash2 K=7, block
+rejection, probabilistic draft, FP8 draft 2, graph-SP 136, mns 128, cap 256, --max-num-batched-tokens 8199, --kv-cache-memory-bytes 11,573,411,840 (1,629,269 KV tokens/rank), launch line
+/tmp/muse_wf/s1-9-L11_result.json fg.launch_args. Non-speculative ns256 = --max-num-seqs 256 --max-cudagraph-capture-size 256 --kv-cache-memory-bytes 16,957,243,392; ns128 =
+--max-num-seqs 128 --kv-cache-memory-bytes 17,357,799,424.
+CANDIDATE. Production + vLLM commit 9388ed1133 (KVConnectorBase_V1.receives_remote_kv: a local cache runs as kv_both without turning on the multimodal embedding path; tree src_s110g;
+the optional NUMA-policy commit 359cdc74aa is NOT part of the candidate and is not merged) + the host branch s110-offload (gate mirror host_topo_s110: host.env and spec_k7.env byte identical to
+production, md5 logged by the master; + env/offload.env, check_offload_launch.sh, preflight_offload.sh and the S1-10 tools). The ON arm takes its launch line from env/offload.env itself.
+
+ARMS, per profile (spec | ns256). Tags s110g_<profile>_<ARM>_<g>. Each arm at its own exact bytes (asserted by master_gate.sh before the launch; a mismatch aborts the boot):
+  CTL = production tree sm120-dev/src + production host mirror host_topo, no offload, no bind: spec 11,573,411,840 / ns256 16,957,243,392;
+  OFF = gate tree src_s110g + gate host mirror, MUSE_OFFLOAD=0 sourced (no connector, no bind), same bytes as CTL (feature tree with flags unset: CTL attributes any tree effect);
+  ON  = gate tree + gate host mirror with env/offload.env sourced (before spec_k7.env): --numa-bind --kv-transfer-config SimpleCPUOffloadConnector kv_both cpu_bytes_to_use_per_rank
+        48,318,382,080 (45 GiB; cpu_bytes_to_use 386,547,056,640 = 8x), bytes spec 11,525,693,440 (562,778 blocks, 1,622,551 tokens, -0.41 % against 1,629,269: the KV loss is charged to the arm and
+        printed next to its gain), ns256 16,957,243,392 (unchanged).
+  The ON bytes are the study's. They are re-confirmed on the gate tree by phase X below BEFORE any A/B boot; if a stress boot is not clean or S_live < the floor, the bytes of that
+  profile are stepped down by the shortfall (S1-7 rule, whole blocks) and confirmed by a second stress boot; the stepped value replaces the table above (env/offload.env, expect_bytes of
+  master_gate.sh) and the change is logged with the md5 of the changed files before the first A/B boot.
+  ARM CHECK (every boot): check_spec_launch.sh (spec) and check_offload_launch.sh (ON: bound on nodes 3 3 0 0 7 7 4 4, scheduler and worker block counts equal and = floor(per-rank bytes / bytes per
+  block-id), LBNHC layout, no enable_mm_embeds line, serve_cmd.txt carries --numa-bind, the tier bytes and a --kv-cache-memory-bytes not above the offload-on maximum; OFF / CTL: no connector line, no
+  binding line). A boot that fails its ARM CHECK, does not finish (status.txt without DONE) or is killed by the watchdog is an artifact and is retried once at the end of its hold in its
+  group; a second failure is a failure of that arm (guard G3 / G5 as the case may be).
+
+SESSIONS. 3 counterbalanced boot groups per profile, 3 sessions per arm: g1 CTL OFF ON, g2 OFF ON CTL, g3 ON CTL OFF (every arm once per position). Spec profile first, then ns256.
+Jobs inside one boot, in this order (cells that must not reuse run BEFORE the reuse workloads, on a cold GPU pool and an empty tier):
+  facts -> STEADY -> DEC -> REUSE (ON, OFF; CTL in group 1 only, reported) -> RAG (ON, OFF; reported).
+  STEADY: drive_steady_s110.py = the S1-9 L11 protocol: real mix320 chats (gsm80 + mtbench), greedy, ignore_eos, long outputs, constant batch c; cells c1 (2 ramps) c16 c64 c128 (1 ramp each); per ramp 3 s ramp +
+          2 windows of 12 s; step_ms from the engine counters (spec: 1000 c dt / d(drafts); non-spec: per generated token); prompts are warmed into the GPU prefix cache before the windows, so a window sees decode and the
+          eager stores of its own blocks, never a tier load. Boot value of a cell = mean of its valid windows.
+  DEC:    real greedy closed loop (gsm80 + mtbench, 128 output tokens, n = max(16, 4c) requests, cells c1 c16 c64 c128, 2 repetitions), EVERY request with its own cache_salt (no request can hit the GPU cache
+          or the tier: rows measure decode plus the stores). Boot value of a cell = mean of the repetitions' output tok/s.
+  REUSE:  reuse_driver.py --scenario cycle --doc-len 32768 --ws-factor 1.6 --clients 4 (spec --passes 3, 80 documents of 32,768 random tokens + 64-token suffix = 1.6x the GPU pool; ns256 --passes 2, 143 documents),
+          first the 64k / 118k cold, GPU-hit and (after pass 1) RE-ADMISSION singles; pass 1 = cold fill, passes >= 2 = reuse passes (same prompts, cyclic order: the GPU LRU hits nothing by construction).
+          THIS IS A BEST CASE and the document says so: its ratios are an upper bound of mixed traffic. The RAG job below is the less favourable workload.
+  RAG:    reuse_driver.py --scenario rag: the same documents, Zipf(1.0) popularity, a fresh 32..256-token question suffix per request (160 requests, 4 clients) while 64 background decoders (random
+          256-token prompts, 384 output tokens, closed loop) run: TTFT p50/p99 of the RAG requests, background output tok/s and inter-token latency in the window. REPORTED, not a gate (the OFF arm also pays
+          prefill interference), but its failed requests count under G5.
+  Spec-profile REUSE boots of CTL are not required (group 1 only); CTL boots of groups 2 and 3 run facts, STEADY and DEC.
+
+PRIMARY (REUSE, ON vs OFF, per profile; ratios per group, every group AND the mean must satisfy; the thresholds are those of the study rule's Benefit test):
+  P1 pooled reuse-pass TTFT p50 ratio ON/OFF <= 0.70;  P2 pooled reuse-pass prompt tok/s ratio >= 1.30;  P3 pooled reuse-pass TTFT p99 ratio <= 1.00;
+  P4 118k re-admission TTFT ratio <= 0.70;  P5 HIT = external_prefix_cache_hits / external_prefix_cache_queries over the reuse passes >= 0.90.
+  Reported with it: 64k re-admission, the CTL group-1 production control, the RAG rows, the KV-token cost of ON (spec -0.41 %).
+
+GUARDS (every one must hold for the profile to be adopted):
+  G1 no-reuse steady state. STEADY: per cell the paired ratio step(OFF)/step(ON) per group, mean over groups; geometric mean over c1 c16 c64 c128 >= 0.990 and every cell >= 0.985; the same against CTL.
+     DEC: ratio tok/s(ON)/tok/s(OFF) per cell per group, mean over groups; geometric mean >= 0.990 and every cell >= 0.975; the same against CTL. The per-group spread of every cell is printed (noise); the
+     OFF-vs-CTL pair is the tree attribution. A failing G1 (point estimate below a threshold) triggers ONE further group (g4: the three arms of that profile) and the pooled 4 groups decide.
+  G2 cold prefill (eager stores during long cold prefills next to the SP collectives): REUSE pass 1 prompt tok/s ratio ON/OFF >= 0.98 pooled and >= 0.96 in every group; cold 64k and 118k single-prompt
+     TTFT ratio ON/OFF <= 1.02 pooled.
+  G3 host memory and boot: every ON boot reaches READY, READY seconds <= median OFF READY + 180 s (boot time is noted for every boot incl. CTL); 0 'OutOfMemoryError|CUDA out of memory' lines in any serve.log;
+     0 watchdog trips (memory floor MemFree + file cache 2,048 MiB per GPU node, anon + shmem 95 % of a node, raised oom_score_adj 1000 on the session); 0 populate stalls (= READY within the limit);
+     min over the run of MemFree + file cache of every GPU node >= 4,096 MiB in the ON boots; preflight_offload.sh OK before every ON boot.
+  G4 GPU memory: GPU used at READY ON - OFF <= 96 MiB (2 MiB per GiB registered x 45 GiB = 90 MiB + noise) in every group; phase X decides S_live.
+  G5 correctness: 0 failed requests in every driver (reuse sends, DEC rows, RAG rows), STEADY cells complete, 0 preemptions in the ON boots (the A/B workloads must not preempt; the connector's preemption path
+     has its own gate S), health 200 and status DONE at the end of every boot.
+
+PHASE X (memory, before any A/B boot): S1-7 stress (exact_boot_s110.sh on the probe tree src_s110gx = gate tree + sitecustomize allocator probe, stress A1 B C1 C2 D H I (L M for spec) X, REPS = 2, the ON launch line,
+  NVML 10 ms sampler) at the ON bytes: spec 11,525,693,440 (floor S_live 1,256 MiB), ns256 16,957,243,392 (floor 500 MiB), ns128 17,357,799,424 (floor 500 MiB; the only profile with no confirmed tier value yet).
+  Clean = 0 failures, 0 OOM, 0 preemptions, health 200. S_live below the floor -> step by the shortfall, second boot (see ARMS). ns128 is an opt-in profile: its row is shipped only after its stress.
+
+GATE S (preemption path): a spec ON boot with the production flags but --max-model-len 24576 and --num-gpu-blocks-override 24000 (the pool holds ~5 long prompts); preempt_smoke.py: 24 distinct random prompts of
+  12,000 tokens sent at once twice (300 greedy output tokens each), then the tier-consistency pairs (GPU pool reset, prompt sent twice: tier hit then GPU hit of the same length: bitwise equal tokens and logprob
+  values for every pair whose first send was a full tier hit; >= 4 such pairs). PASS = health 200, 0 failed or incomplete requests, vllm:num_preemptions_total > 0 (proof that the path ran; 0 preemptions is
+  INCONCLUSIVE and the boot is repeated once with 2/3 of the blocks), pending stores drained, all pairs equal. The same smoke on an ns256 ON boot is run and reported.
+GATE T (tier-full regime): a spec ON boot, reuse_driver cycle over 330 documents of 32,768 tokens in random order per pass (1.34x the 245 documents the tier holds), 3 passes, then tiercheck (24 documents:
+  GPU reset, send, send again; pairs whose first send was a full tier hit must be bitwise equal; >= 6 pairs). PASS = 0 failed requests, health 200, all comparable pairs equal. The hit fraction of passes 2 and 3
+  and the TTFT distribution are reported (performance of the CPU-pool LRU eviction regime), not gated.
+
+GATE D (determinism, run after the A/B holds): offline e2e (e2e_s110.py, VLLM_ENABLE_V1_MULTIPROCESSING=0, TP8 + EP8, the production spec settings, max-model-len 32768, 85 prompts of 9 .. 23,000 tokens, 128
+  new tokens, enable_prefix_caching=True in all four processes), TWO COLD PROCESSES PER ARM (ONa, OFFa, ONb, OFFb; ON = numa_bind + the tier + the ON bytes; OFF = its own bytes), per sampling mode
+  (greedy, seeded t1k64, mixed seeded top_p / frequency penalty / greedy, and `lp` = 8 prompts with logprobs=5): pass C (cold: GPU cache and tier emptied), pass H (the same prompts again: GPU hits), pass X (GPU pool
+  reset, tier kept: ON = connector hits, OFF = recompute). Request by request, only between passes with the same num_cached_tokens (a hit and a recompute are different computations; coverage >= 90 % required):
+  D1 ONa == ONb and OFFa == OFFb in every pass (token ids, and `lp` logprob values); D2 ON C == OFF C; D3 ON H == OFF H; D4 ON X == ON H and ON X == OFF H; D5 OFF X == OFF C and ON C == OFF X.
+  PASS = every comparison identical. An OOM / missing pass / missing connector evidence in a process = ARTIFACT, that process is retried once. Run for spec (gating the speculative profile) and ns256 (mns 256, no
+  speculation, MNBT 8192; gating the ns256 recommendation).
+
+ADOPTION.
+  spec:  ADOPT (offload becomes part of the production speculative launch profile, env/spec_k7.env sources env/offload.env, MUSE_OFFLOAD=0 opts out) iff P1-P5 in every group, G1-G5, X (spec), S, T and D (spec) hold.
+  ns256: the non-speculative offload profile is RECOMMENDED (documented launch line, ns256 bytes unchanged) iff P1-P5, G1-G5, X (ns256) and D (ns256) hold; otherwise it is documented as not recommended.
+  ns128: shipped as an offload profile iff its stress (X) passes; no A/B (the ns256 A/B covers the non-speculative connector behaviour).
+  If spec fails: the configuration is kept as an opt-in profile (MUSE_OFFLOAD default 0 in spec_k7.env) with all evidence in docs/s110_numa_offload.md; the vLLM fix 9388ed1133 is merged either way (it is a correctness
+  fix of VllmConfig independent of the adoption).
+  The ns256 --numa-bind deviation (the bound ns256 arm is 9-12 % slower in median reuse TTFT than its unbound twin; study, named deviation) is NOT re-gated here: the gate judges the shipped configuration.
+  Noise statement: all ratios are paired inside boot groups; OFF-vs-CTL and the per-group spreads are printed by verdict_gate.py; thresholds are point estimates (a single borderline failure is resolved by the g4 clause of G1,
+  nothing else is retried). verdict_gate.py (thresholds = constants of the file) implements the A/B part, cmp_e2e_s110.py gate D, preempt_smoke.py gate S, the tiercheck of reuse_driver.py gate T.
