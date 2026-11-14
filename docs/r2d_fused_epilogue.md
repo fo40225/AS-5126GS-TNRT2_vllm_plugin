@@ -17,6 +17,14 @@ NCCL does not, and the model then keeps the two-step path).
 
 ## Accuracy class: identical (bit for bit), by construction and by test
 
+**Scope (since r3c, `docs/r3c_medium_ar.md`).** "Identical" holds against the unfused path *with the same all-reduce arithmetic*.
+The fused `all_reduce_boundary` kernel always uses the exact fp32 exchange. With the medium bf16 exchange on (the `env/host.env`
+default, `MUSE_TOPO_MEDIUM_BX=1` together with `MUSE_TOPO_LARGE_BF16_EXCHANGE=1`), the unfused attn-out all-reduce of the same batch
+(`comm.all_reduce`, T = 4 .. 8 = 64 .. 128 KiB) takes the bf16 exchange instead, so switching the fused kernels off
+(`MUSE_TOPO_FUSED=0`, `MUSE_TOPO_OPS` without `boundary`, or `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`) changes the bits for
+T = 4 .. 8 (class deterministic_different; T = 1 .. 3 stay exact). A bit-identical fused on / off A/B needs
+`MUSE_TOPO_MEDIUM_BX=0` in both runs.
+
 The fused kernels reproduce the Triton kernels bit for bit, so the model's outputs do not change. "Reproduce" is defined against the
 **SASS** of the Triton kernels on sm_120a (Triton 3.7.1, ptxas of CUDA 13.3), not against the Python source: ptxas contracts some of the
 multiplies of the sum of squares into FMAs, and the reduction tree is the one Triton generates for the block layout. What the proof
@@ -86,6 +94,9 @@ crossover; larger batches keep the two-step path (they are bandwidth bound, and 
 | 6-layer dummy e2e (`nccl/e2e_bitwise.py`, fused on vs off, plugin on in both) | 20/20 requests, every logprob and prompt logprob bitwise equal |
 | real weights, 62 layers, **base trees** (vLLM `aef9851844` + host `37b2d96`, no `boundary` op, none of the new code) vs the committed trees (fused on, 2026-10-26, same 270-request script) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal (chosen-token and prompt |dlogprob| max 0, mean NLL delta 0); 118 fused-op log lines in the run with the fusion, none in the base run. This is the check that the whole change (model refactor included) leaves the outputs of the current default untouched |
 | real weights, 62 layers (`e2e_ab.py` of the final-measure track + decode batches T = 1, 2, 3, 4, 5, 9, 12, 16, 17, 33, 48, 64) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal fused on vs off; a second fused process equals the first; in-process repeats equal; the log shows `all_reduce_boundary` / `all_gather_boundary` (T = 1, 2, 4, 8) and `all_gather_rmsnorm` (T <= 16) inside the 62-layer CUDA graphs |
+
+The two real-weight fused on / off rows were measured before r3c existed (exact exchange for every medium all-reduce); under the
+r3c default they would differ for T = 4 .. 8 as described under "Accuracy class".
 
 NaN payloads: a NaN stays a NaN everywhere; the all-reduce replaces words equal to `0xFFFFFFFF` (as before), so a NaN payload may differ
 between runs of different batch compositions only in the case that was already true for the plain all-reduce.

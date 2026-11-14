@@ -70,11 +70,17 @@ Environment (all optional):
                              all-gather shards above 1 MiB then go to NCCL); default 1
 ``MUSE_TOPO_LARGE_BF16_EXCHANGE``  1 (opt-in, class deterministic_different): the large all-reduce / reduce_scatter
                              exchange both island partials rounded to bf16 (bf16 inputs only; fp16 / fp32 keep the exact
-                             exchange); default 0 (exact fp32 partials). Batch invariant only inside the large algorithm
-``MUSE_TOPO_MEDIUM_BX``      0 keeps the exact fp32 exchange for the all-reduces below ``ar_large_min_bx`` (2 MiB) when
+                             exchange); default 0 (exact fp32 partials). Batch invariant only inside the bf16-exchange
+                             range: every bf16 all-reduce from ``ar_bx_min`` (64 KiB with ``MUSE_TOPO_MEDIUM_BX`` on, else
+                             the 2 MiB switch ``ar_large_min``) and every reduce_scatter (at least 128 KiB) give a row the
+                             same bits at any size; smaller all-reduces and the fused T <= 8 kernels keep the exact exchange
+``MUSE_TOPO_MEDIUM_BX``      0 keeps the exact fp32 exchange for the all-reduces below ``ar_large_min`` (2 MiB) when
                              ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1``; default 1: those bf16 all-reduces from
-                             ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES`` bytes on use the bf16 exchange as well (algorithm 2 with
-                             rounded island partials, r3c; same bits as the large algorithm, class deterministic_different)
+                             ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES`` bytes (``ar_bx_min``, default 65536) on use the bf16 exchange
+                             as well (algorithm 2 with rounded island partials, r3c; same bits as the large algorithm, class
+                             deterministic_different); the large algorithm then only takes messages above ``max_bytes``
+                             (``ar_large_min_bx``, 1 << 62). The two variables and ``MUSE_TOPO_AR_TUNING_FILE`` must be
+                             identical on every rank
 ``MUSE_TOPO_FUSED``          0 disables the fused collective + epilogue kernels (``TopoComm.supports_boundary_rows``
                              then declines every batch and the model runs the two steps); default 1
 ``MUSE_TOPO_LOG_OPS``        0 (default): the per-op summary goes to the debug log; 1: info log on group rank 0;

@@ -37,8 +37,12 @@ applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm an
 all_reduce calls of the medium algorithm (algorithm 2, ``BX`` kernel variant) from ``ar_bx_min`` (64 KiB) up to ``max_bytes``,
 with the same arithmetic as the large algorithm, so every bf16 all_reduce of at least 64 KiB gets the same bits whichever algorithm
 its size selects (docs/r3c_medium_ar.md); fp16 and fp32 keep the exact exchange (an fp16 partial above 65504 would overflow) and the
-flag must be the same on all ranks. Messages below ``ar_bx_min``, the fused all-reduce + boundary kernels (T <= 8) and
-reduce_scatter below 2 MiB keep the exact fp32 exchange, so an element can still get different bits depending on its message size.
+flag and the medium-exchange settings (``MUSE_TOPO_MEDIUM_BX``, ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES``, the tuning file) must be the same
+on all ranks. reduce_scatter always runs the large algorithm with the exchange when the flag is on (it needs at least
+``rs_min_bytes``, 128 KiB), so reduce_scatter and all_reduce agree bitwise from 128 KiB on (from 2 MiB with
+``MUSE_TOPO_MEDIUM_BX=0``). Messages below ``ar_bx_min`` and the fused all-reduce + boundary kernels (T <= 8) keep the exact
+fp32 exchange, so an element can still get different bits depending on its message size: at ``ar_bx_min`` (64 KiB; 2 MiB with
+``MUSE_TOPO_MEDIUM_BX=0``) and, with the medium exchange on, between the fused and the unfused T = 4 .. 8 attn-out reduction.
 ``MUSE_TOPO_LARGE=0`` disables the large algorithms (supports() then keeps the H1a limits).
 
 Calls are asynchronous on the current CUDA stream, CUDA-graph safe (no host state per call), and must be issued
@@ -497,7 +501,8 @@ class TopoComm:
 
     def _medium_bx(self, x: torch.Tensor, nbytes: int) -> bool:
         """Whether this all_reduce takes the bf16 exchange of the medium algorithm (bf16 input, the size window of
-        ``ar_bx_min`` and up); a function of dtype and size only, so it is the same on every rank."""
+        ``ar_bx_min`` and up); a function of dtype, size and the construction-time settings only, so it is the same on every
+        rank as long as those settings are (see the module docstring)."""
         return self.bf16_exchange and self.medium_bx and x.dtype == torch.bfloat16 and nbytes >= self.ar_bx_min
 
     def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None, bx=False):

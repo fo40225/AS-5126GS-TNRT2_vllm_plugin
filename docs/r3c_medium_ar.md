@@ -23,9 +23,15 @@ for every transport (`docs/h1b_latency.md`).
   dispatch path with the medium exchange off / on), `bench/make_table_medium.py` (rows -> table + thresholds),
   `bench/test_medium_bx.py` (correctness), `scripts/r3c_chain.sh` / `scripts/conc_sweep.sh` (the one-lock measurement sequence).
 * Unchanged: the fused all-reduce + boundary kernel (`ar_bnd.cu`, T <= 8, attn-out) keeps the exact fp32 exchange and the dispatch
-  limits of r2d; the model-side hook is untouched (no vLLM change).
+  limits of r2d; the model-side hook is untouched (no vLLM change). Consequence: the attn-out reduction at T = 4 .. 8 (64 .. 128 KiB) is
+  exact only while the fused kernel serves it. With the fused kernels off (`MUSE_TOPO_FUSED=0`, `MUSE_TOPO_OPS` without `boundary`,
+  or `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`) it goes through `comm.all_reduce` and takes the bf16 exchange, so fused on vs off is
+  no longer bit-identical for T = 4 .. 8 (`docs/r2d_fused_epilogue.md`). A bit-identical fused on / off A/B needs
+  `MUSE_TOPO_MEDIUM_BX=0` in both runs.
 * `MUSE_TOPO_AR_TUNING_FILE=<json>` is an experiment hook: `bx_table` (rows of `_AR_BX_TABLE`), `bx_min`, `large_min_bx` override the
-  built-in values (this is how the measured table was exercised end to end before it was compiled in).
+  built-in values (this is how the measured table was exercised end to end before it was compiled in). Like `MUSE_TOPO_MEDIUM_BX` and
+  `MUSE_TOPO_MEDIUM_BX_MIN_BYTES` it must be identical on every rank; a bad integer or an unreadable file on some rank is reported
+  through the stage-1 agreement of `TopoComm.__init__`, so every rank raises `TopoUnavailable` (`bench/test_init_failure.py`, case `tuning`).
 
 ## Accuracy class: deterministic_different
 
@@ -33,11 +39,19 @@ Reproducible run to run, identical on all ranks, equal to a torch emulation bit 
 path, no systematic bias (round to nearest even on both partials). Evidence (`bench/test_medium_bx.py`, 8 ranks, real GPUs):
 
 * ar2 BX == torch emulation (`bf16(P_0)`, `bf16(P_1)` added in fp32, rounded once) for 64 KiB .. 4 MiB, randn / mixed-exponent / signed-zero
-  data and 7 launch geometries (grid 1 .. 188, block 32 .. 512, unroll 1 .. 4); the BX result differs from the exact path (not a no-op).
+  data, mostly -0.0 data (`negzeros`: 43 % of the results are -0.0 at every size, so the sign-of-zero path is exercised from 64 KiB on)
+  and 7 launch geometries (grid 1 .. 188, block 32 .. 512, unroll 1 .. 4); the BX result differs from the exact path (not a no-op).
+* dispatch (`comm.all_reduce`) from 32 KiB to 8 MiB and at the `max_bytes` edge: exactly 8 MiB still takes algorithm 2 with BX, 8 MiB +
+  128 B takes the large algorithm; every size is checked for its bits and for the algorithm that ran (medium BX on / off / exchange off).
 * random bit patterns (NaN, inf, subnormals, all-ones words): ar2 BX == large BX, fused and two-launch, bitwise, for two geometries.
 * rank-identical (sha256 over ranks), run-to-run (5 runs), eager == CUDA graph replay, batch invariant (the rows of the first half alone
-  equal the rows of the full batch), 4 mixed sequences of 40 all-reduce sizes + all-gathers in one graph (counter alignment, 3 replays).
-  83 hard checks pass; `tests_h1a.py --quick` (119 checks) and `tests_h1b.py --quick` (190 checks) pass unchanged.
+  equal the rows of the full batch), 4 mixed sequences of 40 all-reduce sizes + all-gathers in one graph (counter alignment, 3 replays),
+  and decode-layer sequences that interleave the BX all-reduce with the fused `all_reduce_boundary` / `all_gather_rmsnorm` /
+  `all_gather_boundary` kernels on the shared regions (the real decode order: embedding all-reduce, 6 layers of attn-out + boundary,
+  pooler gather + RMSNorm, MoE-out all-reduce, unpooler gather + boundary, logits gather; T = 8 and T = 4 and 3 random mixes with
+  layers of T in {1, 2, 3, 4, 5, 8} between bank all-reduces up to 16 MiB), eager and after 3 CUDA-graph replays, against the Triton
+  kernels applied to the exact contract (fused kernels) and against the BX emulation (all-reduces). 124 hard checks pass (83 before the
+  follow-up); `tests_h1a.py --quick` (119 checks) and `tests_h1b.py --quick` (190 checks) pass unchanged.
 * error against the fp64 sum, 1 MiB, mean ulp (exact path / BX / NCCL ring): randn 0.24 / 1.10 / 1.98, mixed-exponent 0.25 / 0.79 / 1.45;
   mean signed error -3e-6 and +2e-6 of the mean |value| (no bias). Maximum error is large when the two island partials cancel
   (1920 / 3856 ulp, NCCL's ring: 7168 / 24448), the same property as the large path (`docs/h1b_collectives.md`).
@@ -46,7 +60,7 @@ path, no systematic bias (round to nearest even on both partials). Evidence (`be
   NCCL 96.2 %. A vs B same final answer 192 / 200 (without: 191 / 200).
 
 Batch-size consequence (same class as the 2 MiB threshold of the large path before): in the decode range the attn-out all-reduce of
-T <= 8 is exact (fused kernel, 16 .. 128 KiB), from T = 9 on it carries the bf16 exchange (in the CUDA-graph decode the padded sizes are 1, 2, 4, 8, 16, 24, ..., so
+T <= 8 is exact while the fused kernel serves it (16 .. 128 KiB; with the fused kernels off, T = 4 .. 8 carries the exchange as well), from T = 9 on it carries the bf16 exchange (in the CUDA-graph decode the padded sizes are 1, 2, 4, 8, 16, 24, ..., so
 from T = 16); the MoE-out all-reduce `[T, 4096]` carries it from padded T = 8 (64 KiB). An element's bits therefore depend on the padded batch size at those boundaries, which the dummy end-to-end
 bitwise tool cannot be used for; the GSM8K smoke above is the evidence.
 
