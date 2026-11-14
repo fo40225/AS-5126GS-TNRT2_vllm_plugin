@@ -508,6 +508,8 @@ AL, KV blocks, GPU MiB at READY).
 
 ## S1-10R Phase 0: the speculative profile runs with the fused boundary off (`VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`), 2026-11-11
 
+**SUPERSEDED by Phase 2b (below, same day): the export of 0 was reverted; `env/spec_k7.env` no longer sets the variable and the production expectation of `check_spec_launch.sh` is FB=1. The text of this section is the Phase 0 record, kept as it was.**
+
 **Question.** S1-14 F1 (the communicator-fused boundaries kept on SM120 beside FlashInfer's dual norm, vLLM `0261903b9e`) left one unattributed number: speculative c1 real greedy -3.5 % with AL 4.856 -> 4.671 on 16 replayed prompts
 (z = 2.06). Pre-registered in `muse_wf/specs/S1-10R_regate_v033.md` (Phase 0) before measuring: arms FB1 = production, FB0 = production + launch env `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`, one boot per arm
 (greedy is run-to-run identical), c1 greedy, gsm80 and mtbench80 (the sd harness data), `max_tokens` 256, acceptance from accepted / drafted counts, z = (rate_FB1 - rate_FB0) / SE per dataset,
@@ -538,9 +540,40 @@ errors; the S1-7 stress was not repeated for FB0. FB0 takes the cuBLAS GEMV + `c
 (1) `/proc/<pid>/environ` of the server, the value it really read (pid from `server.pid` / `serve.pid` next to the log, else the last `APIServer pid=<n>` of the log; used only when the process is alive, its cmdline names vllm and the environ is
 readable by the checking user; a missing variable there is the vLLM default 1); (2) the environment snapshot next to the log, an `env.txt` (the S1-10R drivers write `env | grep -E '^(MUSE_|VLLM_MUSE|NCCL_|VLLM_PLUGINS)'` there):
 `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1>` is the state, a snapshot that lists other `VLLM_MUSE_SPARK_` variables but not this one means unset = the vLLM default 1; the snapshot is the driver shell, not the server process, so it can differ from
-what the server read; (3) neither: unverified. `SPEC_EXPECT_FB=0|1` demands the state and FAILS when it cannot be confirmed. **Production drivers must pass `SPEC_EXPECT_FB=0`**: without it an unverifiable boot exits 0 with `fb=unverified`, so a boot that
+what the server read; (3) neither: unverified. `SPEC_EXPECT_FB=0|1` demands the state and FAILS when it cannot be confirmed. **(Phase 0 wording, superseded by Phase 2b: production now expects FB=1, `SPEC_EXPECT_FB=0` is for an FB0 arm only) Production drivers must pass `SPEC_EXPECT_FB=0`**: without it an unverifiable boot exits 0 with `fb=unverified`, so a boot that
 lost the export would pass; without `SPEC_EXPECT_FB` the expectation is the value exported in the checking shell (a shell that sourced `env/spec_k7.env` expects 0) and is compared only when a source exists. A value other than 0 / 1 FAILS.
 The OK line carries `fb=<0|1|unverified>` (after `mnst=8192`, before the bytes note and the pool).
 `bench/test_check_spec_launch.sh` covers snapshots with 0, 1, unset, empty and invalid values, the explicit and the shell expectation, and a live process environment (pid file, overriding a stale `env.txt`), and the profile file (FB0 exported to the environment of child processes, preset kept, invalid preset rejected, `host.env` untouched).
 
 **Status.** Implemented on host branch `s110r-fb0` (from main `3192c6dd77`); takes effect on the server with the host deploy (the vLLM tree is unchanged).
+
+## S1-10R Phase 2b: the fused boundary is back ON in the speculative profile (FB0 reverted), 2026-11-11
+
+**Question.** Phase 0 turned the fused boundary off for the speculative profile on a c1-only acceptance result. The pre-registered Phase 2b rule (`muse_wf/specs/S1-10R_regate_v033.md`) asked for the speed side: boots FB1 FB0 FB0 FB1 of the
+production speculative profile, real greedy output tok/s on gsm80 + mtbench80 at c1 and c2 (pooled over the two datasets and the two boots), STEADY c1 / c2 / c16; keep FB0 iff its pooled tok/s at c1 AND at c2 is >= FB1's minus 0.5 %, else revert the
+spec profile to FB1 (remove the export; production returns to the host `3192c6dd77` behaviour for the boundary).
+
+**Result** (workflow `wf_8cf59f46-5bc`, `muse_wf/s1-10r_phase2b_result.json`, `muse_wf/s1-10r/phase2b_*.json`; production vLLM `f6a60ab9d7`, host `4ce6e12d2b`):
+
+| pooled real greedy tok/s | FB1 | FB0 | FB0 vs FB1 |
+|---|---|---|---|
+| c1 | 242.69 | 247.07 | **+1.80 %** |
+| c2 | 362.55 | 356.24 | **-1.74 %** (systematic: the two boots of each arm agree within 0.1 %) |
+
+STEADY (ms per step) FB1 / FB0: c1 17.30 / 17.20, c2 22.40 / 22.55, c16 55.84 / 55.58. The c2 result misses the rule (-1.74 % < -0.5 %), so the decision is `REVERT_TO_FB1`.
+
+**What FB0 removes.** `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0` turns every boundary kind off: `all_gather_boundary`, `all_gather_rmsnorm`, `all_reduce_boundary`, `gemv_all_gather_boundary`, `gemv_all_gather_rmsnorm`. At T = 16 (c2) only the pooler
+`all_gather_rmsnorm` (<= 16 rows, which the pre-F1 spec line kept) goes; that is the c2 loss. At T = 8 (c1) the ar / ag boundaries go as well, which is the c1 gain.
+
+**Decision.** `env/spec_k7.env` does not set, default or export `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY` any more (the speculative profile runs the vLLM default 1, as host `3192c6dd77` did); `env/host.env` never touched it. A launch that needs the FB0 arm exports it in
+its own driver. The KV bytes 11,720,212,480 were derived with the fused boundary on, so the revert returns the profile to the state they belong to (the S1-10R Phase 3 stress covers the production state).
+
+**Follow-up (S1-17, after S1-10R).** Keep the pooler kinds (T <= 16) and cap only the ar / ag boundary at T <= 4: expected c1 +~1.8 %, ns c8 +~1.2 %, c2 neutral. Not implemented here.
+
+**Check.** `scripts/check_spec_launch.sh` keeps the `fb=<0|1|unverified>` detection (sources as in the Phase 0 section: `/proc/<pid>/environ`, then `env.txt`, else unverified) and the production expectation is now FB=1: `SPEC_EXPECT_FB` unset means 1,
+`SPEC_EXPECT_FB=1` is accepted (same thing), `SPEC_EXPECT_FB=0` is for an FB0 arm of an A/B. A detected 0 without `SPEC_EXPECT_FB=0` FAILS, and so does a checking shell that exports `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0` while `SPEC_EXPECT_FB` is unset
+(a comeback of the export cannot pass silently). An explicit `SPEC_EXPECT_FB=0|1` still FAILS when the state cannot be confirmed; without it an unverifiable boot exits 0 with `fb=unverified`.
+`bench/test_check_spec_launch.sh` fails if `env/spec_k7.env` exports (or sets, or names in a non-comment line) the variable again, if a preset value is changed by the file, and for every detected-0 case without `SPEC_EXPECT_FB=0` (mutation-checked
+against the Phase 0 revision of the profile file and against a checker that expects the detected state).
+
+**Status.** Implemented on host branch `s110r-fb1` (from main `4ce6e12d2b`); takes effect on the server with the host deploy (the vLLM tree is unchanged).

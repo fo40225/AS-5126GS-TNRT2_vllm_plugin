@@ -43,14 +43,17 @@
 # S1-14 F2 (scheduled-token cap): the profile also carries --max-num-scheduled-tokens 8192 (MUSE_SPEC_MNST of env/spec_k7.env; the DFlash drafter has 0 slots on vLLM 0.33.0, so without the cap the chunks are 8199 tokens). The cap
 # is read from vLLM's startup line "non-default args: {... 'max_num_scheduled_tokens': <n> ...}" and, next to a harness serve_cmd.txt, from the flag. SPEC_EXPECT_MNST=<n> (default: this shell's MUSE_SPEC_MNST, else 8192) | off|0 (no cap, the plain port) demands the state. Every "non-default args" line of the log (a relaunch
 # appended to serve.log, a second API server) must carry the cap. The KV bytes are expected not to depend on the cap (max_num_batched_tokens stays 8199; to be verified by the S1-14 A/B), and no KV token number is checked.
-# S1-10R Phase 0 (fused boundary): env/spec_k7.env exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 (spec only). The model and the communicator log NOTHING about this switch (vllm/envs.py reads it
+# Fused boundary (S1-10R Phase 0, reverted by Phase 2b): the production speculative profile runs the vLLM default VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1; env/spec_k7.env does NOT export the variable (the Phase 0
+# export of 0 was reverted). The model and the communicator log NOTHING about this switch (vllm/envs.py reads it
 # into the fuses_boundary_collectives attributes of the layers, no log line), so the state cannot come from the serve.log. Sources, in order: (1) /proc/<pid>/environ of the server, the value it really read
 # (pid from server.pid / serve.pid next to the log, else the last "APIServer pid=<n>" of the log; used only when the process is alive, its cmdline names vllm and the environ is readable by the checking user;
 # a missing variable there = the vLLM default 1); (2) the env.txt snapshot of the driver shell next to the log (output of `env | grep -E '^(MUSE_|VLLM_MUSE|NCCL_|VLLM_PLUGINS)'`): a line
 # VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1> is the state, a snapshot with other VLLM_MUSE_SPARK_ lines but not this one means unset = the vLLM default 1; the snapshot is the driver shell, which can differ
-# from what the server read; (3) neither = fb=unverified. SPEC_EXPECT_FB=0|1 demands the state and FAILS when it cannot be confirmed. PRODUCTION DRIVERS MUST PASS SPEC_EXPECT_FB=0: without it an unverifiable
-# boot (no readable pid, no env.txt) exits 0 with fb=unverified, so a boot that lost the export would pass; without SPEC_EXPECT_FB the expectation is the value exported in the checking shell (a shell that
-# sourced env/spec_k7.env expects 0) and is only compared when a source exists. The OK line carries fb=<0|1|unverified> (before the bytes note and the pool).
+# from what the server read; (3) neither = fb=unverified.
+# Expectation: SPEC_EXPECT_FB unset means 1 (the production profile); SPEC_EXPECT_FB=1 is the same, explicitly; SPEC_EXPECT_FB=0 is for an FB0 arm of an A/B only. A detected 0 FAILS unless SPEC_EXPECT_FB=0 was
+# passed, so a comeback of the export (a profile file or a driver exporting 0) cannot pass silently. A checking shell that itself exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 FAILS the same way when SPEC_EXPECT_FB is
+# unset (it launched, or sourced a profile that launches, with the switch off). An explicit SPEC_EXPECT_FB=0|1 also FAILS when the state cannot be confirmed (no readable pid, no env.txt); without it an unverifiable
+# boot exits 0 with fb=unverified (nothing to compare). The OK line carries fb=<0|1|unverified> (before the bytes note and the pool).
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
@@ -314,15 +317,18 @@ elif [ -r "$fb_file" ]; then
   fi
 fi
 case "${SPEC_EXPECT_FB:-}" in ""|0|1) ;; *) echo "check_spec_launch: SPEC_EXPECT_FB must be 0 or 1, got '$SPEC_EXPECT_FB'" >&2; exit 2 ;; esac
-want_fb=${SPEC_EXPECT_FB:-}
-if [ -z "$want_fb" ]; then
-  case "${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-}" in 0|1) [ "$fb" != unverified ] && want_fb=$VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY ;; esac
+want_fb=${SPEC_EXPECT_FB:-1}
+if [ -z "${SPEC_EXPECT_FB:-}" ] && [ "${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-}" = 0 ]; then
+  echo "FAIL the checking shell exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 but SPEC_EXPECT_FB is not set (the production profile runs the fused boundary, FB=1; pass SPEC_EXPECT_FB=0 for an FB0 arm)"; rc=1
 fi
-if [ -n "$want_fb" ] && [ "$fb" != invalid ] && [ "$fb" != "$want_fb" ]; then
+if [ "$fb" != invalid ] && [ "$fb" != "$want_fb" ]; then
   if [ "$fb" = unverified ]; then
-    echo "FAIL the fused boundary state cannot be confirmed: no readable server /proc/<pid>/environ and no env.txt with VLLM_MUSE_SPARK_ variables next to $log, $want_fb demanded"; rc=1
+    # nothing to compare: only an explicit demand fails on it
+    if [ -n "${SPEC_EXPECT_FB:-}" ]; then
+      echo "FAIL the fused boundary state cannot be confirmed: no readable server /proc/<pid>/environ and no env.txt with VLLM_MUSE_SPARK_ variables next to $log, $want_fb demanded"; rc=1
+    fi
   else
-    echo "FAIL the fused boundary (VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY) is $fb in $fb_src, expected $want_fb"; rc=1
+    echo "FAIL the fused boundary (VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY) is $fb in $fb_src, expected $want_fb$([ -z "${SPEC_EXPECT_FB:-}" ] && echo ' (SPEC_EXPECT_FB unset = 1)')"; rc=1
   fi
 fi
 [ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt mnst=$mnst fb=$fb$cap_bytes_note ($pool)"
