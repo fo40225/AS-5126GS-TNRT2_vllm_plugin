@@ -133,8 +133,9 @@ One lock acquisition: `scripts/run_h1a.sh h2b tests other`, `bench/run_h1b.sh h2
 
 ### r2c (2026-10-24): sequence parallelism by default, `reduce_scatter_all_gather_matches_all_reduce`
 
-Branch side (`muse/r2c-sp-auto`): `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL` is `auto` by default and shards a prefill batch only
-when this property holds and the sharded stream is bit for bit the replicated one at that batch size. Validation, real
+Branch side (`muse/r2c-sp-auto`): `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=auto` shards a prefill batch only
+when this property holds and the sharded stream is bit for bit the replicated one at that batch size (since the round-2
+integration the branch default is the forced `1`, and `auto` stays selectable; the rows below are the r2c measurements of `auto`). Validation, real
 checkpoint, plugin on, SRC = the r2c tree:
 
 * `bench/test_plugin.py --quick`: 173 checks x 8 ranks, 0 failures, with the new ones: the property is `True` with the
