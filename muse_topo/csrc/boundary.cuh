@@ -165,6 +165,45 @@ __device__ __forceinline__ void store8f(float* p, const float (&v)[8]) {
   *reinterpret_cast<float4*>(p + 4) = make_float4(v[4], v[5], v[6], v[7]);
 }
 
+// Load of operands that never change (gate coefficients, norm weights) ahead of griddepcontrol.wait of a programmatic dependent: a volatile
+// asm with a memory clobber, so that ptxas keeps it above the wait (it moves a plain or .nc load below it).
+__device__ __forceinline__ uint4 ld_early(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void load8f_early(const float* p, float (&v)[8]) {
+  const uint4 a = ld_early(p), b = ld_early(p + 4);
+  v[0] = __uint_as_float(a.x);
+  v[1] = __uint_as_float(a.y);
+  v[2] = __uint_as_float(a.z);
+  v[3] = __uint_as_float(a.w);
+  v[4] = __uint_as_float(b.x);
+  v[5] = __uint_as_float(b.y);
+  v[6] = __uint_as_float(b.z);
+  v[7] = __uint_as_float(b.w);
+}
+
+// The part of bnd8192_load that does not change from call to call (gate coefficients and weights): may run before the wait for the
+// producer of the branch.
+template <bool POST_SCALE>
+__device__ __forceinline__ void bnd8192_load_static(const Bnd8192& a, Bnd8192Regs& r) {
+#pragma unroll
+  for (int j = 0; j < kD8192Packs; ++j) {
+    const int c = 8 * (kRowThreads * j + threadIdx.x);
+    load8f_early(a.alpha + c, r.alpha[j]);
+    load8f_early(a.beta + c, r.beta[j]);
+    r.pre_w[j] = ld_early(a.pre_w + c);
+    if (POST_SCALE) r.post_w[j] = ld_early(a.post_w + c);
+  }
+}
+// The residual stream of row `row`: written by an earlier kernel of the layer.
+__device__ __forceinline__ void bnd8192_load_stream(const Bnd8192& a, int row, Bnd8192Regs& r) {
+#pragma unroll
+  for (int j = 0; j < kD8192Packs; ++j)
+    load8f(a.stream + (int64_t)row * 8192 + 8 * (kRowThreads * j + threadIdx.x), r.stream[j]);
+}
+
 template <bool POST_SCALE>
 __device__ __forceinline__ void bnd8192_load(const Bnd8192& a, int row, Bnd8192Regs& r) {
 #pragma unroll
@@ -272,6 +311,11 @@ __device__ __forceinline__ void rms4096_load(const Rms4096& a, uint4 (&wx)[kD409
 #pragma unroll
   for (int c = 0; c < kD4096Packs; ++c)
     wx[c] = *reinterpret_cast<const uint4*>(a.w + 8 * (kRowThreads * c + threadIdx.x));
+}
+// The same ahead of griddepcontrol.wait (see ld_early).
+__device__ __forceinline__ void rms4096_load_early(const Rms4096& a, uint4 (&wx)[kD4096Packs]) {
+#pragma unroll
+  for (int c = 0; c < kD4096Packs; ++c) wx[c] = ld_early(a.w + 8 * (kRowThreads * c + threadIdx.x));
 }
 
 // bx[c] = 16-byte pack 256 * c + threadIdx.x of the row (8 bf16), c = 0, 1; wx = rms4096_load.

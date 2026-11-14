@@ -172,6 +172,8 @@ __device__ __forceinline__ uint64_t epoch_begin(const Ctx& c, uint32_t& old) {
   if (c.pdl) {
     pdl_wait();      // the previous grid (and its counter update) has completed
     pdl_trigger();   // let the next collective's blocks become resident; they wait for this grid to finish
+  } else if (c.trigger) {
+    pdl_trigger();   // not a programmatic dependent itself; only a programmatic successor (gemv_push_kernel) starts early
   }
   const uint64_t e = ld_u64(c.ctl);
   uint32_t one;
@@ -186,6 +188,19 @@ __device__ __forceinline__ void epoch_end(const Ctx& c, uint64_t e, uint32_t old
     st_u32(c.ctl + 32, 0);
     st_u64(c.ctl, e + 1);
   }
+}
+
+// The collective that was started by a gemv_push_kernel (the two halves of one call): the second kernel is a programmatic dependent of the
+// first, so it waits for it and for everything before it, and then takes the call epoch the first one read (it does not advance it).
+// The second kernel does not trigger: its own successors start after it, as after any other topo kernel.
+__device__ __forceinline__ uint64_t epoch_begin_pushed(const Ctx& c, uint32_t& old) {
+  pdl_wait();
+  const uint64_t e = ld_u64(c.ctl);
+  uint32_t one;
+  asm volatile("mov.u32 %0, 1;" : "=r"(one) : "r"((uint32_t)e));
+  old = 0;
+  if ((threadIdx.x & 31) == 0) old = atomicAdd(c.ctl + 32, one);
+  return e;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -239,7 +254,7 @@ __device__ __forceinline__ uint4 pack_pack(const float* f) {
 
 // Launch helper: <<<>>> or cudaLaunchKernelEx with the programmatic-serialization attribute (c.pdl).
 template <typename... KArgs, typename... Args>
-static void launch_k(void (*kernel)(KArgs...), const Ctx& c, dim3 grid, dim3 block, cudaStream_t s, Args... args) {
+static void launch_kp(void (*kernel)(KArgs...), bool pdl, dim3 grid, dim3 block, cudaStream_t s, Args... args) {
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = grid;
   cfg.blockDim = block;
@@ -249,8 +264,12 @@ static void launch_k(void (*kernel)(KArgs...), const Ctx& c, dim3 grid, dim3 blo
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
-  cfg.numAttrs = c.pdl ? 1 : 0;
+  cfg.numAttrs = pdl ? 1 : 0;
   cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+template <typename... KArgs, typename... Args>
+static void launch_k(void (*kernel)(KArgs...), const Ctx& c, dim3 grid, dim3 block, cudaStream_t s, Args... args) {
+  launch_kp(kernel, c.pdl != 0, grid, block, s, args...);
 }
 
 }  // namespace muse_topo

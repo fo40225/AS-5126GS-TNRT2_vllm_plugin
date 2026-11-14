@@ -27,6 +27,11 @@ group, so putting the host folder on ``PYTHONPATH`` is enough (no pip install). 
   ``docs/r2d_fused_epilogue.md``. Gated by ``MUSE_TOPO_OPS`` containing ``boundary`` (default) and ``MUSE_TOPO_FUSED != 0``;
   a call the kernels cannot serve (shape, dtype, contiguity: all rank-uniform; misaligned operands are staged through an aligned
   copy, never a reason to decline) returns ``None`` and the model runs the two steps itself.
+* ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary`` (same interface): the sharded pooler / unpooler GEMV of the
+  decode layer (T <= 8) together with the gather that follows it. The GEMV kernel loads its weights while the all-reduce in front
+  of it is still running, sums in the fixed fp32 order of ``csrc/gemv.cuh`` (class deterministic_different against the cuBLAS GEMV
+  of the model) and pushes its columns to the partner and the island peers; the gather kernel then forwards, collects and runs the
+  epilogue (``docs/r3b_gemv_push.md``).
 * ``destroy``: dumps the call counters and closes the topo communicator.
 
 Capability ``reduce_scatter_all_gather_matches_all_reduce`` (property of the patched ``CudaCommunicator``, a plain
@@ -91,6 +96,11 @@ Environment (all optional):
                              ``MUSE_TOPO_AR_TUNING_FILE`` must be identical on every rank
 ``MUSE_TOPO_FUSED``          0 disables the fused collective + epilogue kernels (``TopoComm.supports_boundary_rows``
                              then declines every batch and the model runs the two steps); default 1
+``MUSE_TOPO_GEMV``           0 keeps the sharded pooler / unpooler GEMV of the decode layer on cuBLAS (T <= 8 otherwise runs
+                             ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary``: the GEMV kernel of
+                             ``csrc/gemv_push.cu`` + the pushed gather kernel, see ``docs/r3b_gemv_push.md``); needs
+                             ``MUSE_TOPO_FUSED`` != 0; default 1
+``MUSE_TOPO_GEMV_PUSH``      0: the GEMV kernel only stores its columns and the gather kernel pushes them (A/B switch); default 1
 ``MUSE_TOPO_LOG_OPS``        0 (default): the per-op summary goes to the debug log; 1: info log on group rank 0;
                              2: info log on every rank
 
@@ -385,6 +395,30 @@ def _all_gather_residual_boundary(self, shard, stream, *, alpha, beta, pre_weigh
                                     post_gain_center, pre_gain_center, out_fp32=out_fp32)
 
 
+def _gemv_all_gather_residual_boundary(self, x, weight, stream, *, alpha, beta, pre_weight, post_weight, post_eps, pre_eps,
+                                       post_gain_center, pre_gain_center, out_fp32=None):
+    comm = _boundary_comm(self)
+    if (comm is None or not comm.supports_boundary_rows("gemv_all_gather_boundary", x.shape[0])
+            or not comm.supports_gemv_all_gather_boundary(x, weight, stream)
+            or not comm.boundary_params_ok(alpha, beta, pre_weight, post_weight, out_fp32)):
+        return None
+    _note_boundary(self, "gemv_all_gather_boundary", x, "topo")
+    return comm.gemv_all_gather_boundary(x, weight, stream, alpha, beta, pre_weight, post_weight, post_eps, pre_eps,
+                                         post_gain_center, pre_gain_center, out_fp32=out_fp32)
+
+
+def _gemv_all_gather_rmsnorm(self, x, weight, norm_weight, eps, gain_center):
+    import torch
+
+    comm = _boundary_comm(self)
+    if (comm is None or not comm.supports_boundary_rows("gemv_all_gather_rmsnorm", x.shape[0])
+            or not comm.supports_gemv_all_gather_rmsnorm(x, weight)
+            or not comm._boundary_ok(norm_weight, (4096,), torch.bfloat16)):
+        return None
+    _note_boundary(self, "gemv_all_gather_rmsnorm", x, "topo")
+    return comm.gemv_all_gather_rmsnorm(x, weight, norm_weight, eps, gain_center)
+
+
 def _all_gather_rmsnorm(self, shard, weight, eps, gain_center):
     import torch
 
@@ -440,6 +474,8 @@ def register() -> None:
         CudaCommunicator.all_reduce_residual_boundary = _all_reduce_residual_boundary
         CudaCommunicator.all_gather_residual_boundary = _all_gather_residual_boundary
         CudaCommunicator.all_gather_rmsnorm = _all_gather_rmsnorm
+        CudaCommunicator.gemv_all_gather_residual_boundary = _gemv_all_gather_residual_boundary
+        CudaCommunicator.gemv_all_gather_rmsnorm = _gemv_all_gather_rmsnorm
         setattr(CudaCommunicator, _PATCH_MARK, True)
         logger.info("muse_topo plugin registered in pid %d (ops=%s)", os.getpid(), ",".join(sorted(routed)))
     except Exception:

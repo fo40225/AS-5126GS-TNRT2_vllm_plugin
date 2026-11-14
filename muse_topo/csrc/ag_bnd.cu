@@ -13,7 +13,9 @@
 
 namespace muse_topo {
 
-template <int WPR, int EPI, bool POST_SCALE, bool FP32_OUT>
+// PUSHED: the shard words were already sent to the partner and the island peers by gemv_push_kernel (the first half of the same collective
+// call, launched just before this kernel as its programmatic predecessor); stage 1 then only copies the own words into the staging row.
+template <int WPR, int EPI, bool POST_SCALE, bool FP32_OUT, bool PUSHED>
 __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, const uint32_t* __restrict__ in,
                                                                   const BndParams bp, const RmsParams rp) {
   constexpr int NW = WPR / bnd::kRowThreads;  // words of the shard row per thread
@@ -22,8 +24,18 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, c
   __shared__ float sm[66];
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
+  const bnd::Bnd8192 ba(bp);
+  bnd::Bnd8192Regs regs;
+  uint4 wx[bnd::kD4096Packs];
+  const bnd::Rms4096 ra0(rp);
+  if (PUSHED) {
+    // A programmatic dependent: the operands that never change are loaded while the GEMV kernel and the all-reduce in front of it are
+    // still running.
+    if (EPI == 0) bnd::bnd8192_load_static<POST_SCALE>(ba, regs);
+    else bnd::rms4096_load_early(ra0, wx);
+  }
   uint32_t old;
-  const uint64_t e = epoch_begin(c, old);
+  const uint64_t e = PUSHED ? epoch_begin_pushed(c, old) : epoch_begin(c, old);
   const uint32_t tag = ll8_tag(e);
   const int par = e & 1;
   const int ip = c.ipos;
@@ -45,8 +57,6 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, c
     org[3 + s] = c.partner_of[peer];
   }
 
-  const bnd::Bnd8192 ba(bp);
-  bnd::Bnd8192Regs regs;
   if (EPI == 0 && (bp.ld_mode == 1 || bp.ld_mode == 3)) bnd::bnd8192_prefetch_l2<POST_SCALE>(ba, row);
 
   TRACE(c, 0);
@@ -55,22 +65,27 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, c
 #pragma unroll
   for (int k = 0; k < NW; ++k) {
     const int w = row * WPR + tid + bnd::kRowThreads * k;
-    x[k] = in[w];
-    st_v2(txp + w, x[k], tag);
+    // PUSHED: written by the programmatic predecessor, so a strong load that stays behind griddepcontrol.wait (a read-only load of an
+    // __restrict__ pointer may be hoisted above it).
+    x[k] = PUSHED ? ld_u32(in + w) : in[w];
+    if (!PUSHED) st_v2(txp + w, x[k], tag);
   }
 #pragma unroll
   for (int k = 0; k < NW; ++k) {
     const int w = row * WPR + tid + bnd::kRowThreads * k;
-    st_v2(txi[0] + w, x[k], tag);
-    st_v2(txi[1] + w, x[k], tag);
-    st_v2(txi[2] + w, x[k], tag);
+    if (!PUSHED) {
+      st_v2(txi[0] + w, x[k], tag);
+      st_v2(txi[1] + w, x[k], tag);
+      st_v2(txi[2] + w, x[k], tag);
+    }
     srow[me * WPR + tid + bnd::kRowThreads * k] = x[k];
   }
   // The loads of the epilogue that do not depend on the gather, issued behind the pushes (see ar_bnd.cu).
-  if (EPI == 0 && (bp.ld_mode == 0 || bp.ld_mode == 3)) bnd::bnd8192_load<POST_SCALE>(ba, row, regs);
-  uint4 wx[bnd::kD4096Packs];
-  const bnd::Rms4096 ra0(rp);
-  if (EPI == 1) bnd::rms4096_load(ra0, wx);
+  if (EPI == 0 && (bp.ld_mode == 0 || bp.ld_mode == 3)) {
+    if (PUSHED) bnd::bnd8192_load_stream(ba, row, regs);
+    else bnd::bnd8192_load<POST_SCALE>(ba, row, regs);
+  }
+  if (EPI == 1 && !PUSHED) bnd::rms4096_load(ra0, wx);
   TRACE(c, 1);
   // stage 2: the partner's words: keep and forward
   uint2 vp[NW];
@@ -135,7 +150,10 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, c
       if (!ok) sp.tick(c, 52);
     } while (!ok);
   }
-  if (EPI == 0 && (bp.ld_mode == 1 || bp.ld_mode == 2)) bnd::bnd8192_load<POST_SCALE>(ba, row, regs);
+  if (EPI == 0 && (bp.ld_mode == 1 || bp.ld_mode == 2)) {
+    if (PUSHED) bnd::bnd8192_load_stream(ba, row, regs);
+    else bnd::bnd8192_load<POST_SCALE>(ba, row, regs);
+  }
   TRACE(c, 3);
   __syncthreads();
   if (EPI == 0) {
@@ -156,21 +174,34 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ag_bnd_kernel(const Ctx c, c
   epoch_end(c, e, old);
 }
 
-void launch_ag_bnd(const Ctx& c, const void* shard, const BndParams& a, int rows, cudaStream_t s) {
+void launch_ag_bnd(const Ctx& c, const void* shard, const BndParams& a, int rows, int pushed, cudaStream_t s) {
   const uint32_t* i = static_cast<const uint32_t*>(shard);
   const dim3 grid(rows), block(bnd::kRowThreads);
   const RmsParams none{};
   const bool ps = a.post_w != nullptr, f32 = a.out_fp32 != nullptr;
-  if (ps && f32) launch_k(ag_bnd_kernel<1024 / 2, 0, true, true>, c, grid, block, s, c, i, a, none);
-  else if (ps) launch_k(ag_bnd_kernel<1024 / 2, 0, true, false>, c, grid, block, s, c, i, a, none);
-  else if (f32) launch_k(ag_bnd_kernel<1024 / 2, 0, false, true>, c, grid, block, s, c, i, a, none);
-  else launch_k(ag_bnd_kernel<1024 / 2, 0, false, false>, c, grid, block, s, c, i, a, none);
+#define MUSE_TOPO_AG_BND(PS, F32, PUSHED)                                                                     \
+  launch_kp(ag_bnd_kernel<1024 / 2, 0, PS, F32, PUSHED>, PUSHED || c.pdl != 0, grid, block, s, c, i, a, none)
+  if (pushed) {
+    if (ps && f32) MUSE_TOPO_AG_BND(true, true, true);
+    else if (ps) MUSE_TOPO_AG_BND(true, false, true);
+    else if (f32) MUSE_TOPO_AG_BND(false, true, true);
+    else MUSE_TOPO_AG_BND(false, false, true);
+  } else {
+    if (ps && f32) MUSE_TOPO_AG_BND(true, true, false);
+    else if (ps) MUSE_TOPO_AG_BND(true, false, false);
+    else if (f32) MUSE_TOPO_AG_BND(false, true, false);
+    else MUSE_TOPO_AG_BND(false, false, false);
+  }
+#undef MUSE_TOPO_AG_BND
 }
 
-void launch_ag_rms(const Ctx& c, const void* shard, const RmsParams& a, int rows, cudaStream_t s) {
+void launch_ag_rms(const Ctx& c, const void* shard, const RmsParams& a, int rows, int pushed, cudaStream_t s) {
   const uint32_t* i = static_cast<const uint32_t*>(shard);
   const BndParams none{};
-  launch_k(ag_bnd_kernel<512 / 2, 1, false, false>, c, dim3(rows), dim3(bnd::kRowThreads), s, c, i, none, a);
+  if (pushed)
+    launch_kp(ag_bnd_kernel<512 / 2, 1, false, false, true>, true, dim3(rows), dim3(bnd::kRowThreads), s, c, i, none, a);
+  else
+    launch_kp(ag_bnd_kernel<512 / 2, 1, false, false, false>, c.pdl != 0, dim3(rows), dim3(bnd::kRowThreads), s, c, i, none, a);
 }
 
 }  // namespace muse_topo

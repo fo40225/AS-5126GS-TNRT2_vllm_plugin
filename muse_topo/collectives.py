@@ -261,6 +261,16 @@ class TopoComm:
         self.large = os.environ.get("MUSE_TOPO_LARGE", "1") != "0"
         # fused collective + epilogue kernels (all_reduce_boundary, all_gather_boundary, all_gather_rmsnorm)
         self.fused = os.environ.get("MUSE_TOPO_FUSED", "1") != "0"
+        # GEMV + all-gather in one call (gemv_all_gather_rmsnorm / gemv_all_gather_boundary, csrc/gemv_push.cu): MUSE_TOPO_GEMV=0
+        # keeps the model on the cuBLAS GEMV + all_gather_rmsnorm / all_gather_boundary kernels. MUSE_TOPO_GEMV_PUSH: 1 = every GEMV CTA
+        # sends its columns to the partner and the island peers as soon as it has them, 2 = the last CTA to finish sends the whole block
+        # in coalesced stores, 0 = the GEMV kernel (own summation order, early weight loads) only stores and the gather kernel pushes; +4 loads the
+        # weights behind the wait for the predecessor kernel instead of before it (A/B switch).
+        self.gemv = self.fused and os.environ.get("MUSE_TOPO_GEMV", "1") != "0"
+        self.gemv_push = int(os.environ.get("MUSE_TOPO_GEMV_PUSH", "1"))
+        # Geometry variant of the GEMV kernels (csrc/gemv_push.cu, 0 = default); a variant with another number of warps per row sums in
+        # another order, so it is a (deterministic) rounding change. For tuning: bench/bench_gemv_push.py --variants.
+        self.gemv_variant = int(os.environ.get("MUSE_TOPO_GEMV_VARIANT", "0"))
         self.bf16_exchange = (os.environ.get("MUSE_TOPO_LARGE_BF16_EXCHANGE", "0") == "1"
                               if bf16_exchange is None else bool(bf16_exchange))
         self.ar_large_min = _AR_LARGE_MIN
@@ -328,6 +338,10 @@ class TopoComm:
         self._agree(cpu_group, reason, "IPC exchange", exc)
         i = self.info
         self._c.set_pdl(os.environ.get("MUSE_TOPO_PDL", "0") == "1")
+        # The collective kernels let a programmatic successor start at once (only gemv_push_kernel is one): its weight loads then
+        # overlap the tail of the all-reduce in front of it.
+        self._c.set_trigger(self.gemv)
+        self._c.set_gemv_variant(self.gemv_variant)
         # Where the fused collectives load the epilogue operands that do not depend on the collective (BndParams::ld_mode in
         # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (bench_boundary_cold.py,
         # 2026-10-24: all-reduce + boundary at T = 1 / 4 / 8: 12.1 / 14.6 / 18.8 us vs 12.8 / 15.3 / 19.3 for loading after the
@@ -532,6 +546,12 @@ class TopoComm:
     # the tuned many-CTA kernels of the plain collectives win from 16 rows on: fused - two-step = -1.0 us at T <= 8 and +3.0 us at T = 16
     # for the all-reduce, -1.0 / +0.5 for the unpooler gather, -1.3 us up to T = 16 and +0.5 at T = 32 for the pooler gather).
     DISPATCH_MAX_ROWS = {"all_reduce_boundary": 8, "all_gather_boundary": 8, "all_gather_rmsnorm": 16}
+    # The GEMV + gather kernels (csrc/gemv_push.cu) serve 1 .. 8 rows (the activations are re-read by every CTA, which costs more than the
+    # weights beyond that).
+    GEMV_MAX_ROWS = 8
+    GEMV_KINDS = ("gemv_all_gather_rmsnorm", "gemv_all_gather_boundary")
+    GEMV_POOLER_SHAPE = (512, 8192)     # weight rows of one rank x input width
+    GEMV_UNPOOLER_SHAPE = (1024, 4096)
 
     def _boundary_ok(self, t: torch.Tensor, shape, dtype) -> bool:
         """Rank-uniform operand gate: device, dtype, shape and contiguity only. The kernels need 16-byte aligned operands, but
@@ -547,7 +567,11 @@ class TopoComm:
         """Batch-size gate of the fused kernels that the model asks before it has the tensors: ``kind`` is
         "all_reduce_boundary", "all_gather_boundary" or "all_gather_rmsnorm". Where the fused kernel is faster than the two-step path
         (``DISPATCH_MAX_ROWS``). Identical on every rank."""
-        if self._closed or not self.fused or kind not in self.DISPATCH_MAX_ROWS:
+        if self._closed or not self.fused:
+            return False
+        if kind in self.GEMV_KINDS:
+            return self.gemv and 1 <= num_tokens <= self.GEMV_MAX_ROWS
+        if kind not in self.DISPATCH_MAX_ROWS:
             return False
         return 1 <= num_tokens <= self.DISPATCH_MAX_ROWS[kind] and self._kernel_rows_ok(kind, num_tokens)
 
@@ -655,6 +679,58 @@ class TopoComm:
         out = torch.empty((shard.shape[0], 4096), dtype=torch.bfloat16, device=shard.device)
         self._c.all_gather_rmsnorm(shard, out, weight, float(eps), float(gain))
         return out
+
+    # ------------------------------------------------------------------------------------------------
+    # sharded GEMV fused with the all-gather that follows it (csrc/gemv_push.cu, ag_bnd.cu with ``pushed``)
+    # ------------------------------------------------------------------------------------------------
+    def set_gemv_variant(self, v: int) -> None:
+        """Select the geometry variant of the GEMV kernels (the same on all ranks, between calls)."""
+        self._c.set_gemv_variant(int(v))
+        self.gemv_variant = int(v)
+
+    def supports_gemv_all_gather_rmsnorm(self, x: torch.Tensor, w: torch.Tensor) -> bool:
+        """Whether :meth:`gemv_all_gather_rmsnorm` can serve this call: bf16 ``x`` [T, 8192] (1 <= T <= 8) and the bf16 weight rows
+        [512, 8192] of this rank (rank-uniform: shapes, dtypes, contiguity)."""
+        return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.GEMV_MAX_ROWS
+                and tuple(w.shape) == self.GEMV_POOLER_SHAPE and x.shape[1] == self.GEMV_POOLER_SHAPE[1]
+                and self._boundary_ok(x, x.shape, torch.bfloat16) and self._boundary_ok(w, w.shape, torch.bfloat16))
+
+    def supports_gemv_all_gather_boundary(self, x: torch.Tensor, w: torch.Tensor, stream: torch.Tensor) -> bool:
+        """Whether :meth:`gemv_all_gather_boundary` can serve this call: bf16 ``x`` [T, 4096] (1 <= T <= 8), the bf16 weight rows
+        [1024, 4096] of this rank, fp32 ``stream`` [T, 8192]."""
+        return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.GEMV_MAX_ROWS
+                and tuple(w.shape) == self.GEMV_UNPOOLER_SHAPE and x.shape[1] == self.GEMV_UNPOOLER_SHAPE[1]
+                and self._boundary_ok(x, x.shape, torch.bfloat16) and self._boundary_ok(w, w.shape, torch.bfloat16)
+                and self._boundary_ok(stream, (x.shape[0], self.BOUNDARY_D), torch.float32))
+
+    def gemv_all_gather_rmsnorm(self, x, w, norm_w, eps, gain):
+        """``all_gather(gemv(x, w), -1)`` followed by ``pre_expert_norm`` (see :meth:`all_gather_rmsnorm`) in two kernels that are one
+        collective call: ``gemv(x, w)`` is the bf16 rounding of the fp32 sum of the products ``x[t, k] * w[n, k]`` in the fixed order of
+        csrc/gemv.cuh (deterministic, the same bits at every batch size and on every rank for the same data, but not the order of
+        cuBLAS), computed for this rank's 512 columns and pushed to the partner and the island peers while the other columns are still being
+        reduced. Returns the normalized [T, 4096] bf16 rows."""
+        self._order_stream()
+        x, w, norm_w = self._aligned(x), self._aligned(w), self._aligned(norm_w)
+        shard = torch.empty((x.shape[0], self.GEMV_POOLER_SHAPE[0]), dtype=torch.bfloat16, device=x.device)
+        out = torch.empty((x.shape[0], 4096), dtype=torch.bfloat16, device=x.device)
+        self._c.gemv_all_gather_rmsnorm(x, w, shard, out, norm_w, float(eps), float(gain), self.gemv_push)
+        return out
+
+    def gemv_all_gather_boundary(self, x, w, stream, alpha, beta, pre_w, post_w, post_eps, pre_eps, post_gain, pre_gain,
+                                 out_fp32=None):
+        """``all_gather(gemv(x, w), -1)`` (this rank's 1024 columns of the unpooler) followed by the residual boundary (see
+        :meth:`all_gather_boundary`), same contract as :meth:`gemv_all_gather_rmsnorm`; returns ``(out, new_stream)``."""
+        self._order_stream()
+        x, w, stream, alpha, beta, pre_w = (self._aligned(t) for t in (x, w, stream, alpha, beta, pre_w))
+        post_w = None if post_w is None else self._aligned(post_w)
+        user_f32, out_fp32 = self._stage_out(out_fp32)
+        shard = torch.empty((x.shape[0], self.GEMV_UNPOOLER_SHAPE[0]), dtype=torch.bfloat16, device=x.device)
+        out = torch.empty(stream.shape, dtype=torch.bfloat16, device=stream.device)
+        new_stream = torch.empty_like(stream)
+        self._c.gemv_all_gather_boundary(x, w, shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w,
+                                         float(post_eps), float(pre_eps), float(post_gain), float(pre_gain), self.gemv_push)
+        self._unstage_out(user_f32, out_fp32)
+        return out, new_stream
 
     def all_gather(self, x: torch.Tensor, dim: int, out: torch.Tensor | None = None) -> torch.Tensor:
         self._order_stream()
