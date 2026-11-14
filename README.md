@@ -85,7 +85,8 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── h2_vllm_plugin.md        plugin 的 patch 範圍、環境變數、驗證紀錄、benchmark、review fixes、限制
 │   ├── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
 │   ├── r3b_gemv_push.md         decode 的 pooler / unpooler GEMV 與 all-gather 融合（r3b）：算術與精度、protocol、環境變數、S1-4a 量測
-│   └── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
+│   ├── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
+│   └── a1_table_retune.md       S1-9 L9 A1：bf16 exchange 下 dispatch table 的逐 size 重調（verify band c1 .. c128 與 prefill chunk 的 message size、reduce-scatter 8 blocks、2bx slabs、方法與 bitwise 證明）
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
 
@@ -98,9 +99,9 @@ AS-5126GS-TNRT2_vllm_plugin/
 
 | 類別 | 檔案 |
 |------|------|
-| correctness（8 processes、GPU lock 下執行） | `tests_h1a.py`、`tests_h1b.py`、`test_epoch.py`、`test_timeout.py`、`test_timeout_large.py`、`test_init_failure.py`、`check_ctx.py`、`smoke.py`、`test_plugin.py`（8 ranks、經 vLLM wrapper）、`test_medium_bx.py`（medium all-reduce 的 bf16 exchange）、`test_gemv_push.py`（GEMV + all-gather 融合，8 ranks）；CPU-only：`test_plugin_unit.py`、`test_topology.py` |
+| correctness（8 processes、GPU lock 下執行） | `tests_h1a.py`、`tests_h1b.py`、`test_epoch.py`、`test_timeout.py`、`test_timeout_large.py`、`test_init_failure.py`、`check_ctx.py`、`smoke.py`、`test_plugin.py`（8 ranks、經 vLLM wrapper）、`test_medium_bx.py`（medium all-reduce 的 bf16 exchange）、`test_a1_tables.py`（production 設定下各 dispatch table 的逐 size 檢查：對 torch emulation 的 bitwise、CUDA graph replay）、`test_gemv_push.py`（GEMV + all-gather 融合，8 ranks）；CPU-only：`test_plugin_unit.py`、`test_topology.py` |
 | 第二套獨立的 H1a 測試 | `test_h1a.py` + `hlib.py` + `test_topology.py` |
-| benchmark / 表格 | `bench_h1a.py`、`bench_h1b.py`、`bench_medium.py`（medium all-reduce sweep）、`bench_gemv_push.py`（GEMV + all-gather 融合的 layer chain，`--variants` / `--triggers` / `--cold`）、`acc_gemv_sweep.py`（GEMV 加總順序對 cuBLAS 與 fp64 的精度，單 GPU）、`make_table*.py`（含 `make_table_medium.py`）、`summarize_h1a.py`、`summarize_h1b.py`、`summarize_ops.py`、`trace_h1a.py`、`trace_h1b.py`、`build_ext.py` |
+| benchmark / 表格 | `bench_h1a.py`、`bench_h1b.py`、`bench_medium.py`（medium all-reduce sweep）、`bench_a1_tables.py`（A1：各 table cell 的逐 size sweep 與 before / after dispatch 量測，warm / spacer / cold 三種 protocol，`summ_a1.py` 套用採用規則，`ms_step_a1.py` 換算 ms/step）、`bench_gemv_push.py`（GEMV + all-gather 融合的 layer chain，`--variants` / `--triggers` / `--cold`）、`acc_gemv_sweep.py`（GEMV 加總順序對 cuBLAS 與 fp64 的精度，單 GPU）、`make_table*.py`（含 `make_table_medium.py`）、`summarize_h1a.py`、`summarize_h1b.py`、`summarize_ops.py`、`trace_h1a.py`、`trace_h1b.py`、`build_ext.py` |
 | 研究 probe（不屬於 runtime） | `a2a_probe.py`、`ce_cut_probe.py`、`host_relay_probe.py` |
 | end-to-end | `e2e_prompt_lp.py`（teacher-forced logprob）、`e2e_real.py`（real weights、62 層）、`e2e_overlap.py`（real weights、長 prompt / chunked prefill / mixed batch，microbatched prefill 的 A/B）、`chat_check.py`（greedy chat 檢查） |
 | runner | `run_h1b.sh` |

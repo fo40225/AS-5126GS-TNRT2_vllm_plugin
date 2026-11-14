@@ -79,9 +79,12 @@ all_reduce agree bitwise from 128 KiB; the 2 MiB switch applies with `MUSE_TOPO_
 |---|---|---|
 | all_reduce | nbytes < 2 MiB (and <= `max_bytes`, multiple of 64 B) | H1a algorithm 2 (unchanged) |
 | all_reduce | nbytes >= 2 MiB, multiple of 128 B, <= 2 GiB | large: fused reduce-scatter + all-gather pipeline, `_AR_LARGE_TABLE` |
-| reduce_scatter | T % 8 == 0, bf16/fp16/fp32, message >= 128 KiB, multiple of 128 B | large reduce-scatter, `_RS_TABLE` (otherwise `supports` is False -> NCCL) |
+| reduce_scatter | T % 8 == 0, bf16/fp16/fp32, message >= 128 KiB, multiple of 128 B | large reduce-scatter, `_RS_TABLE` (`_RS_BX_TABLE` for bf16 while the bf16 exchange is on, S1-9 L9 A1: docs/a1_table_retune.md; otherwise `supports` is False -> NCCL) |
 | all_gather | shard < 256 KiB (<= 1 MiB) | H1a LL8 / flag kernels (unchanged) |
 | all_gather | shard >= 256 KiB, 16 B multiples (row bytes too for dim -1) | large all-gather chunk engine, `_AGL_TABLE` (any size, chunked) |
+
+(With the bf16 exchange on, bf16 all-reduces between 64 KiB and 64 MiB are served by algorithm 2 (messages above `max_bytes` as row slabs of at most 4 MiB) instead of this
+row, see `docs/r3c_medium_ar.md` and `docs/a1_table_retune.md`; the large pipeline remains the path of the exact exchange and of everything above 64 MiB.)
 
 Everything else (other dtypes, non-contiguous, odd sizes, world != 8) is rejected by `supports()` and falls back to NCCL.
 The tables were produced with `bench/bench_h1b.py --search` (coordinate descent over mode, chunk, blocks, threads, unroll, cut
