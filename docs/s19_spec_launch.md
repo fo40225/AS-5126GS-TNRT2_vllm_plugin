@@ -488,14 +488,14 @@ chunk is `min(token_budget, max_num_batched_tokens - draft_slots)` (`vllm/v1/cor
 8199 % 8 = 7, the r2e microbatches have 4100 / 4099 rows and the S1-9 L5 gain (no `sp_reduce_scatter` F.pad staging copy, M-aligned cuBLAS tiles) is lost.
 
 **What the flag is (vLLM 0.33.0 source, branch 7f32b76f49).** `max_num_scheduled_tokens` is a `SchedulerConfig` field (`vllm/config/scheduler.py:55`, "usually equal to max_num_batched_tokens, but can be smaller ... when the model might
-append tokens into the batch (such as speculative decoding)"), CLI `--max-num-scheduled-tokens` (`vllm/engine/arg_utils.py:1745-1750`, human-readable ints at `:399`). With a speculative config an unset value becomes
-`max_num_batched_tokens` and values below 8192 log a warning (`vllm/config/vllm.py:2359-2385`; 8192 itself does not warn). The scheduler uses it as the per-step budget (`scheduler.py:139-141` and `:719`, so it caps
-the tokens of the whole step incl. the 1 + K verify rows of the decoders, and asserts it at `:1620`) and as the chunk bound for block-aligned prefill (`:613`). The draft slots are 0, so MNBT 8199 and the cap 8192 give
+append tokens into the batch (such as speculative decoding)"), CLI `--max-num-scheduled-tokens` (`vllm/engine/arg_utils.py:1746-1752`, human-readable ints at `:399`). With a speculative config an unset value becomes
+`max_num_batched_tokens` and values below 8192 log a warning (`vllm/config/vllm.py:2359-2385`; 8192 itself does not warn). The scheduler uses it as the per-step budget (`scheduler.py:139-141` and `:719`; each request is charged `num_new_tokens` against it, `:840-848` and `:1002`, `:1570`, where a decoder's `num_new_tokens` is
+`num_tokens_with_spec - num_computed_tokens` = 1 + K = 8 rows, so the cap counts the speculative verify rows; `draft_slots` is charged to the MNBT `input_budget` only, `:1003`, `:1571`, and is 0 here; asserted at `:1620`) and as the chunk bound for block-aligned prefill (`:613`). The draft slots are 0, so MNBT 8199 and the cap 8192 give
 `min(8192, 8199 - 0)` = 8192-row chunks; a 32k prompt is 4 x 8192 with no tail. A mixed step (decoders + prefill) loses 7 tokens of budget (8192 instead of 8199).
 
 **What it does not change.** `max_num_batched_tokens` stays 8199 and is what sizes the runner (`gpu_model_runner.py:524`, `self.max_num_tokens`), the profile run, the cudagraph range (`vllm/config/vllm.py:2569`: capture sizes
 are `min(MNBT, cap)` = 256, unchanged), the compile range end (`:2682`), the Muse SP / MoE buffers (`model.py:1220`, `gemm_rs.py:75,104`) and the sliding-window KV reservation
-(`VllmConfig.max_in_flight_tokens`, `vllm/config/vllm.py:612-623` -> `SlidingWindowSpec.max_admission_blocks_per_request`, `kv_cache_interface.py:937-940`, both use MNBT). Only two b12x helpers read the cap
+(`VllmConfig.max_in_flight_tokens`, `vllm/config/vllm.py:611-620` -> `SlidingWindowSpec.max_admission_blocks_per_request`, `kv_cache_interface.py:937-940`, both use MNBT). Only two b12x helpers read the cap
 (`modelopt_block_quant.py:326`, `b12x_warmup.py:72-74`) and both take `max(MNBT, cap)` = 8199. So the memory profile, the CUDA graph sizes and the KV pool are expected not to move, and **the exact bytes stay
 11,720,212,480** (flag and bytes travel together: a profile with the flag carries these bytes; `MUSE_SPEC_MNST=0` is the plain port with the same bytes). The S1-14 A/B verifies this (KV blocks per rank, GPU MiB at READY).
 
