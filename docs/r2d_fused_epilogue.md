@@ -46,7 +46,7 @@ The element-wise result of the all-reduce part is the arithmetic contract of `ar
 Evidence (server, GPU lock, vLLM tree `src_r2d-fused-epilogue`):
 
 * `bench/test_boundary.py`: the CUDA epilogue math standalone against `fused_norm_residual_norm_fwd` and `fused_rmsnorm_fwd` (the real
-  Triton kernels): 600 checks, 0 mismatches (T = 1, 2, 3, 8, 24, 64; both boundary variants, with and without the fp32 copy;
+  Triton kernels): 150 checks per repetition, 0 mismatches over `--reps 4` (600 checks; the default `--reps 20` is 3000) (T = 1, 2, 3, 8, 24, 64; both boundary variants, with and without the fp32 copy;
   D = 4096; normal, heavy-tailed, tiny, zero and huge data; three eps / gain configurations).
 * `bench/test_ar_boundary.py` (8 processes): the fused collectives against `TopoComm.all_reduce` / `all_gather` followed by the Triton
   kernels, bitwise, identical on all ranks, eager and in CUDA graphs next to other collectives (see the results section).
@@ -80,8 +80,8 @@ crossover; larger batches keep the two-step path (they are bandwidth bound, and 
 
 | check | result |
 |-------|--------|
-| `bench/test_boundary.py` (CUDA epilogue math vs the real Triton kernels, `--reps 20`) | 3000 checks, 0 mismatches |
-| `bench/test_ar_boundary.py` (8 ranks, fused collective vs `TopoComm` collective + Triton kernel) | 416 checks per rank, 0 failures: T = 1 .. 64, both boundary variants, fp32 copy, eager and CUDA graph next to other collectives, random mixes of collectives, operands misaligned on odd ranks only; also with `MUSE_TOPO_PDL=1` and every `MUSE_TOPO_BND_LOADS` placement |
+| `bench/test_boundary.py` (CUDA epilogue math vs the real Triton kernels, the default `--reps 20`; 150 checks per repetition) | 3000 checks, 0 mismatches (600 at `--reps 4`, the run of the merged tree 2026-10-26) |
+| `bench/test_ar_boundary.py` (8 ranks, fused collective vs `TopoComm` collective + Triton kernel; one default run, the count is per rank) | 416 checks per rank (x 8 ranks), 0 failures: T = 1 .. 64, both boundary variants, fp32 copy, eager and CUDA graph next to other collectives, random mixes of collectives, operands misaligned on odd ranks only; also with `MUSE_TOPO_PDL=1` and every `MUSE_TOPO_BND_LOADS` placement |
 | regression of the existing suites | `tests_h1a --quick` 119 checks, `test_plugin --quick` 159 checks, `test_plugin_unit` PASSED |
 | 6-layer dummy e2e (`nccl/e2e_bitwise.py`, fused on vs off, plugin on in both) | 20/20 requests, every logprob and prompt logprob bitwise equal |
 | real weights, 62 layers, **base trees** (vLLM `aef9851844` + host `37b2d96`, no `boundary` op, none of the new code) vs the committed trees (fused on, 2026-10-26, same 270-request script) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal (chosen-token and prompt |dlogprob| max 0, mean NLL delta 0); 118 fused-op log lines in the run with the fusion, none in the base run. This is the check that the whole change (model refactor included) leaves the outputs of the current default untouched |

@@ -8,6 +8,8 @@ all_reduce (16-128 MiB), reduce_scatter, all_gather with big shards (pooler / un
 reduce_scatter + all_gather == all_reduce, and a CUDA graph that contains large collectives.
 
 usage (server, under the GPU lock): GPU=0,1,2,3,4,5,6,7 SRC=<vllm tree> scripts/runsrc_topo.sh bench/test_plugin.py [--quick]
+The checks are the exact fp32 arithmetic contract, so the run pins MUSE_TOPO_LARGE_BF16_EXCHANGE=0 (env/host.env turns the bf16
+exchange ON for serving, under which the large-message contract checks fail by design); --keep-bf16-exchange keeps the exported value.
 """
 from __future__ import annotations
 
@@ -437,7 +439,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--port", type=int, default=29731)
+    ap.add_argument("--keep-bf16-exchange", action="store_true",
+                    help="keep MUSE_TOPO_LARGE_BF16_EXCHANGE as exported (env/host.env turns it ON for serving; the "
+                         "checks below are the exact fp32 contract and fail with it, see docs/h2_vllm_plugin.md)")
     args = ap.parse_args()
+    if not args.keep_bf16_exchange:
+        os.environ["MUSE_TOPO_LARGE_BF16_EXCHANGE"] = "0"
     os.environ.setdefault("MUSE_TOPO_ENABLE", "1")
     os.environ.setdefault("MUSE_TOPO_TIMEOUT_S", "60")
     os.environ.setdefault("MUSE_TOPO_LOG_OPS", "1")
