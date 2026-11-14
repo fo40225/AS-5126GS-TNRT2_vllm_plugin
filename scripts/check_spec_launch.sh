@@ -6,8 +6,14 @@
 # max(env, 257, cap + 1): the env value alone does not make a launch (floor 513 with the default capture list).
 # When serve_cmd.txt (written by the harness) sits next to the log, it must carry --max-cudagraph-capture-size <cap> too
 # (not checked for cap 512, the default capture list, which has no flag).
-# Exit 0 = profile in effect; 1 = a line with other values, no line, or the flag is missing; 2 = usage.
-log=${1:?usage: check_spec_launch.sh <serve.log> [floor [cap]]}
+# The capture flag is accepted as "--max-cudagraph-capture-size 256", "--max-cudagraph-capture-size=256" or a
+# max_cudagraph_capture_size entry of a -cc / --compilation-config JSON.
+# The log line is printed once per boot (rank 0); the env is inherited by every worker, so only that floor is checked.
+# Exit 0 = profile in effect; 1 = a line with other values, no line, or the flag is missing; 2 = usage or unreadable log.
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
+  echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
+fi
+log=$1
 floor=${2:-384}
 cap=${3:-256}
 [ -r "$log" ] || { echo "check_spec_launch: cannot read $log" >&2; exit 2; }
@@ -22,7 +28,8 @@ fi
 pool=$(grep -a -o -E 'Graph capturing finished in [0-9]+ secs, took [0-9.]+ GiB' "$log" | sort | uniq -c | tr '\n' ';')
 rc=0
 cmd=$(dirname "$log")/serve_cmd.txt
-if [ "$cap" != 512 ] && [ -r "$cmd" ] && ! grep -q -E -e "--max-cudagraph-capture-size $cap( |$)" "$cmd"; then
+flag_re="(--max-cudagraph-capture-size[ =]|max_cudagraph_capture_size[\"' :=]+)$cap([^0-9]|$)"
+if [ "$cap" != 512 ] && [ -r "$cmd" ] && ! grep -q -E -e "$flag_re" "$cmd"; then
   echo "FAIL serve_cmd.txt has no --max-cudagraph-capture-size $cap"; rc=1
 fi
 [ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap ($pool)"

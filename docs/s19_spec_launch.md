@@ -24,6 +24,13 @@ on every rank (8x redundant GEMM FLOPs; dense GEMMs 22.6 ms per step at c64 agai
 | 48..64 | 384..512 | FULL graph, replicated | eager, sequence-parallel |
 | 65..128 | 520..1024 | eager, sequence-parallel (floor 513) | the same |
 
+The table covers the pure verify batches (T = 8c). Under the cap every batch of 257..512 tokens leaves the PIECEWISE graphs, not only the verify ones:
+mixed prefill + decode batches and prefill-only batches too (a c1..c8 request with a 300..500-token prompt used to replay a replicated PIECEWISE graph).
+With the profile they run eagerly: replicated for 257..383 tokens, sequence-parallel for 384..512 (a T that is not a multiple of 8 pads the rows,
+`ceil(T / 8)` per rank, the last rank carries zero rows that are sliced off after the all-gather; same code path as the production SP prefill at T >= 513,
+tested at 257 / 387 / 700 / 1503 and at 384 / 512). The gate rows `ttft_in300` / `ttft_in450` (c1, random 300- and 450-token prompts) measure that
+low-concurrency TTFT, and `real_*` c40 measures the replicated eager band (c33..c47, T = 264..376) that no step-1 arm covered.
+
 The graph sets shrink with the cap: target FULL 48 -> 32 and PIECEWISE 51 -> 35, drafter FULL 48 -> 32 (the draft step runs eagerly above 32
 requests), graph pool 2.11 -> 1.22 GiB per rank. Non-speculative launches, `envs.py` defaults and `model.py` are not touched.
 
@@ -38,10 +45,11 @@ The stage C production line (`/tmp/muse_wf/s1-8/stageC/RESULTS.md` Part 5.3) plu
 
 Harness form (as the A/B ran, `master_l1.sh`): `SERVE_EXTRA="$MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes 9676390400" SPEC_CONFIG=dflash2_radixark ... serve_sd.sh <tag>`.
 
-The two settings are one property: MIN_TOKENS=384 without the cap changes nothing (floor 513); the cap without the SP floor lowered (control arm B520:
-cap 256, MIN_TOKENS 520, 257..519-token verify batches eager and replicated) reached NVML min free 30 MiB at these KV bytes. The fragment is deliberately not in
-`host.env`: host.env is sourced by every launch, and the non-speculative `--max-num-seqs 256 --max-cudagraph-capture-size 256` launch would get floor 384 instead of
-512 (its 384..511-token prefill batches would move onto SP, unmeasured).
+The two settings are one property: MIN_TOKENS=384 without the cap changes nothing (floor 513). The cap without the env (floor max(512, 257, 257) = 512, A/B arm B512)
+runs 257..511-token batches eagerly and replicated, starts SP only at 512 (c64) and had NVML min free 340 / 624 MiB against 920 / 772 MiB with floor 384 and 400 / 484 on the
+default list. The control arm B520 (cap 256, env 520: 257..519 eager and replicated) reached NVML min free 116 / 30 MiB at these KV bytes (no OOM, no margin). The fragment is
+deliberately not in `host.env`: host.env is sourced by every launch, and the non-speculative `--max-num-seqs 256 --max-cudagraph-capture-size 256` launch would get floor 384
+instead of 512 (its 384..511-token prefill batches would move onto SP, unmeasured).
 
 After every boot `scripts/check_spec_launch.sh <serve.log>` must print OK (it reads the vLLM line "sequence-parallel residual stream for batches of at least 384
 tokens (...MIN_TOKENS=384, CUDA graphs up to 256 tokens)" and, next to a harness `serve_cmd.txt`, the capture flag). A gate run whose log fails the check tested the old
