@@ -199,3 +199,18 @@ adds) 5.0 us at `[1,8192]`, 8.6 us at `[8,8192]`, 52.7 us at `[64,8192]`; vLLM C
 * The layout can change with a BIOS/NPS setting or a different card order; `muse_topo` therefore re-derives islands and partners from
   sysfs and refuses to activate (NCCL fallback, one log line per rank) unless the box shows 2 sockets x 2 virtual switches x 2 GPUs of
   cc 12.0 with P2P access on all 56 pairs.
+
+## 8. NCCL 2.30.7 (vllm 0.33.0 venv, 2026-11-09)
+
+Checked on the rebuilt dev venv (nccl-tests 2.20.0 threaded `-g 8` and the 8-process vLLM `PyNcclCommunicator` harness, same box, the
+2.29.7 wheel of `/raid/vllm-runtime/.venv` as same-day control):
+
+* The graph search bug is NOT fixed: "Could not find a path for pattern 4/1" with and without `NCCL_P2P_LEVEL=SYS`.
+* New failure mode: with IB enabled the cross-socket hop 3>4 is connected `via NET/IB/5` (RoCE mlx5_2:2, GDRDMA) instead of P2P (SYS)
+  or SHM (default), and `ibv_modify_qp` fails with "Operation not supported", so the first collective fails (`unhandled system error`;
+  threaded nccl-tests too). The NICs now report 200 Gb/s (2.29.7: 40 Gb/s), which is presumably why the search prefers NET.
+  `NCCL_IB_DISABLE=1` fixes it (`env/host.env` and `scripts/py_topo.sh` set it by default): all hops `P2P/CUMEM` (multi-process) or
+  `P2P/direct pointer` (threaded). `NCCL_NET_DISABLE_INTRA=1` also initialises (not run through the full matrix).
+* With `NCCL_IB_DISABLE=1`: `NCCL_P2P_LEVEL=SYS` and the graph file behave as on 2.29.7 (default without SYS: 3>4 / 7>0 via SHM again;
+  `graph_r4.xml`: 4 channels), the outputs are bitwise identical to 2.29.7 (27 shapes eager + graph, all ranks, every config) and the
+  bus bandwidths match 2.29.7 (128 MiB 9173 vs 9135 us, +0.4 %; 8-64 KiB with SYS only +1.2-1.5 us, +3 %; with the graph file equal). The graph file needs IB disabled ("Could not find NET with id 0" otherwise).
