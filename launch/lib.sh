@@ -11,7 +11,7 @@
 #   4. refuses to start when the GPUs are busy or, for a tier-ON launch, scripts/preflight_offload.sh fails;
 #   5. starts the server in its own session (launch/lc_child.sh records the child's own pid / session / start time in server.sess after setsid), waits for /health, saves the
 #      READY facts (cache_config_info.txt, pid_environ.txt, swap record);
-#   6. runs the post-boot checks. A failed
+#   6. runs the post-boot checks (env, line = the live command line / serve_cmd.txt / a fresh clean-shell derivation / vLLM's parsed arguments, then the profile checks). A failed
 #      check stops the server (its recorded session) and exits 1, unless --keep-on-fail was given.
 # On success the server keeps running (detached, own session); stop it with launch/stop_server.sh <out dir>.
 #
@@ -88,15 +88,20 @@ lc_init() {
   HOST=$LC_ROOT
 }
 
-# lc_clean_environ: the environment the server must inherit, derived from the env files in a clean shell (env -i, the operator's MUSE_OFFLOAD only) instead of the launching shell;
-# the dry run of the same script writes pid_environ_expected.txt. Prints the file name; returns 1 when the derivation fails.
-lc_clean_environ() {
-  local script=serve_spec.sh parg=() ref=$LC_OUT/clean_ref
+# lc_clean_derive <dir>: a dry run of the same script in a clean shell (env -i, the operator's MUSE_OFFLOAD only) into <dir>: the serve line, env.txt and
+# pid_environ_expected.txt derived from the env files instead of the launching shell. rc 1 when the derivation fails.
+lc_clean_derive() {
+  local script=serve_spec.sh parg=() ref=$1
   if [ "$LC_KIND" = nonspec ]; then script=serve_nonspec.sh; parg=("$LC_PROFILE"); fi
   rm -rf "$ref"
-  env -i PATH="$PATH" HOME="${HOME:-/}" ${LC_OFFLOAD_IN:+MUSE_OFFLOAD=$LC_OFFLOAD_IN} bash "$LC_ROOT/launch/$script" "${parg[@]}" --dry-run --out "$ref" > "$LC_OUT/clean_ref.stdout" 2>&1 || return 1
-  [ -s "$ref/pid_environ_expected.txt" ] || return 1
-  echo "$ref/pid_environ_expected.txt"
+  env -i PATH="$PATH" HOME="${HOME:-/}" ${LC_OFFLOAD_IN:+MUSE_OFFLOAD=$LC_OFFLOAD_IN} bash "$LC_ROOT/launch/$script" "${parg[@]}" --dry-run --out "$ref" > "$ref.stdout" 2>&1 || return 1
+  [ -s "$ref/pid_environ_expected.txt" ] && [ -s "$ref/serve_cmd.txt" ]
+}
+
+# lc_clean_environ: the environment the server must inherit, derived from the env files in a clean shell. Prints the file name; returns 1 when the derivation fails.
+lc_clean_environ() {
+  lc_clean_derive "$LC_OUT/clean_ref" || return 1
+  echo "$LC_OUT/clean_ref/pid_environ_expected.txt"
 }
 
 # lc_check_env <reference> <live>: the live environment of the server (filtered) equals the reference exactly; prints the difference otherwise
@@ -303,10 +308,11 @@ lc_main() {
     echo "RESULT dryrun" >> "$LC_STATUS"
     return 0
   fi
-  # the reference environment of the server: a clean-shell derivation (a leak of the calling shell cannot hide in it); --keep-env: this shell's own record
+  # the reference environment of the server: a clean-shell derivation (a leak of the calling shell cannot hide in it; the serve line is compared the same way); --keep-env: this shell's own record
   if [ "$LC_KEEP_ENV" = 0 ]; then
     LC_ENV_REF=$(lc_clean_environ) || lc_refuse "cannot derive the clean-shell environment (see $LC_OUT/clean_ref.stdout)"
     cmp -s "$LC_ENV_REF" "$LC_OUT/pid_environ_expected.txt" || lc_refuse "the scrubbed environment of this shell differs from the clean-shell derivation (diff $LC_ENV_REF $LC_OUT/pid_environ_expected.txt)"
+    cmp -s "$LC_OUT/clean_ref/serve_cmd.txt" "$LC_OUT/serve_cmd.txt" || lc_refuse "the serve line built in this shell differs from the clean-shell derivation (diff $LC_OUT/clean_ref/serve_cmd.txt $LC_OUT/serve_cmd.txt)"
   else
     LC_ENV_REF=$LC_OUT/pid_environ_expected.txt
     lc_log "KEEP_ENV the environment check compares with the launching shell's own record, not with a clean shell"
@@ -391,10 +397,25 @@ lc_ready_facts() {
   lc_log "READY_FACTS gpu_mem_ready.txt cache_config_info.txt pid_cmdline.txt pid_environ.txt ($(wc -l < "$LC_OUT/pid_environ.txt") environ lines)"
 }
 
+# lc_check_line: the serve line the server really runs (review r2 m1). The live /proc/<pid>/cmdline equals serve_cmd.txt, serve_cmd.txt equals the line a clean env -i dry run
+# re-derives from the env files NOW (the pre-start derivation could be stale; --keep-env: not compared, the shell's own line is the reference), and vLLM's "non-default args"
+# line carries exactly these options with these values (scripts/check_serve_line.py).
+lc_check_line() {
+  local ref=()
+  if [ "$LC_KEEP_ENV" = 0 ]; then
+    lc_clean_derive "$LC_OUT/clean_check" || { echo "FAIL cannot re-derive the serve line in a clean shell (see $LC_OUT/clean_check.stdout)"; return 1; }
+    ref=(--derived "$LC_OUT/clean_check/serve_cmd.txt")
+  else
+    echo "NOTE --keep-env: serve_cmd.txt is not compared with a clean-shell derivation"
+  fi
+  python3 -I "$LC_ROOT/scripts/check_serve_line.py" --serve-cmd "$LC_OUT/serve_cmd.txt" --pid "$LC_SPID" --log "$LC_OUT/serve.log" "${ref[@]}"
+}
+
 # lc_checks: the post-boot checks of the profile (expectations come from this shell's env files)
 lc_checks() {
   local log=$LC_OUT/serve.log
   lc_check env lc_check_env "$LC_ENV_REF" "$LC_OUT/pid_environ.txt"
+  lc_check line lc_check_line
   if [ "$LC_KIND" = spec ]; then
     lc_check spec env SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD="$MUSE_OFFLOAD" bash "$LC_ROOT/scripts/check_spec_launch.sh" "$log"
   fi

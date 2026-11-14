@@ -159,6 +159,38 @@ expect_fail keep "--keep-on-fail: a failed check exits 1 and the server keeps ru
 pid=$(cat "$d/keep/serve.pid"); kill -0 "$pid" 2> /dev/null && bad "stop_server.sh stops the kept server" "pid $pid still running" || pass "stop_server.sh stopped the kept server"
 expect_fail keep2 "--keep-on-fail does not keep a server that never became healthy" 3 'TIMEOUT' 0 serve_spec.sh "" STUB_STATE=spec_1 STUB_MODE=hang MUSE_LAUNCH_READY_S=2 -- --keep-on-fail
 
+# ---- review r2 m1: the serve line the server really runs. Live /proc/<pid>/cmdline = serve_cmd.txt = the clean-shell derivation at check time, and vLLM's own parse of
+# the arguments (the "non-default args" line) carries the same options. Every mutation below changes ONE of the three and must fail the line check (exit 1, server stopped).
+grep -q 'CHK line PASS' "$d/spec_def/status.txt" && grep -q 'CHK line PASS' "$d/ns128_on/status.txt" && pass "the unmutated launches pass the serve-line check (CHK line PASS)" || bad "CHK line PASS missing" "$(grep CHK "$d/spec_def/status.txt")"
+grep -q 'NOTE --keep-env' "$d/keepenv/check_line.txt" && pass "--keep-env: the serve-line check runs against the launching shell's own line (noted, no derivation)" || bad "--keep-env serve-line check" "$(cat "$d/keepenv/check_line.txt")"
+K6='s/(num_speculative_tokens[^0-9]*)7/\16/'
+line_case() { # <name> <desc> <regex> <env assignments...>
+  local name=$1 desc=$2 re=$3; shift 3
+  expect_fail "$name" "$desc" 1 'CHK line FAIL' 0 serve_spec.sh "" STUB_STATE=spec_1 "$@" --
+  grep -q -E -- "$re" "$d/$name/check_line.txt" && pass "  ... naming the difference" || bad "  ... naming the difference ($re)" "$(cat "$d/$name/check_line.txt")"
+}
+line_case ln_k_cmd "m1: the live command line has num_speculative_tokens 6 instead of 7 (serve_cmd.txt and the log say 7)" 'live command line differs' "STUB_ARG_SED=$K6"
+line_case ln_k_log "m1: the startup log's non-default args say num_speculative_tokens 6 (the command line and serve_cmd.txt say 7)" "num_speculative_tokens" "STUB_LOG_SED=s/'num_speculative_tokens': 7/'num_speculative_tokens': 6/"
+line_case ln_mnbt_cmd "m1: the live command line has --max-num-batched-tokens 8192 instead of 8199" 'live command line differs' 'STUB_ARG_SED=s/^8199$/8192/'
+line_case ln_mnbt_log "m1: the log's non-default args say max_num_batched_tokens 8192" "max_num_batched_tokens" "STUB_LOG_SED=s/'max_num_batched_tokens': 8199/'max_num_batched_tokens': 8192/"
+line_case ln_cap_cmd "m1: the live command line has --max-cudagraph-capture-size 512 instead of 256" 'live command line differs' 'STUB_ARG_SED=s/^256$/512/'
+line_case ln_cap_log "m1: the log's non-default args say max_cudagraph_capture_size 512" "max_cudagraph_capture_size" "STUB_LOG_SED=s/'max_cudagraph_capture_size': 256/'max_cudagraph_capture_size': 512/"
+grep -q 'CHK spec PASS' "$d/ln_k_cmd/status.txt" && grep -q 'CHK offload PASS' "$d/ln_k_cmd/status.txt" && grep -q 'CHK kv PASS' "$d/ln_k_cmd/status.txt" && grep -q 'CHK env PASS' "$d/ln_k_cmd/status.txt" \
+  && pass "  ... the other four checks pass on the K=6 command line: only the new check sees it" || bad "  ... only the line check fails (K=6 command line)" "$(grep CHK "$d/ln_k_cmd/status.txt")"
+# serve_cmd.txt, the live line and the log all say K=6: only the clean-shell derivation (the env files say 7) can tell
+line_case ln_derive "m1: serve_cmd.txt, the live command line and the log all say K=6, the env files derive K=7" 're-derived from the env files' \
+  "STUB_SERVECMD_SED=$K6" "STUB_ARG_SED=$K6" "STUB_LOG_SED=s/'num_speculative_tokens': 7/'num_speculative_tokens': 6/"
+line_case ln_ns "m1: ns256: the live command line has --max-num-seqs 128 instead of 256" 'live command line differs' 'STUB_ARG_SED=s/^256$/128/'
+# the serve line built in the launching shell must equal the clean-shell derivation BEFORE anything starts: a copy of the host folder whose launch.env lets an exported
+# LAUNCH_PORT through (not scrubbed) is refused with exit 2 and nothing is started
+cp_root=$d/hostcopy; mkdir -p "$cp_root"; cp -r "$here/launch" "$here/env" "$here/scripts" "$cp_root/"
+sed -i 's/^LAUNCH_PORT=8100$/LAUNCH_PORT=${LAUNCH_PORT:-8100}/' "$cp_root/env/launch.env"
+rm -rf "${d:?}/pre_refuse"
+env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
+  STUB_PORT=$port STUB_STATE=spec_1 STUB_MARK="$d/pre_refuse.mark" LAUNCH_PORT=9999 bash "$cp_root/launch/serve_spec.sh" --out "$d/pre_refuse" > "$d/pre_refuse.stdout" 2>&1; rc=$?
+if [ $rc = 2 ] && grep -q 'REFUSED the serve line built in this shell differs from the clean-shell derivation' "$d/pre_refuse.stdout" && [ ! -s "$d/pre_refuse.mark" ]; then pass "m1: a serve line that differs from the clean-shell derivation is refused before the start (exit 2, nothing started)"
+else bad "m1: pre-start serve-line refusal" "rc=$rc $(tail -n 2 "$d/pre_refuse.stdout" | tr '\n' '|')"; fi
+
 # ---- review r2 M2: the session of the server is the one the child recorded after setsid, never one read with ps before it ran
 sentinel_run() { # <name> <seconds to wait before a TERM or 0> <env assignments...>: the launcher runs in its own session next to a sentinel process of that session
   local name=$1 term_after=$2; shift 2
