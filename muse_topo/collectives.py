@@ -31,18 +31,21 @@ of ``large_chunk_bytes`` (1 MiB) per block. reduce_scatter(chunk) leaves the red
 fp32 partial of the partner's block crosses the socket cut once: S/4 bytes per GPU); all_gather(chunk) distributes it.
 all_reduce = both, fused into one pipelined launch per chunk. Bitwise identical to the small algorithms, and
 all_gather(reduce_scatter(x), dim 0) == all_reduce(x) bitwise. ``out`` of all_reduce may alias ``x``.
-Opt-in ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (or ``bf16_exchange=True``): the two island partials are rounded to bf16 before
-the final add (half the cut bytes, class deterministic_different, still rank-identical and run-to-run deterministic). It
-applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm and, unless ``MUSE_TOPO_MEDIUM_BX=0``, to the bf16
-all_reduce calls of the medium algorithm (algorithm 2, ``BX`` kernel variant) from ``ar_bx_min`` (64 KiB) up to ``max_bytes``,
-with the same arithmetic as the large algorithm, so every bf16 all_reduce of at least 64 KiB gets the same bits whichever algorithm
-its size selects (docs/r3c_medium_ar.md); fp16 and fp32 keep the exact exchange (an fp16 partial above 65504 would overflow) and the
-flag and the medium-exchange settings (``MUSE_TOPO_MEDIUM_BX``, ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES``, the tuning file) must be the same
-on all ranks. reduce_scatter always runs the large algorithm with the exchange when the flag is on (it needs at least
+Opt-in ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (or ``bf16_exchange=True``): the two island partials are rounded to bf16
+before the final add (half the cut bytes, class deterministic_different, still rank-identical and run-to-run
+deterministic). It applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm and, unless
+``MUSE_TOPO_MEDIUM_BX=0``, to the bf16 all_reduce calls of the medium algorithm (algorithm 2, ``BX`` kernel variant)
+from ``ar_bx_min`` (64 KiB) up to ``max_bytes``, with the same arithmetic as the large algorithm, so every bf16
+all_reduce of at least 64 KiB gets the same bits whichever algorithm its size selects (docs/r3c_medium_ar.md); fp16
+and fp32 keep the exact exchange (an fp16 partial above 65504 would overflow) and the flag and the medium-exchange
+settings (``MUSE_TOPO_MEDIUM_BX``, ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES``, the tuning file) must be the same on all ranks.
+reduce_scatter always runs the large algorithm with the exchange when the flag is on (it needs at least
 ``rs_min_bytes``, 128 KiB), so reduce_scatter and all_reduce agree bitwise from 128 KiB on (from 2 MiB with
-``MUSE_TOPO_MEDIUM_BX=0``). Messages below ``ar_bx_min`` and the fused all-reduce + boundary kernels (T <= 8) keep the exact
-fp32 exchange, so an element can still get different bits depending on its message size: at ``ar_bx_min`` (64 KiB; 2 MiB with
-``MUSE_TOPO_MEDIUM_BX=0``) and, with the medium exchange on, between the fused and the unfused T = 4 .. 8 attn-out reduction.
+``MUSE_TOPO_MEDIUM_BX=0``). Messages below ``ar_bx_min`` and the fused all-reduce + boundary kernels (T <= 8) keep the
+exact fp32 exchange, so an element can still get different bits depending on its message size: at ``ar_bx_min``
+(64 KiB; 2 MiB with ``MUSE_TOPO_MEDIUM_BX=0``), which in decode is the embedding all-reduce [T, 8192] at T 3 -> 4 and
+the MoE-out all-reduce [T, 4096] at T 7 -> 8 (eager; padded T 2 -> 4 and 4 -> 8 in CUDA graphs), and, with the medium
+exchange on, between the fused and the unfused T = 4 .. 8 attn-out reduction.
 ``MUSE_TOPO_LARGE=0`` disables the large algorithms (supports() then keeps the H1a limits).
 
 Calls are asynchronous on the current CUDA stream, CUDA-graph safe (no host state per call), and must be issued
@@ -339,9 +342,9 @@ class TopoComm:
                     i.partner, self.workspace_bytes / 2**20, i.summary)
 
     def _load_tuning_file(self, path: str) -> None:
-        """Experiment hook (bench/make_table_medium.py writes the file): JSON with optional keys ``bx_table`` (rows of
-        _AR_BX_TABLE), ``bx_min`` (bytes) and ``large_min_bx`` (bytes). Must be the same on every rank (a file that cannot
-        be read or parsed on some rank makes every rank raise TopoUnavailable, see ``__init__``)."""
+        """Experiment hook (bench/make_table_medium.py writes the file): JSON with optional keys ``bx_table`` (rows
+        of _AR_BX_TABLE), ``bx_min`` (bytes) and ``large_min_bx`` (bytes). Must be the same on every rank (a file that
+        cannot be read or parsed on some rank makes every rank raise TopoUnavailable, see ``__init__``)."""
         if not path:
             return
         import json
@@ -501,8 +504,8 @@ class TopoComm:
 
     def _medium_bx(self, x: torch.Tensor, nbytes: int) -> bool:
         """Whether this all_reduce takes the bf16 exchange of the medium algorithm (bf16 input, the size window of
-        ``ar_bx_min`` and up); a function of dtype, size and the construction-time settings only, so it is the same on every
-        rank as long as those settings are (see the module docstring)."""
+        ``ar_bx_min`` and up); a function of dtype, size and the construction-time settings only, so it is the same on
+        every rank as long as those settings are (see the module docstring)."""
         return self.bf16_exchange and self.medium_bx and x.dtype == torch.bfloat16 and nbytes >= self.ar_bx_min
 
     def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None, bx=False):

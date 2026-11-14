@@ -21,7 +21,7 @@ for every transport (`docs/h1b_latency.md`).
   there (table below).
 * `bench/bench_medium.py` (sweep of grid x block x unroll per size, verified bitwise against the torch emulation, plus the
   dispatch path with the medium exchange off / on), `bench/make_table_medium.py` (rows -> table + thresholds),
-  `bench/test_medium_bx.py` (correctness), `scripts/r3c_chain.sh` / `scripts/conc_sweep.sh` (the one-lock measurement sequence).
+  `bench/test_medium_bx.py` (correctness; needs `SRC=<vLLM tree>` for the seq group, which `r3c_chain.sh` / `run_r3c.sh` export), `scripts/r3c_chain.sh` / `scripts/conc_sweep.sh` (the one-lock measurement sequence).
 * Unchanged: the fused all-reduce + boundary kernel (`ar_bnd.cu`, T <= 8, attn-out) keeps the exact fp32 exchange and the dispatch
   limits of r2d; the model-side hook is untouched (no vLLM change). Consequence: the attn-out reduction at T = 4 .. 8 (64 .. 128 KiB) is
   exact only while the fused kernel serves it. With the fused kernels off (`MUSE_TOPO_FUSED=0`, `MUSE_TOPO_OPS` without `boundary`,
@@ -43,15 +43,20 @@ path, no systematic bias (round to nearest even on both partials). Evidence (`be
   and 7 launch geometries (grid 1 .. 188, block 32 .. 512, unroll 1 .. 4); the BX result differs from the exact path (not a no-op).
 * dispatch (`comm.all_reduce`) from 32 KiB to 8 MiB and at the `max_bytes` edge: exactly 8 MiB still takes algorithm 2 with BX, 8 MiB +
   128 B takes the large algorithm; every size is checked for its bits and for the algorithm that ran (medium BX on / off / exchange off).
-* random bit patterns (NaN, inf, subnormals, all-ones words): ar2 BX == large BX, fused and two-launch, bitwise, for two geometries.
+* random bit patterns (NaN, inf, subnormals, all-ones words) and mostly -0.0 data (`negzeros`): ar2 BX == large BX, fused and two-launch,
+  bitwise, for two geometries.
+* reduce_scatter vs all_reduce (group `rsar`, 128 KiB .. 4 MiB, randn / mixed): with the medium exchange on, `comm.reduce_scatter(x)` equals the
+  matching rows of `comm.all_reduce(x)` (algorithm 2 BX) and `all_gather(reduce_scatter(x))` equals `comm.all_reduce(x)` bitwise; with
+  `MUSE_TOPO_MEDIUM_BX=0` they differ below 2 MiB (exact all-reduce vs bf16-exchange reduce_scatter) and agree from 2 MiB. The plugin
+  capability `reduce_scatter_all_gather_matches_all_reduce` nevertheless stays off while the flag is on (deliberately conservative).
 * rank-identical (sha256 over ranks), run-to-run (5 runs), eager == CUDA graph replay, batch invariant (the rows of the first half alone
   equal the rows of the full batch), 4 mixed sequences of 40 all-reduce sizes + all-gathers in one graph (counter alignment, 3 replays),
   and decode-layer sequences that interleave the BX all-reduce with the fused `all_reduce_boundary` / `all_gather_rmsnorm` /
   `all_gather_boundary` kernels on the shared regions (the real decode order: embedding all-reduce, 6 layers of attn-out + boundary,
   pooler gather + RMSNorm, MoE-out all-reduce, unpooler gather + boundary, logits gather; T = 8 and T = 4 and 3 random mixes with
   layers of T in {1, 2, 3, 4, 5, 8} between bank all-reduces up to 16 MiB), eager and after 3 CUDA-graph replays, against the Triton
-  kernels applied to the exact contract (fused kernels) and against the BX emulation (all-reduces). 124 hard checks pass (83 before the
-  follow-up); `tests_h1a.py --quick` (119 checks) and `tests_h1b.py --quick` (190 checks) pass unchanged.
+  kernels applied to the exact contract (fused kernels) and against the BX emulation (all-reduces). 188 hard checks pass (124 before the
+  second follow-up with the `rsar` group and the `negzeros` bits case, 83 before the first); `tests_h1a.py --quick` (119 checks) and `tests_h1b.py --quick` (190 checks) pass unchanged.
 * error against the fp64 sum, 1 MiB, mean ulp (exact path / BX / NCCL ring): randn 0.24 / 1.10 / 1.98, mixed-exponent 0.25 / 0.79 / 1.45;
   mean signed error -3e-6 and +2e-6 of the mean |value| (no bias). Maximum error is large when the two island partials cancel
   (1920 / 3856 ulp, NCCL's ring: 7168 / 24448), the same property as the large path (`docs/h1b_collectives.md`).
@@ -59,10 +64,16 @@ path, no systematic bias (round to nearest even on both partials). Evidence (`be
   forward / reverse): **97.5 % / 96.5 %** (`r3c_c1_acc`); the same harness without the medium exchange (`r2integ_acc`): 96.0 % / 97.0 %,
   NCCL 96.2 %. A vs B same final answer 192 / 200 (without: 191 / 200).
 
-Batch-size consequence (same class as the 2 MiB threshold of the large path before): in the decode range the attn-out all-reduce of
-T <= 8 is exact while the fused kernel serves it (16 .. 128 KiB; with the fused kernels off, T = 4 .. 8 carries the exchange as well), from T = 9 on it carries the bf16 exchange (in the CUDA-graph decode the padded sizes are 1, 2, 4, 8, 16, 24, ..., so
-from T = 16); the MoE-out all-reduce `[T, 4096]` carries it from padded T = 8 (64 KiB). An element's bits therefore depend on the padded batch size at those boundaries, which the dummy end-to-end
-bitwise tool cannot be used for; the GSM8K smoke above is the evidence.
+Batch-size consequence (same class as the 2 MiB threshold of the large path before): the exchange starts at 64 KiB, so in the decode
+range an element's bits depend on the batch size at these boundaries (CUDA-graph decode pads T to 1, 2, 4, 8, 16, 24, ...):
+
+* embedding all-reduce `[T, 8192]` (never fused): eager T 3 -> 4 (48 -> 64 KiB), padded T 2 -> 4 in graphs;
+* MoE-out all-reduce `[T, 4096]`: eager T 7 -> 8 (56 -> 64 KiB), padded T 4 -> 8 in graphs;
+* attn-out all-reduce `[T, 8192]`: exact for every T <= 8 while the fused `all_reduce_boundary` serves it (fused on: exact at T = 3 and
+  T = 4 alike, 16 .. 128 KiB), bf16 exchange from T = 9 (144 KiB; padded T = 16 in graphs). With the fused kernels off, T = 4 .. 8
+  carries the exchange as well (it then crosses at eager T 3 -> 4 like the embedding).
+
+The dummy end-to-end bitwise tool cannot be used across those boundaries; the GSM8K smoke above is the evidence.
 
 ## Latency (bf16 `[T, 8192]`, CUDA graph of back-to-back calls, us per call; `bench/bench_medium.py`, 2026-10-26)
 
@@ -119,6 +130,9 @@ on all 8 ranks of the two sessions, and the serve logs have no spin timeout or f
 * Geometry per size comes from one sweep (3 trials per candidate, top 2 retimed with the full protocol, fewest threads within 1.5 %);
   neighbouring geometries are within 1-3 %. The kernels spin-wait on peers with all blocks co-resident (<= 64 blocks of <= 512 threads),
   same rule as H1a.
+* `muse_topo/csrc/large.cu` (header comment, "the small algorithms (all-reduce below 2 MiB) never round the partials") predates r3c: with
+  the medium exchange on that holds below `ar_bx_min` (64 KiB) only. Not edited here on purpose, because any csrc change gives a new JIT
+  digest and forces a rebuild; correct the comment together with the next kernel change.
 * Prefill all-reduces above 8 MiB still use the large algorithm; per MiB it is slower than algorithm 2 with the bf16 exchange at 8 MiB
   (46.6 us/MiB at 16 MiB from `docs/h1b_latency.md` vs 40.1 us/MiB measured here), so a loop of 8 MiB pieces of algorithm 2 might beat it
   by ~14 % (extrapolation, not built or measured). The forced sequence-parallel prefill uses reduce_scatter + all_gather and does not

@@ -68,6 +68,11 @@ and 2 MiB differ in the same way. The results are still identical on all ranks a
 flag on the numerics of a token row depend on the padded batch size across the 2 MiB threshold: a further reason for the
 class `deterministic_different` and the default OFF.
 
+**Since r3c the 2 MiB boundary statements in this document (above and in the dispatch table below) are the state of H1b.** With the
+flag on and `MUSE_TOPO_MEDIUM_BX` not 0 (the `env/host.env` defaults) the medium all-reduce (algorithm 2) also rounds the partials from
+64 KiB (`ar_bx_min`), so the exact / bf16-exchange boundary of the bf16 all-reduce is 64 KiB, not 2 MiB, and reduce_scatter and
+all_reduce agree bitwise from 128 KiB; the 2 MiB switch applies with `MUSE_TOPO_MEDIUM_BX=0` only (`docs/r3c_medium_ar.md`).
+
 ## Dispatch (collectives.py)
 
 | call | condition | path |

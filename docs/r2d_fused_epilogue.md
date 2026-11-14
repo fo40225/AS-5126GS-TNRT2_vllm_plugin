@@ -70,7 +70,7 @@ Evidence (server, GPU lock, vLLM tree `src_r2d-fused-epilogue`):
 | `muse_topo/collectives.py` | `TopoComm.all_reduce_boundary`, `all_gather_boundary`, `all_gather_rmsnorm`, their `supports_*` gates, `MUSE_TOPO_FUSED` |
 | `muse_topo/vllm_plugin.py` | `CudaCommunicator.supports_fused_residual_boundary / all_reduce_residual_boundary / all_gather_residual_boundary / all_gather_rmsnorm` (op name `boundary` in `MUSE_TOPO_OPS`) |
 | `bench/test_boundary.py`, `bench/boundary_test.cu` | standalone bitwise proof against Triton |
-| `bench/test_ar_boundary.py` | 8-rank bitwise test of the fused collectives |
+| `bench/test_ar_boundary.py` | 8-rank bitwise test of the fused collectives (pins the bf16 exchange off: its reference is the exact `comm.all_reduce`) |
 | `bench/bench_boundary.py` | latency table, fused vs two-step |
 
 Decomposition of the fused all-reduce: the rows of the message are independent, so one CTA of 256 threads handles one row. Slice `j` of a
@@ -95,8 +95,9 @@ crossover; larger batches keep the two-step path (they are bandwidth bound, and 
 | real weights, 62 layers, **base trees** (vLLM `aef9851844` + host `37b2d96`, no `boundary` op, none of the new code) vs the committed trees (fused on, 2026-10-26, same 270-request script) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal (chosen-token and prompt |dlogprob| max 0, mean NLL delta 0); 118 fused-op log lines in the run with the fusion, none in the base run. This is the check that the whole change (model refactor included) leaves the outputs of the current default untouched |
 | real weights, 62 layers (`e2e_ab.py` of the final-measure track + decode batches T = 1, 2, 3, 4, 5, 9, 12, 16, 17, 33, 48, 64) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal fused on vs off; a second fused process equals the first; in-process repeats equal; the log shows `all_reduce_boundary` / `all_gather_boundary` (T = 1, 2, 4, 8) and `all_gather_rmsnorm` (T <= 16) inside the 62-layer CUDA graphs |
 
-The two real-weight fused on / off rows were measured before r3c existed (exact exchange for every medium all-reduce); under the
-r3c default they would differ for T = 4 .. 8 as described under "Accuracy class".
+The 6-layer dummy e2e row (fused on vs off, 20/20 bitwise) and the two real-weight fused on / off rows were measured before r3c
+existed (exact exchange for every medium all-reduce); under the r3c default they would differ for T = 4 .. 8 as described under
+"Accuracy class". A bit-identical fused on / off A/B now needs `MUSE_TOPO_MEDIUM_BX=0` in both runs.
 
 NaN payloads: a NaN stays a NaN everywhere; the all-reduce replaces words equal to `0xFFFFFFFF` (as before), so a NaN payload may differ
 between runs of different batch compositions only in the case that was already true for the plain all-reduce.
