@@ -1,6 +1,6 @@
 """Standalone tests of the dispatch tables of muse_topo under the production setting (bf16 exchange + medium bf16 exchange), S1-9 L9 A1.
 
-usage: [SRC=<vLLM tree>] py_topo.sh bench/test_a1_tables.py [--quick] [--groups tables,ar,rs,ag,graph]
+usage: [SRC=<vLLM tree>] py_topo.sh bench/test_a1_tables.py [--quick] [--groups tables,ar,rs,ag,graph,soak] [--soak-seconds N]
 Groups:
   tables  (CPU) well-formedness of every dispatch table: ascending bounds ending at 1 << 62, geometry limits of the kernels
           (block multiple of 32 up to 512 / 1024, unroll 1 / 2 / 4, grid up to 128), chunk size limits, and the one geometry that
@@ -14,11 +14,20 @@ Groups:
   ag      dispatch all_gather (dim 0 and dim -1, bf16 / uint8 / int32 payloads with all-ones words) == concatenation
   graph   the per-layer collective sequences of the verify bands (replicated c16 / c32, sequence-parallel c48 / c64 / c128) in one CUDA
           graph: replays 1 .. 3 == eager results (epoch / parity of the shared call counter across the multi-kernel calls)
+  slab    (part of ar) the row-slab path above max_bytes (8 MiB < bytes <= 64 MiB): odd / uneven row counts of the prefill and mixed steps
+          (T = 513 .. 4096 at 16 KiB rows, 8 KiB rows), the 64 MiB cap and the first row above it (4097 rows: the large algorithm): every
+          result == torch emulation, == the large algorithm (slabs switched off in the test), with ``out=`` aligned / 64-byte offset /
+          2-byte misaligned (guard words untouched) and a misaligned input, the slab count and size from the gate
+  soak    (not in the default groups; --soak-seconds N) one CUDA graph + eager calls at the retuned sizes (reduce-scatter 1.5 .. 4 MiB, the
+          1.5 / 2 MiB all-reduce rows, 2bx slabs 8.1 .. 64 MiB odd and even, a small op) replayed back to back for N seconds, bitwise
+          against the references every few hundred replays; a hang ends in the kernels' spin timeout (MUSE_TOPO_TIMEOUT_S, 600 s) and
+          fails the run
 """
 import argparse
 import os
 import random
 import sys
+import time
 import traceback
 
 import torch
@@ -29,6 +38,7 @@ from common import *  # noqa: F401,F403
 from tests_h1b import check, free
 
 KIB = 1 << 10
+AR_MAX_BYTES = (64 << 20) + 16 * KIB  # the slab cap (64 MiB) plus one 16 KiB row: [4097, 8192] is the first size above it
 
 
 def shape_for(nbytes, hid=8192):
@@ -79,6 +89,101 @@ def table_checks(C):
     return res
 
 
+def slab_checks(ck, comm, C, members, rank, dev, cpu_group, rows, hid):
+    """The row-slab path of an all-reduce above max_bytes (S1-9 L9 A1), or the first size above its cap: gate, slab count and size, equality with the
+    torch emulation and with the large algorithm (slabs switched off), ``out=`` handling (aligned, 64-byte offset, 2-byte misaligned: the result is
+    the caller's buffer, the words around it are untouched) and a misaligned input."""
+    nb, rowb, n = rows * hid * 2, hid * 2, rows * hid
+    xs = [make("mixed", (rows, hid), r, 93, dev) for r in range(WORLD)]
+    ref = contract_ref_bx(xs, members)
+    x = xs[rank]
+    del xs
+    per = comm._bx_slab_rows(x, nb)
+    in_cap = nb <= C._AR_BX_SLABS_MAX_BYTES
+    tag = f"slab {rows}x{hid} ({nb / KIB:.0f} KiB)"
+    ck(f"{tag}: the gate {'takes' if in_cap else 'rejects'} the shape ({per} rows per slab)", (per > 0) == in_cap and (per == 0 or per * rowb <= comm.max_bytes))
+    calls = []
+    orig = comm._all_reduce
+    comm._all_reduce = lambda *a, **k: (calls.append(a[0].shape[0]), orig(*a, **k))[1]
+    try:
+        y = comm.all_reduce(x)
+    finally:
+        del comm._all_reduce
+    want = [min(per, rows - r0) for r0 in range(0, rows, per)] if per else []
+    ck(f"{tag}: {len(want)} slab launches {want[:1]}.. covering all {rows} rows (none empty)", calls == want and sum(calls) == (rows if per else 0))
+    ck(f"{tag}: == torch emulation", bits_equal(y, ref))
+    saved = C._AR_BX_SLABS_MAX_BYTES
+    C._AR_BX_SLABS_MAX_BYTES = 0  # slabs off on every rank: the large algorithm with the bf16 exchange serves the message
+    try:
+        yl = comm.all_reduce(x)
+    finally:
+        C._AR_BX_SLABS_MAX_BYTES = saved
+    ck(f"{tag}: == the large algorithm with the bf16 exchange", bits_equal(y, yl))
+    flat = torch.zeros(n + 64, dtype=torch.bfloat16, device=dev)
+    for off, label in ((0, "aligned"), (32, "64-byte offset"), (1, "2-byte misaligned")):
+        flat.zero_()
+        o = flat[off:off + n].view(rows, hid)
+        r_ = comm.all_reduce(x, out=o)
+        guard = not bool(flat[:off].view(torch.int16).any()) and not bool(flat[off + n:].view(torch.int16).any())
+        ck(f"{tag}: out= {label}: returns out, == emulation, the words around it untouched", r_.data_ptr() == o.data_ptr() and bits_equal(o, ref) and guard)
+    xf = torch.empty(n + 1, dtype=torch.bfloat16, device=dev)
+    xf[1:] = x.reshape(-1)
+    ck(f"{tag}: misaligned input (2-byte offset) == emulation", bits_equal(comm.all_reduce(xf[1:].view(rows, hid)), ref))
+    del x, ref, y, yl, flat, xf
+
+
+def soak(ck, comm, C, members, rank, dev, cpu_group, seconds):
+    """Back-to-back replays of ONE CUDA graph holding the retuned sizes (reduce-scatter 1.5 .. 4 MiB, the 1.5 / 2 MiB all-reduce rows, 2bx slabs from
+    8.1 MiB to the 64 MiB cap with odd and even row counts, the first size above the cap, a small op) for ``seconds`` of wall clock, with an eager
+    round of the same calls between the chunks (graph and eager calls share the epoch counter). Every result is compared bitwise with the torch
+    emulation after each chunk of replays; the stop decision is rank 0's, so all ranks replay the same number of times."""
+    specs = [("rs", (96, 8192)), ("rs", (128, 8192)), ("rs", (192, 8192)), ("rs", (256, 8192)), ("rs", (384, 4096)), ("rs", (512, 4096)),
+             ("ar", (96, 8192)), ("ar", (128, 8192)), ("ar", (8, 8192)), ("ar", (519, 8192)), ("ar", (768, 8192)), ("ar", (1001, 8192)),
+             ("ar", (1024, 8192)), ("ar", (2049, 8192)), ("ar", (4096, 8192)), ("ar", (4097, 8192))]
+    bufs = []
+    for i, (op, shape) in enumerate(specs):
+        xs = [make("mixed", shape, r, 300 + i, dev) for r in range(WORLD)]
+        ref = contract_ref_bx(xs, members)
+        if op == "rs":
+            tb = shape[0] // WORLD
+            ref = ref[rank * tb:(rank + 1) * tb].contiguous()
+        bufs.append((op, xs[rank], ref))
+        del xs
+        free()
+
+    def body():
+        return [comm.all_reduce(x) if op == "ar" else comm.reduce_scatter(x) for op, x, _ in bufs]
+
+    eager = body()
+    torch.cuda.synchronize()
+    ok = all(bits_equal(o, ref) for o, (_, _, ref) in zip(eager, bufs))
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        gouts = body()
+    chunk, replays, rounds, t0, tlog = 200, 0, 0, time.time(), time.time()
+    while ok:
+        for _ in range(chunk):
+            g.replay()
+        replays += chunk
+        torch.cuda.synchronize()
+        ok = all(bits_equal(o, ref) for o, (_, _, ref) in zip(gouts, bufs))
+        eager = body()
+        torch.cuda.synchronize()
+        rounds += 1
+        ok = ok and all(bits_equal(o, ref) for o, (_, _, ref) in zip(eager, bufs))
+        ok = all(gather_all(bool(ok), cpu_group))
+        stop = torch.tensor([1 if time.time() - t0 >= seconds else 0], dtype=torch.int32)
+        dist.broadcast(stop, src=0, group=cpu_group)
+        if time.time() - tlog >= 120:
+            tlog = time.time()
+            log(rank, f"soak: {replays} graph replays, {rounds} eager rounds, {time.time() - t0:.0f} s, bits ok={ok}")
+        if stop.item():
+            break
+    ck(f"soak: {replays} graph replays of {len(specs)} collectives + {rounds} eager rounds in {time.time() - t0:.0f} s, every result == emulation", ok)
+    del g, gouts, eager, bufs
+    free()
+
+
 def worker(rank, args):
     try:
         run(rank, args)
@@ -120,13 +225,21 @@ def run(rank, args):
             ar_sizes.add(shape_for(r[0]))
             s = shape_for(r[0])
             ar_sizes.add((s[0] + 1, s[1]) if s[0] * s[1] * 2 + s[1] * 2 <= C._LARGE_MAX_BYTES else s)
-    ar_sizes = sorted(s for s in ar_sizes if 64 * KIB <= s[0] * s[1] * 2 <= 16 << 20 and (s[0] * s[1] * 2) % 128 == 0)
+    # the slab path (S1-9 L9 A1): bf16 messages above max_bytes (8 MiB) up to the 64 MiB cap run as row slabs. The prefill and mixed steps issue
+    # [T, 8192] all-reduces at every odd T from 513 to 4096 (round-5 log: 405 distinct shapes), the c96 / c128 draft all-reduce is [768 / 1024, 8192];
+    # 4097 rows (64 MiB + 16 KiB) is the first message above the cap (large algorithm), 8 KiB rows are the [T, 4096] latent shapes
+    slab_T = (513, 519, 520, 600, 700, 768, 1001, 1536, 2049, 3000, 4096, 4097)
+    for T in slab_T:
+        ar_sizes.add((T, 8192))
+    for T in (1025, 2049, 4097):
+        ar_sizes.add((T, 4096))
+    ar_sizes = sorted(s for s in ar_sizes if 64 * KIB <= s[0] * s[1] * 2 <= AR_MAX_BYTES and (s[0] * s[1] * 2) % 128 == 0)
     if args.quick:
-        ar_sizes = [s for s in ar_sizes if s[0] in band_T][::2]
+        ar_sizes = [s for s in ar_sizes if s[0] in band_T or s[0] in (519, 2049, 4096, 4097)][::2]
     if "ar" in groups:
         for (rows, hid) in ar_sizes:
             nb = rows * hid * 2
-            for kind in kinds:
+            for kind in (kinds[:2] if nb > (16 << 20) else kinds):
                 xs = [make(kind, (rows, hid), r, 91, dev) for r in range(WORLD)]
                 ref = contract_ref_bx(xs, members)
                 y = comm.all_reduce(xs[rank])
@@ -136,10 +249,18 @@ def run(rank, args):
                     if rows % 2 == 0 and nb // 2 >= 64 * KIB:
                         yh = comm.all_reduce(xs[rank][: rows // 2].contiguous())
                         ck(f"ar {rows}x{hid} batch invariant (half message)", bits_equal(yh, y[: rows // 2]))
+                    if nb > comm.max_bytes:
+                        # a different row count splits into other slabs: the rows of the shorter message must be the same bits
+                        m = rows - 3
+                        ym = comm.all_reduce(xs[rank][:m].contiguous())
+                        ck(f"ar {rows}x{hid} batch invariant ({m} of {rows} rows, other slab split)", bits_equal(ym, y[:m]))
                 del xs, ref, y
+            if nb > comm.max_bytes:
+                slab_checks(ck, comm, C, members, rank, dev, cpu_group, rows, hid)
             free()
     if "rs" in groups:
-        rs_sizes = {(T, hid) for T in (384, 392, 512, 768, 1024, 2048, 4096, 8192) for hid in (4096, 8192)}
+        # 64 .. 320 rows: the 1.5 .. 4 MiB messages of the _RS_BX_TABLE row (and 1 MiB / 5 MiB around it); 384 .. 8192: the sequence-parallel bands and prefill
+        rs_sizes = {(T, hid) for T in (64, 96, 128, 192, 256, 320, 384, 392, 512, 640, 768, 1024, 2048, 4096, 8192) for hid in (4096, 8192)}
         for tab in (getattr(C, "_RS_BX_TABLE", C._RS_TABLE), C._RS_TABLE):
             for r in tab[:-1]:
                 rs_sizes.add(shape_for(r[0]))
@@ -155,7 +276,7 @@ def run(rank, args):
                 y = comm.reduce_scatter(xs[rank])
                 ck(f"rs {rows}x{hid} ({nb / KIB:.0f} KiB) {kind} == rows block of the torch emulation", bits_equal(y, ref[rank * tb:(rank + 1) * tb]))
                 if kind == "randn":
-                    if nb <= 16 << 20:
+                    if nb <= 64 << 20:
                         ya = comm.all_reduce(xs[rank])
                         ck(f"rs {rows}x{hid} == rows block of the dispatch all_reduce", bits_equal(y, ya[rank * tb:(rank + 1) * tb]))
                         del ya
@@ -199,6 +320,9 @@ def run(rank, args):
             "c48": [("ag", (48, 8192, 0)), ("ag", (48, 2304, 0)), ("rs", (384, 8192)), ("rs", (384, 4096))],
             "c64": [("ag", (64, 8192, 0)), ("ag", (64, 2304, 0)), ("rs", (512, 8192)), ("rs", (512, 4096)), ("ar", (512, 8192))],
             "c128": [("ag", (128, 8192, 0)), ("ag", (128, 2304, 0)), ("rs", (1024, 8192)), ("rs", (1024, 4096)), ("ar", (1024, 8192))],
+            # c96: the draft all-reduce [768, 8192] (12 MiB) is served as slabs; odd row counts of the prefill / mixed steps and the 64 MiB cap
+            "c96": [("ag", (96, 8192, 0)), ("ag", (96, 2304, 0)), ("rs", (768, 8192)), ("rs", (768, 4096)), ("ar", (768, 8192))],
+            "slabs": [("ar", (519, 8192)), ("ar", (1001, 8192)), ("ar", (2049, 8192)), ("ar", (4096, 8192)), ("ar", (1025, 4096))],
         }
         for name, seq in seqs.items():
             bufs = []
@@ -239,6 +363,8 @@ def run(rank, args):
             ck(f"graph {name}: {len(seq)} collectives, 3 replays + eager == first eager run", ok)
             del g, gouts, again, eager, bufs
             free()
+    if "soak" in groups:
+        soak(ck, comm, C, members, rank, dev, cpu_group, args.soak_seconds)
     fails = [n for n, ok in RESULTS if not ok]
     dist.barrier(cpu_group)
     log(rank, f"{len(RESULTS)} checks, {len(fails)} failures" + ("" if not fails else f": {fails[:10]}"))
@@ -261,6 +387,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--groups", default="tables,ar,rs,ag,graph")
+    ap.add_argument("--soak-seconds", type=int, default=1800, help="wall clock of the soak group (not in the default groups)")
     ap.add_argument("--port", type=int, default=29761)
     args = ap.parse_args()
     mp.spawn(worker, args=(args,), nprocs=WORLD, join=True)

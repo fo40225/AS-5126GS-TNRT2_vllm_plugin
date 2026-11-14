@@ -18,7 +18,7 @@ Modes:
             data kinds, so the rows of two host trees can be compared bit for bit (summ_a1.py before after).
 
 usage (server, GPU lock): GPU=0,1,2,3,4,5,6,7 HOST_DIR=<host folder> <host folder>/scripts/runsrc_topo.sh <host folder>/bench/bench_a1_tables.py
-       --mode sweep|dispatch --what ar,arl,rs,ag --out <jsonl> [--tag <label>] [--only <substring>]
+       --mode sweep|dispatch --what ar,arl,arm,rs,ag --out <jsonl> [--tag <label>] [--only <substring>]
 """
 import argparse
 import hashlib
@@ -53,6 +53,9 @@ def targets(what):
             out.append(dict(op="ar", shape=(T, 4096), name=f"ar_T{T}x4096"))
     if "arl" in what:  # above max_bytes (8 MiB): the large all-reduce, c96 / c128 draft + embedding, prefill embedding
         for T in (768, 1024, 1536, 2048, 4096, 8192):
+            out.append(dict(op="ar", shape=(T, 8192), name=f"ar_T{T}x8192"))
+    if "arm" in what:  # just above max_bytes (8.0 .. 15.6 MiB) and odd row counts: prefill / mixed steps, c65 .. c95 draft all-reduce (review of the A1 slabs)
+        for T in (520, 600, 700, 1001, 2049):
             out.append(dict(op="ar", shape=(T, 8192), name=f"ar_T{T}x8192"))
     if "rs" in what:
         for T in (64, 128, 192, 256, 384, 512, 768, 1024):
