@@ -263,7 +263,7 @@ path: the microbench aligns the ranks, so it has no expert-parallel straggler sk
 c64 MoE-partial reduce-scatter is the call that waits for the experts: the round-5 trace attributes 29.6 ms per step (about 477 us per call) to it against 127 us in isolation, so
 roughly 350 us of each call is wait for the slowest rank's experts, and how much of the -1.7 ms survives that wait is what a model A/B decides), and the c96 / c128 slabs add CPU launch time
 on eager steps. The c128 draft all-reduce gain is the one more likely to be realized in full (the draft GEMMs are rank-symmetric, no expert wait in front of it). A model-level A/B (STEADY
-c48 / c64 / c128, spec profile) is the check that has not been run here.
+c48 / c64 / c128, spec profile) is the check; it was run afterwards and is reported in section 8.
 
 ## 7. Tests and reproduction
 
@@ -271,7 +271,7 @@ All on 8 GPUs under the GPU lock, server mirror copy of the new host tree (`work
 
 | test | result | what it covers for A1 |
 |---|---|---|
-| `bench/test_a1_tables.py` (groups tables, ag, graph, ar, rs; bf16 exchange + medium exchange on) | 430 checks x 8 ranks, 0 failures (tables+ag 75, graph 6, ar 252, rs 97) | dispatch == torch emulation of the contract on four data kinds at every production size and every table bound, rank-identical, batch invariant, RS == rows of AR, all_gather == concatenation, CUDA-graph replays == eager, table well-formedness |
+| `bench/test_a1_tables.py` (groups tables, ag, graph, ar, rs; bf16 exchange + medium exchange on) | 430 checks x 8 ranks, 0 failures (tables+ag 75, graph 6, ar 252, rs 97) before the review; 709 checks x 8 ranks, 0 failures after it (slab path at odd T 513 .. 4097, `out=` variants, slab == large algorithm, graphs c96 / odd-T slabs; section 8) | dispatch == torch emulation of the contract on four data kinds at every production size and every table bound, rank-identical, batch invariant, RS == rows of AR, all_gather == concatenation, CUDA-graph replays == eager, table well-formedness |
 | `bench/test_medium_bx.py` (all groups; the `disp` expectation for `max_bytes + 128 B` now names the slab path) | 192 checks x 8 ranks, 0 failed | medium bf16 exchange: emulation, bits, determinism, dispatch, mixed sequences in graphs, RS == AR rows |
 | `bench/tests_h1b.py` (exact exchange pinned: `MUSE_TOPO_LARGE_BF16_EXCHANGE=0`) | 284 checks x 8 ranks, 0 failed | large algorithms and exact-exchange tables (regression of the paths that did not change) |
 | `bench/test_plugin.py --quick` (pins the exact exchange itself) | 175 checks x 8 ranks, 0 failures | the vLLM wrapper path of the unchanged exact exchange (regression, not coverage of the new bf16 tables) |
@@ -293,3 +293,32 @@ python3 bench/summ_a1.py sweep <jsonl>                                  # adopti
 python3 bench/summ_a1.py cmp <jsonl> <jsonl> --tag-before a,b --tag-after c,d   # before / after per size, digests, verdict
 python3 bench/ms_step_a1.py bench/a1_sizes.json <jsonl> <jsonl> --tag-before a,b --tag-after c,d --targets <cells>
 ```
+
+## 8. Model-level gate (S1-9 L9 A1 gate, 2026-11-04 / 05): bitwise and hang-free, NOT adopted by the pre-registered rule
+
+Candidate = this branch at 58e9b9459d63 (`muse_topo/collectives.py` md5 43e85025db32, unchanged since 5a02275); OFF = production host tree a7e7a03 (server `host_topo`, identical to git main); both arms on the production vLLM tree
+6da60b3062 (all 2688 tracked `vllm/*.py` files of the commit identical on the server), the production speculative launch line (RadixArk DFlash2 K = 7, FP8 draft level 2, cap 256, MNBT 8199) at the same exact bytes
+11,573,411,840 (1,629,269 KV tokens per rank, idle 94,165 MiB in all six boots, 0 OOM, 0 preemptions; no S1-7 re-derivation: a slab call writes the same one `out` tensor the large algorithm allocates and the workspace is unchanged).
+The rule was written down before the first gate boot (ADOPTION_RULE.txt, md5 bcaf82a890e1; `work/s1-9/L9/a1g/g` on the server, tags `s19a1g_{ON,OFF}_{1,2,3}`, order ON OFF OFF ON ON OFF, one GPU-lock hold).
+
+| gate | result |
+|---|---|
+| tests on the candidate mirror | `test_a1_tables.py` 709 checks x 8, `test_medium_bx.py` 192 x 8, `test_plugin.py --quick` 175 x 8 (PASSED), `tests_h1b.py` (exact exchange, 20000 replays) 284 x 8: 0 failures |
+| bitwise equality with production and run-to-run determinism | offline LLM TP8 + EP8, production speculative profile, 131 prompts of 9 .. 23,000 tokens (110 of 90 tokens so that 128 requests run at once: verify batches of 1024 rows, draft all-reduce 16 MiB), 128 new tokens, 12 passes (greedy, seeded t1k64 / top_p / mixed, penalties, repeats): three cold processes (candidate a, candidate b, production): **all 36 comparisons identical** (token ids, top-5 logprobs of every generated token, prompt logprobs): a == b, a == production, pass 1 == repeat in each. Path proof from the DEBUG lines of `vllm.muse_topo`: the candidate runs 688 "2bx slabs" lines (T = 520 .. 1253 and 3819 .. 4079 among others), production 0 slab lines and 712 "large" all-reduce lines |
+| 30-minute hang soak (`test_a1_tables.py --groups soak`) | 188,600 graph replays of one graph with 16 collectives (RS 1.5 .. 4 MiB, AR 1.5 / 2 MiB rows, slabs T = 519 .. 4096, the first size above the cap) + 943 eager rounds in 1801 s, every result == the torch emulation, exit 0, no spin timeout |
+| speculative A/B, 3 sessions per arm, all six boots healthy (armOK, cfgcheck OK) | **pre-registered primary NOT met: pooled primary score (STEADY c16 / c32 / c40 + real greedy / default tok/s c16 / c32 / c40 / c48 / c64) gain -0.04 % against the required +0.25 %** (no primary cell tripped its limit, every guard passed) |
+
+STEADY step ms (engine counters, constant batch; OFF -> ON, 3 sessions each; "SIG" = beyond noise, Welch t = 2.78):
+
+```
+c1     16.934 -> 16.921  +0.08 % noise      c16   55.233 -> 54.769  -0.464 ms  +0.85 % SIG    c32   81.612 -> 81.556  +0.07 % noise
+c40    95.034 -> 95.036   0.00 % noise      c48   93.079 -> 93.561  +0.482 ms  -0.51 % noise   c64  105.939 -> 103.804  -2.135 ms  +2.06 % SIG
+c128  153.272 -> 151.985  -1.287 ms  +0.85 % SIG
+TTFT 8k / 16k / 32k  +-0.1 % noise;  churn c64 +0.06 %;  natural 8192 c16 +0.13 %;  real-prompt tok/s (14 cells): every |gain| <= 0.76 %, none beyond noise
+```
+
+Reading: the microbench predictions hold where they were predicted to hold on the critical path: c64 -2.135 ms (predicted -1.7 .. -2.1), c128 -1.287 ms (predicted -1.0, the draft all-reduce slabs with no CPU penalty visible),
+c16 -0.464 ms (predicted -0.09 .. -0.33). Nothing reached the real-prompt throughput cells (their session sd is 0.3 .. 1 %), which carried 10 of the 13 primary cells, and c48 (T = 384, the sequence-parallel floor, reduce-scatter 3 MiB) went the
+other way within noise (STEADY +0.48 ms, real greedy -0.76 %, default -0.50 %; predicted -1.3 .. -1.6 ms): look at c48 before any re-gate. The non-speculative guard was started (ON_1 of 6 boots) and stopped after the speculative
+primary had fixed the verdict; its ADOPT=no is "fewer than 3 sessions", not a guard trip. Not merged: the branch stays at 58e9b9459d63 plus this section for a decision on a re-gate (for example a STEADY-based primary written down in advance,
+or more sessions on the real-prompt cells), the revert of the 1.5 / 2 MiB rows is not needed (STEADY c16 improved, c32 flat).
