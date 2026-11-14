@@ -212,7 +212,7 @@ bytes 與 offload 參數是同一個 launch 屬性：`$MUSE_OFFLOAD_SERVE_ARGS` 
 `vllm serve ... --max-num-seqs 256 --max-cudagraph-capture-size 256 --kv-cache-memory-bytes $MUSE_OFFLOAD_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS`（ON bytes 16,854,810,624，2,893,281 KV tokens per rank），再跑 `check_offload_launch.sh`。
 gate 數字（ON vs OFF）：reuse TTFT p50 x0.0481、prompt tok/s x26.19、TTFT p99 x0.0376、118k re-admission x0.026、hit 0.9995；STEADY gmean 0.9956、DEC tok/s gmean 0.992；stress X S_live 501.8 MiB（floor 500）。
 **具名偏離（0.32.0 研究）**：這條 line 含 `--numa-bind`，但該研究中 bound 的 ns256 比 unbound 的 median reuse TTFT 慢 9-12 %（25-30 ms），未重新 gate；`MUSE_OFFLOAD_NUMA_BIND=0` 可關。
-**ns128 offload profile**（shipped）：`MUSE_OFFLOAD_PROFILE=ns128`，`--max-num-seqs 128`，ON bytes 17,257,267,200（2,962,366 KV tokens per rank），S_live 501.1 MiB（floor 500）。舊 launch 一律 `MUSE_OFFLOAD=0`。
+**ns128 offload profile**（shipped）：`MUSE_OFFLOAD_PROFILE=ns128`，`--max-num-seqs 128`，ON bytes 17,257,267,200（2,962,366 KV tokens per rank），S_live 501.1 MiB（floor 500）。舊 launch：speculative 用 `MUSE_OFFLOAD=0`；ns256 / ns128 的 `offload.env` 即使 `MUSE_OFFLOAD=0` 仍 export ON bytes（只有 `spec_k7.env` 會切換 bytes），舊 launch 要寫字面的 no-tier bytes（ns256 16,957,243,392、ns128 17,357,799,424）且不帶 `$MUSE_OFFLOAD_SERVE_ARGS`。
 
 **Swap（必讀）**：gate 中 14 / 18 個 ON 類 boot 發生 swap（launch 到 READY 增加 3.8-7.4 GiB），16 / 16 的 OFF / CTL 類 boot 沒有；swap 峰值 7,444.8 MiB / 8,192 MiB（`s110r_spec_ON_1`）；adoption 的 gate-T boot `s110r_fulltier_spec_a5` 只有 45.6 MiB。
 所以 ON launch 不是 swap-free，也不保證每次 boot 都不 swap；c128 p99 TTFT 在六組中都比 OFF 高 3.5-7.7 %；spec 的 stress S_live 餘裕只有 1,256.4 vs 1,256 MiB。完整記錄見 `docs/s110_numa_offload.md` 第 11 節。需要 vLLM branch 的 `receives_remote_kv` 修正。

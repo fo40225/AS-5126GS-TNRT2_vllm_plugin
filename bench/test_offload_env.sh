@@ -82,6 +82,22 @@ t "A1: MUSE_OFFLOAD=0 sources nothing of offload.env: no MUSE_OFFLOAD_* variable
   'export MUSE_OFFLOAD=0; source $E/host.env; source $E/spec_k7.env; export -p | grep -o -E "MUSE_OFFLOAD[A-Z_]*" | sort -u | tr "\n" " " | sed "s/ *$//"'
 t "A1: MUSE_OFFLOAD=0 after an ON source in the same shell drops the serve args and the override (stale state)" "off=0 args=[] ov=[] kv=11720212480" \
   'source $E/spec_k7.env; export MUSE_OFFLOAD=0; source $E/spec_k7.env; echo "off=$MUSE_OFFLOAD args=[$MUSE_OFFLOAD_SERVE_ARGS] ov=[${MUSE_SPEC_KV_BYTES_OVERRIDE:-}] kv=$MUSE_SPEC_KV_BYTES"'
+# review r1 B1: a CHILD shell inherits the ON exports but not offload.env's shell-local marker of its own override
+t "B1: child shell, parent ON exports, MUSE_OFFLOAD=0: no override, no serve args, the no-tier bytes" "off=0 args=[] ov=[] kv=11720212480" \
+  'source $E/host.env; source $E/spec_k7.env; MUSE_OFFLOAD=0 bash -c "source \$E/host.env; source \$E/spec_k7.env; echo \"off=\$MUSE_OFFLOAD args=[\$MUSE_OFFLOAD_SERVE_ARGS] ov=[\${MUSE_SPEC_KV_BYTES_OVERRIDE:-}] kv=\$MUSE_SPEC_KV_BYTES\""'
+t "B1: same with export MUSE_OFFLOAD=0 in the parent after the ON source" "off=0 args=[] ov=[] kv=11720212480" \
+  'source $E/host.env; source $E/spec_k7.env; export MUSE_OFFLOAD=0; bash -c "source \$E/host.env; source \$E/spec_k7.env; echo \"off=\$MUSE_OFFLOAD args=[\$MUSE_OFFLOAD_SERVE_ARGS] ov=[\${MUSE_SPEC_KV_BYTES_OVERRIDE:-}] kv=\$MUSE_SPEC_KV_BYTES\""'
+t "B1: child shell, parent ON exports, MUSE_OFFLOAD=0: the documented line is the pre-adoption launch" "--max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 11720212480" \
+  "CH='source \$E/host.env; source \$E/spec_k7.env; echo \$($LINE)'; source \$E/host.env; source \$E/spec_k7.env; export MUSE_OFFLOAD=0; bash -c \"\$CH\""
+t "B1: child shell with ON exports and MUSE_OFFLOAD unset: still ON (the gated line)" "$GATED" \
+  "CH='source \$E/host.env; source \$E/spec_k7.env; $LINE'; source \$E/host.env; source \$E/spec_k7.env; bash -c \"\$CH\""
+t "B1: an operator override that differs from the ON bytes survives MUSE_OFFLOAD=0 in a child shell with ON exports" "ov=11346923520 kv=11346923520" \
+  'source $E/host.env; source $E/spec_k7.env; export MUSE_OFFLOAD=0 MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520; bash -c "source \$E/spec_k7.env; echo \"ov=\$MUSE_SPEC_KV_BYTES_OVERRIDE kv=\$MUSE_SPEC_KV_BYTES\""'
+# review r1 M3: the cap > 256 warning (bytes not derived) is printed on the ON path too, and not for an operator override
+t "M3: MUSE_SPEC_GRAPH_CAP=512 with the tier on prints the 'not derived' warning" "1" \
+  'export MUSE_SPEC_GRAPH_CAP=512; source $E/spec_k7.env 2>&1 >/dev/null | grep -c "not derived"'
+t "M3: MUSE_SPEC_GRAPH_CAP=512 with MUSE_OFFLOAD=0 and an operator override prints no warning" "0" \
+  'export MUSE_OFFLOAD=0 MUSE_SPEC_GRAPH_CAP=512 MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520; source $E/spec_k7.env 2>&1 >/dev/null | grep -c "not derived"'
 t "A1: MUSE_OFFLOAD=0 keeps an operator MUSE_SPEC_KV_BYTES_OVERRIDE without offload.env (cap 384 launches)" "11346923520 11346923520" \
   'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520 MUSE_OFFLOAD=0; MUSE_SPEC_GRAPH_CAP=384 source $E/spec_k7.env; echo "${MUSE_SPEC_KV_BYTES_OVERRIDE:-} $MUSE_SPEC_KV_BYTES"'
 # A3 literal proofs: every exported variable (export -p, sorted) of the default launch equals the gated order's; the OFF launch equals main 942acddc48's
