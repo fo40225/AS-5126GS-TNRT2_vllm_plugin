@@ -22,6 +22,17 @@ group, so putting the host folder on ``PYTHONPATH`` is enough (no pip install). 
   still issue topo collectives would leave them waiting (until ``MUSE_TOPO_TIMEOUT_S``).
 * ``destroy``: dumps the call counters and closes the topo communicator.
 
+Capability ``reduce_scatter_all_gather_matches_all_reduce`` (property of the patched ``CudaCommunicator``, a plain
+``False`` on vLLM's base class): ``True`` when this communicator owns a ``TopoComm`` that takes all three ops and runs the
+large algorithms with the exact fp32 exchange. Every topo reduction is one fp32 sum in a fixed order with a single final
+rounding, so ``all_gather(reduce_scatter(x, dim 0), dim 0) == all_reduce(x)`` bit for bit (``bench/tests_h1b.py``,
+``bench/test_plugin.py``) for the tensors the topo path takes: bf16 / fp16 / fp32, a row count that is a multiple of 8,
+a size that is a multiple of 128 B between 128 KiB and 2 GiB. Callers that shard a reduction along the rows (the Muse
+sequence-parallel stream) read it to know that sharding leaves the result unchanged. ``MUSE_TOPO_OPS`` without one of
+the three ops, ``MUSE_TOPO_LARGE=0`` (reduce_scatter and the large all-reduce go to NCCL) and
+``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (the large algorithms round the island partials, the small all-reduce does not) turn
+it off.
+
 The sequence-parallel helpers of the Muse model (``sp_all_gather`` / ``sp_reduce_scatter``) first ask the device
 communicator's ``custom_all_gather`` / ``custom_reduce_scatter`` (vLLM's CustomAllreduce) and then fall back to
 ``tensor_model_parallel_all_gather`` / ``_reduce_scatter``, which end in the patched methods above. On this box the
@@ -271,6 +282,13 @@ def _wrap_destroy(orig):
     return destroy
 
 
+def _rs_ag_matches_ar(self) -> bool:
+    """``reduce_scatter`` + ``all_gather`` == ``all_reduce`` bitwise for the tensors the topo path takes (see the module doc)."""
+    comm = getattr(self, "topo_comm", None)
+    return bool(comm is not None and self.topo_ops >= frozenset(_ALL_OPS) and getattr(comm, "large", False)
+                and not getattr(comm, "bf16_exchange", False))
+
+
 def register() -> None:
     """Entry point of the ``vllm.general_plugins`` group; idempotent, never raises."""
     if not _enabled():
@@ -287,6 +305,7 @@ def register() -> None:
         CudaCommunicator.all_gather = _wrap_all_gather(CudaCommunicator.all_gather)
         CudaCommunicator.reduce_scatter = _wrap_reduce_scatter(CudaCommunicator.reduce_scatter)
         CudaCommunicator.destroy = _wrap_destroy(CudaCommunicator.destroy)
+        CudaCommunicator.reduce_scatter_all_gather_matches_all_reduce = property(_rs_ag_matches_ar)
         setattr(CudaCommunicator, _PATCH_MARK, True)
         logger.info("muse_topo plugin registered in pid %d (ops=%s)", os.getpid(), ",".join(sorted(routed)))
     except Exception:

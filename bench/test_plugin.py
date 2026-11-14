@@ -107,6 +107,12 @@ def run(rank, port, quick, ck):
     dc = tp.device_communicator
     comm = dc.topo_comm
     ck.check(comm is not None, "TopoComm created for the TP group")
+    # the capability the sequence-parallel stream asks for (False on vLLM's base class, a property of the patched one)
+    ck.check(dc.reduce_scatter_all_gather_matches_all_reduce is True, "capability RS + AG == AR advertised")
+    saved = dc.topo_comm
+    dc.topo_comm = None
+    ck.check(dc.reduce_scatter_all_gather_matches_all_reduce is False, "capability off without a TopoComm")
+    dc.topo_comm = saved
     log(rank, "TP group", tp.unique_name, "topo_comm", type(comm).__name__, "workspace MiB",
         f"{comm.workspace_bytes / 2**20:.1f}", comm.info.summary)
     members = comm.info.members
@@ -280,6 +286,16 @@ def run(rank, port, quick, ck):
         full = tensor_model_parallel_all_gather(yr, 0)
         ck.check(bits_equal(full, ref_r), f"RS + AG(dim 0) {dtype} {shape} == AR contract")
         del xs, xr, y, yr
+    # the capability itself, on the shapes of the sequence-parallel stream (attention output [T, 8192], expert output
+    # [T, 4096], T = a multiple of 8 from the smallest sharded batch up to a full chunk, and a mid size that is not a
+    # multiple of 128 rows): all_gather(reduce_scatter(x)) is bit for bit all_reduce(x), without going through the contract
+    for shape in ((520, 8192), (1024, 4096), (3000, 8192), (4104, 4096), (8192, 8192), (8192, 4096)):
+        xs = [make_input(r, shape, nseed(), dev) for r in range(WORLD)]
+        ar = tensor_model_parallel_all_reduce(xs[rank].clone())
+        rsag = tensor_model_parallel_all_gather(tp.reduce_scatter(xs[rank], 0), 0)
+        ck.check(bits_equal(rsag, ar), f"AG(RS(x)) == AR(x) bitwise {shape}")
+        ck.check(all_equal_across_ranks(rsag, cpu), f"AG(RS(x)) {shape} identical on all ranks")
+        del xs, ar, rsag
     # big all-gather shards: unpooler / pooler of a prefill chunk (dim 0) and the logits (dim -1)
     for shape, dim in (((8192, 512), 0), ((4096, 1024), 0), ((64, 25256), -1), ((256, 25256), -1), ((2048, 1024), -1)):
         xs = [make_input(r, shape, nseed(), dev) for r in range(WORLD)]
