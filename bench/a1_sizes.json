@@ -1,0 +1,1026 @@
+[
+ {
+  "band": "c1",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   8,
+   4096
+  ],
+  "bytes": 65536,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (65536, 2, 8, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c1",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   8,
+   8192
+  ],
+  "bytes": 131072,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (131072, 2, 8, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c1",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   8,
+   8192
+  ],
+  "bytes": 131072,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (131072, 2, 8, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c2",
+  "site": "attn-out AR",
+  "op": "AR",
+  "shape": [
+   16,
+   8192
+  ],
+  "bytes": 262144,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (262144, 2, 64, 64, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c2",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   16,
+   4096
+  ],
+  "bytes": 131072,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (131072, 2, 8, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c2",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   16,
+   8192
+  ],
+  "bytes": 262144,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (262144, 2, 64, 64, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c2",
+  "site": "unpooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   16,
+   1024
+  ],
+  "bytes": 32768,
+  "calls": 62,
+  "note": "",
+  "row": "AG (32768, 2, 32, 128, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c2",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   16,
+   8192
+  ],
+  "bytes": 262144,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (262144, 2, 64, 64, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c4",
+  "site": "attn-out AR",
+  "op": "AR",
+  "shape": [
+   32,
+   8192
+  ],
+  "bytes": 524288,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (524288, 2, 16, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c4",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   32,
+   4096
+  ],
+  "bytes": 262144,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (262144, 2, 64, 64, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c4",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   32,
+   8192
+  ],
+  "bytes": 524288,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (524288, 2, 16, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c4",
+  "site": "pooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   32,
+   512
+  ],
+  "bytes": 32768,
+  "calls": 62,
+  "note": "",
+  "row": "AG (32768, 2, 32, 128, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c4",
+  "site": "unpooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   32,
+   1024
+  ],
+  "bytes": 65536,
+  "calls": 62,
+  "note": "",
+  "row": "AG (65536, 2, 16, 256, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c4",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   32,
+   8192
+  ],
+  "bytes": 524288,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (524288, 2, 16, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c8",
+  "site": "attn-out AR",
+  "op": "AR",
+  "shape": [
+   64,
+   8192
+  ],
+  "bytes": 1048576,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (1048576, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c8",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   64,
+   4096
+  ],
+  "bytes": 524288,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (524288, 2, 16, 256, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c8",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   64,
+   8192
+  ],
+  "bytes": 1048576,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (1048576, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c8",
+  "site": "pooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   64,
+   512
+  ],
+  "bytes": 65536,
+  "calls": 62,
+  "note": "",
+  "row": "AG (65536, 2, 16, 256, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c8",
+  "site": "unpooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   64,
+   1024
+  ],
+  "bytes": 131072,
+  "calls": 62,
+  "note": "",
+  "row": "AG (131072, 2, 32, 1024, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c8",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   64,
+   8192
+  ],
+  "bytes": 1048576,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (1048576, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c16",
+  "site": "attn-out AR",
+  "op": "AR",
+  "shape": [
+   128,
+   8192
+  ],
+  "bytes": 2097152,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c16",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   128,
+   4096
+  ],
+  "bytes": 1048576,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (1048576, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c16",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   128,
+   8192
+  ],
+  "bytes": 2097152,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c16",
+  "site": "pooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   128,
+   512
+  ],
+  "bytes": 131072,
+  "calls": 62,
+  "note": "",
+  "row": "AG (131072, 2, 32, 1024, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c16",
+  "site": "unpooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   128,
+   1024
+  ],
+  "bytes": 262144,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c16",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   128,
+   8192
+  ],
+  "bytes": 2097152,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c32",
+  "site": "attn-out AR",
+  "op": "AR",
+  "shape": [
+   256,
+   8192
+  ],
+  "bytes": 4194304,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (4194304, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c32",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   256,
+   4096
+  ],
+  "bytes": 2097152,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c32",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   256,
+   8192
+  ],
+  "bytes": 4194304,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (4194304, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c32",
+  "site": "pooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   256,
+   512
+  ],
+  "bytes": 262144,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c32",
+  "site": "unpooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   256,
+   1024
+  ],
+  "bytes": 524288,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c32",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   256,
+   8192
+  ],
+  "bytes": 4194304,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (4194304, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c40",
+  "site": "attn-out AR",
+  "op": "AR",
+  "shape": [
+   320,
+   8192
+  ],
+  "bytes": 5242880,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (5242880, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c40",
+  "site": "moe-out AR",
+  "op": "AR",
+  "shape": [
+   320,
+   4096
+  ],
+  "bytes": 2621440,
+  "calls": 62,
+  "note": "",
+  "row": "2bx (2621440, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c40",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   320,
+   8192
+  ],
+  "bytes": 5242880,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (5242880, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c40",
+  "site": "pooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   320,
+   512
+  ],
+  "bytes": 327680,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c40",
+  "site": "unpooler col AG (dim -1)",
+  "op": "AG-1",
+  "shape": [
+   320,
+   1024
+  ],
+  "bytes": 655360,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 2
+ },
+ {
+  "band": "c40",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   320,
+   8192
+  ],
+  "bytes": 5242880,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (5242880, 2, 8, 512, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c48",
+  "site": "attn-out RS",
+  "op": "RS",
+  "shape": [
+   384,
+   8192
+  ],
+  "bytes": 6291456,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "c48",
+  "site": "moe-partial RS",
+  "op": "RS",
+  "shape": [
+   384,
+   4096
+  ],
+  "bytes": 3145728,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4194304, 1048576, 4, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "c48",
+  "site": "QKV-in AG (dim0)",
+  "op": "AG0",
+  "shape": [
+   48,
+   8192
+  ],
+  "bytes": 786432,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 2
+ },
+ {
+  "band": "c48",
+  "site": "packed-latent AG (dim0, u8)",
+  "op": "AG0",
+  "shape": [
+   48,
+   2304
+  ],
+  "bytes": 110592,
+  "calls": 60,
+  "note": "",
+  "row": "AG (131072, 2, 32, 1024, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c48",
+  "site": "bf16-latent AG (dim0, layers 0/61)",
+  "op": "AG0",
+  "shape": [
+   48,
+   4096
+  ],
+  "bytes": 393216,
+  "calls": 2,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c48",
+  "site": "routes AG (dim0, i32)",
+  "op": "AG0",
+  "shape": [
+   48,
+   16
+  ],
+  "bytes": 3072,
+  "calls": 62,
+  "note": "",
+  "row": "AG (4096, 1, 8, 128, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c48",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   384,
+   8192
+  ],
+  "bytes": 6291456,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (6291456, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c48",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   384,
+   8192
+  ],
+  "bytes": 6291456,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (6291456, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c64",
+  "site": "attn-out RS",
+  "op": "RS",
+  "shape": [
+   512,
+   8192
+  ],
+  "bytes": 8388608,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "c64",
+  "site": "moe-partial RS",
+  "op": "RS",
+  "shape": [
+   512,
+   4096
+  ],
+  "bytes": 4194304,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4194304, 1048576, 4, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "c64",
+  "site": "QKV-in AG (dim0)",
+  "op": "AG0",
+  "shape": [
+   64,
+   8192
+  ],
+  "bytes": 1048576,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 2
+ },
+ {
+  "band": "c64",
+  "site": "packed-latent AG (dim0, u8)",
+  "op": "AG0",
+  "shape": [
+   64,
+   2304
+  ],
+  "bytes": 147456,
+  "calls": 60,
+  "note": "",
+  "row": "AG (262144, 2, 32, 1024, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c64",
+  "site": "bf16-latent AG (dim0, layers 0/61)",
+  "op": "AG0",
+  "shape": [
+   64,
+   4096
+  ],
+  "bytes": 524288,
+  "calls": 2,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c64",
+  "site": "routes AG (dim0, i32)",
+  "op": "AG0",
+  "shape": [
+   64,
+   16
+  ],
+  "bytes": 4096,
+  "calls": 62,
+  "note": "",
+  "row": "AG (4096, 1, 8, 128, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c64",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   512,
+   8192
+  ],
+  "bytes": 8388608,
+  "calls": 1,
+  "note": "",
+  "row": "2bx (8388608, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c64",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   512,
+   8192
+  ],
+  "bytes": 8388608,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "2bx (8388608, 2, 16, 128, 1)",
+  "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
+ },
+ {
+  "band": "c128",
+  "site": "attn-out RS",
+  "op": "RS",
+  "shape": [
+   1024,
+   8192
+  ],
+  "bytes": 16777216,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "c128",
+  "site": "moe-partial RS",
+  "op": "RS",
+  "shape": [
+   1024,
+   4096
+  ],
+  "bytes": 8388608,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "c128",
+  "site": "QKV-in AG (dim0)",
+  "op": "AG0",
+  "shape": [
+   128,
+   8192
+  ],
+  "bytes": 2097152,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 4
+ },
+ {
+  "band": "c128",
+  "site": "packed-latent AG (dim0, u8)",
+  "op": "AG0",
+  "shape": [
+   128,
+   2304
+  ],
+  "bytes": 294912,
+  "calls": 60,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 1
+ },
+ {
+  "band": "c128",
+  "site": "bf16-latent AG (dim0, layers 0/61)",
+  "op": "AG0",
+  "shape": [
+   128,
+   4096
+  ],
+  "bytes": 1048576,
+  "calls": 2,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 2
+ },
+ {
+  "band": "c128",
+  "site": "routes AG (dim0, i32)",
+  "op": "AG0",
+  "shape": [
+   128,
+   16
+  ],
+  "bytes": 8192,
+  "calls": 62,
+  "note": "",
+  "row": "AG (8192, 1, 64, 32, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "c128",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   1024,
+   8192
+  ],
+  "bytes": 16777216,
+  "calls": 1,
+  "note": "",
+  "row": "AR_LARGE (4611686018427387904, 1, 1048576, 4, 8, 512, 2, 0, 1)",
+  "table": "_AR_LARGE_TABLE (tuned exact)"
+ },
+ {
+  "band": "c128",
+  "site": "draft AR (5 layers x 2 + emb)",
+  "op": "AR",
+  "shape": [
+   1024,
+   8192
+  ],
+  "bytes": 16777216,
+  "calls": 11,
+  "note": "draft rows assumed = T",
+  "row": "AR_LARGE (4611686018427387904, 1, 1048576, 4, 8, 512, 2, 0, 1)",
+  "table": "_AR_LARGE_TABLE (tuned exact)"
+ },
+ {
+  "band": "prefill8192",
+  "site": "attn-out RS",
+  "op": "RS",
+  "shape": [
+   8192,
+   8192
+  ],
+  "bytes": 134217728,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "prefill8192",
+  "site": "moe-partial RS",
+  "op": "RS",
+  "shape": [
+   8192,
+   4096
+  ],
+  "bytes": 67108864,
+  "calls": 62,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "prefill8192",
+  "site": "QKV-in AG",
+  "op": "AG0",
+  "shape": [
+   1024,
+   8192
+  ],
+  "bytes": 16777216,
+  "calls": 62,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 32
+ },
+ {
+  "band": "prefill8192",
+  "site": "packed-latent AG",
+  "op": "AG0",
+  "shape": [
+   1024,
+   2304
+  ],
+  "bytes": 2359296,
+  "calls": 60,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 5
+ },
+ {
+  "band": "prefill8192",
+  "site": "routes AG",
+  "op": "AG0",
+  "shape": [
+   1024,
+   16
+  ],
+  "bytes": 65536,
+  "calls": 62,
+  "note": "",
+  "row": "AG (65536, 2, 16, 256, 1)",
+  "table": "_AG_TABLES"
+ },
+ {
+  "band": "prefill8192",
+  "site": "embedding AR",
+  "op": "AR",
+  "shape": [
+   8192,
+   8192
+  ],
+  "bytes": 134217728,
+  "calls": 1,
+  "note": "",
+  "row": "AR_LARGE (4611686018427387904, 1, 1048576, 4, 8, 512, 2, 0, 1)",
+  "table": "_AR_LARGE_TABLE (tuned exact)"
+ },
+ {
+  "band": "prefill4096 (r2e half)",
+  "site": "attn-out RS",
+  "op": "RS",
+  "shape": [
+   4096,
+   8192
+  ],
+  "bytes": 67108864,
+  "calls": 124,
+  "note": "per microbatch half",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "prefill4096 (r2e half)",
+  "site": "moe-partial RS",
+  "op": "RS",
+  "shape": [
+   4096,
+   4096
+  ],
+  "bytes": 33554432,
+  "calls": 124,
+  "note": "",
+  "row": "RS (4611686018427387904, 1048576, 8, 256, 1, 0)",
+  "table": "_RS_TABLE (tuned exact)"
+ },
+ {
+  "band": "prefill4096 (r2e half)",
+  "site": "QKV-in AG",
+  "op": "AG0",
+  "shape": [
+   512,
+   8192
+  ],
+  "bytes": 8388608,
+  "calls": 124,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 16
+ },
+ {
+  "band": "prefill4096 (r2e half)",
+  "site": "packed-latent AG",
+  "op": "AG0",
+  "shape": [
+   512,
+   2304
+  ],
+  "bytes": 1179648,
+  "calls": 120,
+  "note": "",
+  "row": "AGL (4611686018427387904, 524288, 8, 1024, 1)",
+  "table": "_AGL_TABLE (single row)",
+  "launches": 3
+ }
+]
