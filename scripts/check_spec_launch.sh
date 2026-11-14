@@ -51,9 +51,9 @@
 # VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1> is the state, a snapshot with other VLLM_MUSE_SPARK_ lines but not this one means unset = the vLLM default 1; the snapshot is the driver shell, which can differ
 # from what the server read; (3) neither = fb=unverified.
 # Expectation: SPEC_EXPECT_FB unset means 1 (the production profile); SPEC_EXPECT_FB=1 is the same, explicitly; SPEC_EXPECT_FB=0 is for an FB0 arm of an A/B only. A detected 0 FAILS unless SPEC_EXPECT_FB=0 was
-# passed, so a comeback of the export (a profile file or a driver exporting 0) cannot pass silently. A checking shell that itself exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 FAILS the same way when SPEC_EXPECT_FB is
+# passed, so a comeback of the export (a profile file or a driver exporting 0) cannot pass silently when a state source exists or the checking shell exports 0. A checking shell that itself exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 FAILS the same way when SPEC_EXPECT_FB is
 # unset (it launched, or sourced a profile that launches, with the switch off). An explicit SPEC_EXPECT_FB=0|1 also FAILS when the state cannot be confirmed (no readable pid, no env.txt); without it an unverifiable
-# boot exits 0 with fb=unverified (nothing to compare). The OK line carries fb=<0|1|unverified> (before the bytes note and the pool).
+# boot exits 0 with fb=unverified (nothing to compare). Production drivers (Phase 3 / Phase 4) should pass SPEC_EXPECT_FB=1 so that an unverifiable boot also FAILS. The OK line carries fb=<0|1|unverified> (before the bytes note and the pool).
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
