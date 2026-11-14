@@ -116,8 +116,8 @@ def run(rank, args):
     default_variant = comm.gemv_variant
     default_push = comm.gemv_push
 
-    def wpr(kind):
-        return VARIANT_WPR[kind][comm.gemv_variant]
+    def wpr(kind, rows=1):
+        return comm.gemv_wpr(kind, rows)
 
     Ts = list(range(1, 9)) if not args.quick else [1, 3, 8]
     alpha, beta, post_w, pre_w, w4 = make_params(dev, 5)
@@ -150,10 +150,10 @@ def run(rank, args):
                         torch.cuda.synchronize()
                         check(rank, f"gemv row 0 independent of T variant={variant} kind={kind} {data} T={T}",
                               bits_equal(shard1, ref[:1]))
-    comm.set_gemv_variant(default_variant)
+    comm.set_gemv_variant(0)
 
     # ---- 2. fused calls == all_gather of the emulated shards + the model's kernels ------------------------------------
-    for variant in ([default_variant] if args.quick else [0, 1, 2, 3]):
+    for variant in ([0, 3] if args.quick else [0, 1, 2, 3]):
         comm.set_gemv_variant(variant)
         cfgs = [(1e-8, 1e-6, 1.0, 1.0), (1e-6, 1e-6, 0.0, 0.0)] if not args.quick else [(1e-8, 1e-6, 1.0, 1.0)]
         for push in ((1, 2, 0, 5) if variant == 0 else (1, 2)):
@@ -198,7 +198,7 @@ def run(rank, args):
                                 check(rank, f"gemv+ag+boundary == unfused variant={variant} push={push} {data} T={T} post_scale={post_scale} "
                                             f"fp32={fp32} cfg={cfg[:2]}", ok and same)
         comm.gemv_push = default_push
-    comm.set_gemv_variant(default_variant)
+    comm.set_gemv_variant(0)
     comm.gemv_push = default_push
 
     # ---- 3. accuracy of the order against the exact product (and next to cuBLAS) ----------------------------------------
@@ -327,6 +327,24 @@ def run(rank, args):
             ok_all &= bits_equal(fo, ro) and bits_equal(fn, rn)
     torch.cuda.synchronize()
     check(rank, "random mix of fused GEMV calls and other collectives (eager)", ok_all)
+
+    # ---- 6. the variant chosen by the number of rows (the default of the plugin) -------------------------------------------
+    comm.set_gemv_variant(None)
+    for T in Ts:
+        x = make_x(T, 8192, dev, 1000 + T, "mixed")
+        got = comm.gemv_all_gather_rmsnorm(x, wp, w4, 1e-6, 1.0)
+        ref = fused_rmsnorm_fwd(comm.all_gather(emulate_gemv(x, wp, wpr(0, T)), -1), w4, 1e-6, gain_center=1.0, input_scale=False,
+                                use_kahan_summation=True)
+        xu = make_x(T, 4096, dev, 1100 + T, "mixed")
+        st = (torch.randn(T, D, device=dev, generator=torch.Generator(device=dev).manual_seed(T)) * 2).float()
+        fo, fn = comm.gemv_all_gather_boundary(xu, wu, st, alpha, beta, pre_w, post_w, 1e-8, 1e-6, 1.0, 1.0)
+        ro, rn = fused_norm_residual_norm_fwd(comm.all_gather(emulate_gemv(xu, wu, wpr(1, T)), -1), st, post_w, pre_w, 1e-8, 1e-6,
+                                              alpha=alpha, beta=beta, post_gain_center=1.0, pre_gain_center=1.0,
+                                              post_input_scale=True, pre_input_scale=False, out_dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+        check(rank, f"variant by rows (v{comm._variant_for(T)}) T={T}",
+              bits_equal(got, ref) and bits_equal(fo, ro) and bits_equal(fn, rn))
+    comm.set_gemv_variant(default_variant)
     comm.close()
 
 

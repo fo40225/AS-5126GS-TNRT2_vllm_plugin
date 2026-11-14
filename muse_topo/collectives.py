@@ -268,9 +268,13 @@ class TopoComm:
         # weights behind the wait for the predecessor kernel instead of before it (A/B switch).
         self.gemv = self.fused and os.environ.get("MUSE_TOPO_GEMV", "1") != "0"
         self.gemv_push = int(os.environ.get("MUSE_TOPO_GEMV_PUSH", "1"))
-        # Geometry variant of the GEMV kernels (csrc/gemv_push.cu, 0 = default); a variant with another number of warps per row sums in
-        # another order, so it is a (deterministic) rounding change. For tuning: bench/bench_gemv_push.py --variants.
-        self.gemv_variant = int(os.environ.get("MUSE_TOPO_GEMV_VARIANT", "0"))
+        # Geometry variant of the GEMV kernels (csrc/gemv_push.cu): unset = by the number of rows (GEMV_VARIANT_BY_ROWS), a number pins it.
+        # A variant with another number of warps per row sums in another order, so it is a (deterministic) rounding change; V0 and V3 sum in
+        # the same order. For tuning: bench/bench_gemv_push.py --variants.
+        v_env = os.environ.get("MUSE_TOPO_GEMV_VARIANT")
+        self.gemv_variant: int | None = int(v_env) if v_env else None  # None: by rows (GEMV_VARIANT_BY_ROWS)
+        # Largest decode batch (padded rows) the GEMV + gather kernels serve; above it the model keeps the cuBLAS GEMV and the r2d gather.
+        self.gemv_max_rows = int(os.environ.get("MUSE_TOPO_GEMV_MAX_ROWS", str(self.GEMV_MAX_ROWS)))
         self.bf16_exchange = (os.environ.get("MUSE_TOPO_LARGE_BF16_EXCHANGE", "0") == "1"
                               if bf16_exchange is None else bool(bf16_exchange))
         self.ar_large_min = _AR_LARGE_MIN
@@ -346,7 +350,7 @@ class TopoComm:
         # (ar1, large / medium reduce_scatter, flag) do not, and the GEMV kernel then starts at their completion. Identical on every rank.
         self.gemv_trigger = int(os.environ.get("MUSE_TOPO_GEMV_TRIGGER", "3"))
         self._c.set_trigger(self.gemv_trigger if self.gemv else 0)
-        self._c.set_gemv_variant(self.gemv_variant)
+        self._c.set_gemv_variant(self._variant_for(1))
         # Where the fused collectives load the epilogue operands that do not depend on the collective (BndParams::ld_mode in
         # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (bench_boundary_cold.py,
         # 2026-10-24: all-reduce + boundary at T = 1 / 4 / 8: 12.1 / 14.6 / 18.8 us vs 12.8 / 15.3 / 19.3 for loading after the
@@ -554,6 +558,9 @@ class TopoComm:
     # The GEMV + gather kernels (csrc/gemv_push.cu) serve 1 .. 8 rows (the activations are re-read by every CTA, which costs more than the
     # weights beyond that).
     GEMV_MAX_ROWS = 8
+    # Geometry variant (csrc/gemv_push.cu) by the number of rows: V0 (128 CTAs) for one row, V3 (64 CTAs of 512 threads, half the activation
+    # traffic and half the pushing CTAs) from two rows on (bench/bench_gemv_push.py, hot L2: T = 2 layer chain 34.1 -> 33.1 us, T = 4 44.5 -> 41.5).
+    GEMV_VARIANT_BY_ROWS = {1: 0, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3, 7: 3, 8: 3}
     GEMV_KINDS = ("gemv_all_gather_rmsnorm", "gemv_all_gather_boundary")
     GEMV_POOLER_SHAPE = (512, 8192)     # weight rows of one rank x input width
     GEMV_UNPOOLER_SHAPE = (1024, 4096)
@@ -575,7 +582,7 @@ class TopoComm:
         if self._closed or not self.fused:
             return False
         if kind in self.GEMV_KINDS:
-            return self.gemv and 1 <= num_tokens <= self.GEMV_MAX_ROWS
+            return self.gemv and 1 <= num_tokens <= self.gemv_max_rows
         if kind not in self.DISPATCH_MAX_ROWS:
             return False
         return 1 <= num_tokens <= self.DISPATCH_MAX_ROWS[kind] and self._kernel_rows_ok(kind, num_tokens)
@@ -688,22 +695,29 @@ class TopoComm:
     # ------------------------------------------------------------------------------------------------
     # sharded GEMV fused with the all-gather that follows it (csrc/gemv_push.cu, ag_bnd.cu with ``pushed``)
     # ------------------------------------------------------------------------------------------------
-    def set_gemv_variant(self, v: int) -> None:
-        """Select the geometry variant of the GEMV kernels (the same on all ranks, between calls)."""
-        self._c.set_gemv_variant(int(v))
-        self.gemv_variant = int(v)
+    def set_gemv_variant(self, v: int | None) -> None:
+        """Pin the geometry variant of the GEMV kernels (the same on all ranks, between calls); None: choose by the number of rows."""
+        self.gemv_variant = None if v is None else int(v)
+        self._c.set_gemv_variant(self._variant_for(1))
+
+    def _variant_for(self, rows: int) -> int:
+        return self.GEMV_VARIANT_BY_ROWS[max(1, min(rows, 8))] if self.gemv_variant is None else self.gemv_variant
+
+    def gemv_wpr(self, kind: int, rows: int) -> int:
+        """Warps per output row of the geometry variant used for ``rows`` rows (kind 0 pooler, 1 unpooler): the summation order depends on it."""
+        return ((2, 4, 4, 2), (1, 2, 2, 1))[kind][self._variant_for(rows)]
 
     def supports_gemv_all_gather_rmsnorm(self, x: torch.Tensor, w: torch.Tensor) -> bool:
         """Whether :meth:`gemv_all_gather_rmsnorm` can serve this call: bf16 ``x`` [T, 8192] (1 <= T <= 8) and the bf16 weight rows
         [512, 8192] of this rank (rank-uniform: shapes, dtypes, contiguity)."""
-        return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.GEMV_MAX_ROWS
+        return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.gemv_max_rows
                 and tuple(w.shape) == self.GEMV_POOLER_SHAPE and x.shape[1] == self.GEMV_POOLER_SHAPE[1]
                 and self._boundary_ok(x, x.shape, torch.bfloat16) and self._boundary_ok(w, w.shape, torch.bfloat16))
 
     def supports_gemv_all_gather_boundary(self, x: torch.Tensor, w: torch.Tensor, stream: torch.Tensor) -> bool:
         """Whether :meth:`gemv_all_gather_boundary` can serve this call: bf16 ``x`` [T, 4096] (1 <= T <= 8), the bf16 weight rows
         [1024, 4096] of this rank, fp32 ``stream`` [T, 8192]."""
-        return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.GEMV_MAX_ROWS
+        return (not self._closed and self.gemv and x.dim() == 2 and 1 <= x.shape[0] <= self.gemv_max_rows
                 and tuple(w.shape) == self.GEMV_UNPOOLER_SHAPE and x.shape[1] == self.GEMV_UNPOOLER_SHAPE[1]
                 and self._boundary_ok(x, x.shape, torch.bfloat16) and self._boundary_ok(w, w.shape, torch.bfloat16)
                 and self._boundary_ok(stream, (x.shape[0], self.BOUNDARY_D), torch.float32))
@@ -715,6 +729,7 @@ class TopoComm:
         cuBLAS), computed for this rank's 512 columns and pushed to the partner and the island peers while the other columns are still being
         reduced. Returns the normalized [T, 4096] bf16 rows."""
         self._order_stream()
+        self._c.set_gemv_variant(self._variant_for(x.shape[0]))
         x, w, norm_w = self._aligned(x), self._aligned(w), self._aligned(norm_w)
         shard = torch.empty((x.shape[0], self.GEMV_POOLER_SHAPE[0]), dtype=torch.bfloat16, device=x.device)
         out = torch.empty((x.shape[0], 4096), dtype=torch.bfloat16, device=x.device)
@@ -726,6 +741,7 @@ class TopoComm:
         """``all_gather(gemv(x, w), -1)`` (this rank's 1024 columns of the unpooler) followed by the residual boundary (see
         :meth:`all_gather_boundary`), same contract as :meth:`gemv_all_gather_rmsnorm`; returns ``(out, new_stream)``."""
         self._order_stream()
+        self._c.set_gemv_variant(self._variant_for(x.shape[0]))
         x, w, stream, alpha, beta, pre_w = (self._aligned(t) for t in (x, w, stream, alpha, beta, pre_w))
         post_w = None if post_w is None else self._aligned(post_w)
         user_f32, out_fp32 = self._stage_out(out_fp32)

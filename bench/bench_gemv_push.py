@@ -114,7 +114,7 @@ def run(rank, args):
             per = time_graph(gr, N, cpu_group, target_s=0.05, trials=args.trials)
             row[name] = round(med_over_ranks(per, cpu_group) - base_flush, 2)
         comm.gemv_push = 1
-        comm.set_gemv_variant(0)
+        comm.set_gemv_variant(None)
         comm._c.set_trigger(comm.gemv_trigger)
         rows.append(row)
         log(rank, json.dumps(row))
