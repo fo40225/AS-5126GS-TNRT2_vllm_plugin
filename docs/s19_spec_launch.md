@@ -10,6 +10,8 @@ Launch-scoped, no vLLM code change: `env/spec_k7.env` (sourced after `env/host.e
 **S1-9 L4 (the DFlash2 aux projection on each rank's rows, `VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2`, the vLLM default) moves the bytes to 11,134,914,560** (543,697 blocks = 1,567,918 tokens per rank, +7.3 %):
 `env/spec_k7.env` exports the flag and sets `MUSE_SPEC_KV_BYTES` from it (11,134,914,560 with the flag at 2, 10,373,877,760 otherwise). See the section "S1-9 L4" at the end of this file.
 
+**S1-9 L5 (2026-11-02) adds `--max-num-batched-tokens 8199` to the profile** (`MUSE_SPEC_SERVE_ARGS`, aligned prefill chunks; the KV bytes stay 11,134,914,560). The SP floor stays 384 (floors 264 / 320 lost the A/B) and the router aux-stream overlap in the SP stream was not adopted. See the section "S1-9 L5" at the end of this file.
+
 ## What it changes
 
 Speculative decoding with RadixArk DFlash2, K = 7, `--max-num-seqs 128` verifies 8 tokens per request, so a batch of c requests is
@@ -218,3 +220,42 @@ Determinism (offline TP8 + EP8, production profile, 85 prompts, 128 tokens): two
 natural 8192-token c16 -0.05 %, all within noise, 0 preemptions.
 **Tests** (tree 0b6bf921fe, the gated tree): SP 8-GPU file 77, r2e 8-GPU file 61, the DFlash2 shard file 26 with the host plugin and 26 with NCCL (it includes the real `MuseSpark1xModel.forward` with the combiner under SP batches of 512 / 1024 / 8185 tokens and
 r2e microbatch splits, checked row by row against the projection of the taps), Muse suite 3645 passed / 198 skipped, tests/v1/spec_decode failing set identical to production (100).
+
+## S1-9 L5 bundle: aligned prefill chunks adopted; SP floor 264 / 320, SP router overlap and level-4 verification not adopted
+
+Production under test: vLLM `sm120-muse-spark-open` 1eb639f807 + this folder ebd579e2aa, speculative profile at 11,134,914,560 bytes. Two GPU-lock holds (2026-11-02 16:45-22:02 and 22:03-23:43), scripts and the frozen
+rule in the L5 scratch (`ADOPTION_RULE.txt`, md5 fdf3857774614f9715fbecadbe620a6e before the first gate boot).
+
+**Design of the A/B.** A 2^3 full factorial over B1 (VLLM_MUSE_SPARK_SM120_SP_ROUTER_OVERLAP_MAX_ROWS=128), B2 (SEQUENCE_PARALLEL_MIN_TOKENS 264 against 384) and B3 (`--max-num-batched-tokens` 8199 against 8192): eight boots, each factor
+compared ON against OFF over 4 + 4 boots (the other factors average out; Welch over the boots, t 2.45, se floored at 0.15 % of the OFF mean), plus one production-tree control boot (CTL) and one informational level-4
+boot. All 10 boots finished, 0 preemptions, arm checks OK (B1 line "the routing chain of the sequence-parallel stream runs on the aux stream ... for up to 128 rows per rank", the SP floor line, the scheduler line
+"Chunked prefill is enabled with max_num_batched_tokens=N"). Real mix320 prompts, closed loop, 128 out tokens; TTFT = median of 5 single random-id requests per size. Control: the all-off corner against the production
+tree -0.08 % (greedy c48 / c64 / c128, default c64 / c128; one boot each).
+
+| item | primary cells (ON / OFF) | result | verdict |
+|---|---|---|---|
+| B3 aligned chunks, 8199 | median TTFT 16,384 / 32,768 tokens | 1.5247 -> 1.4707 s (**-3.54 %**), 3.0956 -> 3.0122 s (**-2.69 %**), pooled score +3.22 % (t 23); 8,192 tokens 0.7646 -> 0.7317 s (-4.31 %), 8,185 flat | **adopted** (threshold +1.0 % beyond noise) |
+| B2 SP floor 264 | greedy c36 / c40 / c44 | -1.64 % (SIG) / -0.73 % (SIG) / +0.59 %; pooled -0.59 %; floor 320 (c40 / c44): -0.73 % / +0.59 %, pooled -0.07 % | not adopted: eager SP at T 288 .. 320 is slower than the replicated eager batch |
+| B1 SP router overlap, 128 rows | greedy c48 / c64 / c128 | -0.66 % / -0.01 % / +0.18 %, pooled -0.16 % (noise) | not adopted (predicted +0.45 .. 0.76 %: the real all-gather takes the SMs the microbench left idle) |
+| B5 level-4 verification (informational, 1 boot vs CTL) | toppall c64 / c128 | +2.6 % / +4.6 % tok/s | not adoptable: its kept-set audit found a ~1e-4 per-row mismatch rate (rule criterion (b) is zero) |
+
+B3 guards (all passed): natural 8192-token prompts c1 +2.4 %, c16 -0.9 % (SIG, inside the -1.5 % bar), c64 -0.5 %; mixed churn c64 +0.26 %; greedy c1 / c16 / c36 / c40 / c44 / c48 / c64 / c128
+-0.2 / -0.7 / -0.2 / +0.1 / +0.1 / -0.2 / +0.4 / +0.0 %, default c1 / c16 / c40 / c64 / c128 -0.2 / +0.3 / -0.2 / -0.6 / +0.4 % (all noise); acceptance length: draft-weighted mean ON - OFF +0.0000 over 13 cells, no trip.
+The cfgcheck of the B3 boots flags the KV token count (1,567,538 tokens per rank at the same bytes against 1,567,918 without the flag: the sliding-window groups reserve per scheduled token); the verdict waives exactly that flag.
+
+**Bytes.** S1-7 stress (probe tree of the production tree, REPS = 2, phases A1 B C1 C2 D H I L M X, the eligible mix) with the flag at 11,134,914,560: clean, **S_live 1,278.4 MiB** (floor 1,256; production without the flag 1,356.7) ->
+unchanged bytes, 1,567,538 KV tokens per rank. `check_spec_launch.sh` now checks the chunk (log line and serve_cmd.txt; `SPEC_EXPECT_MNBT`).
+**Accuracy / determinism** (production tree + the flag, bytes 11,134,914,560; rounding-level change: the chunk boundaries of long prefills move). GSM8K 200x2 at c64 with speculation, forward + reverse pass, 0 request errors:
+greedy 192 + 196 = **388/400 = 97.00 %** (band 95.5-98.0 %; production boot of the same hold 195 + 193 = 388), default sampling 197 + 196 = 393/400 = 98.25 % (production 394), top_p 0.95 on every request 394 (production 393),
+top_p 0.95 on every 4th item 393 (production 393); 6 + 2 answers hit the 16,384-token cap in the final greedy passes (production boot 2 + 2: the known repetition-loop tail). Determinism (offline TP8 + EP8, production profile + the flag,
+85 prompts of 9 .. 23,000 tokens, 128 new tokens, passes greedy / seeded t1k64 / seeded top_p 0.95 / seeded T 0.7 top_p 0.9 / mixed, then mixed, top_p 0.95 and greedy again): two cold processes identical 85/85 in all 8 passes,
+pass 1 against pass 2 identical 85/85 in both processes (E2E_GATE PASS, 0 OOM). Accuracy class: rounding-level, run-to-run deterministic, identical across ranks.
+
+**Non-speculative exact bytes (B4, S1-7 procedure re-run on the production tree, REPS = 2, stress A1 B C1 C2 D H I X, floor 500 MiB).** The S1-7 values left ~540 MiB of headroom on the current tree (S1-9 L2: S_live 1,238 / 1,166 MiB against
+696 / 512). Stepped up to a target S_live of ~600 MiB (one stress boot each, clean, 0 errors / mismatches / preemptions / OOM):
+ns128 (`--max-num-seqs 128`) **17,357,799,424** (264,859 blocks = **2,979,623 KV tokens** per rank, +114,838 = +4.0 % against 16,688,807,936 / 2,864,785), S_live 600.1 MiB, idle free 1,785.4 MiB, live growth 1,185.3 MiB, 1 allocator retry;
+ns256 (`--max-num-seqs 256 --max-cudagraph-capture-size 256`) **16,957,243,392** (258,747 blocks = **2,910,864 tokens**, +101,878 = +3.6 % against 16,363,749,376 / 2,808,986), S_live 599.9 MiB, idle free 1,831.4 MiB, live growth 1,231.5 MiB, 4 retries.
+Gate tier (valid without `prompt_logprobs` / `echo`; the prompt_logprobs-safe tier of S1-7 section 4 was not re-derived and stays a valid lower bound). Non-speculative launches do not carry the aligned-chunk flag (K = 0: the chunk is 8192 already).
+
+Not merged: vLLM branches `muse/s19-bundle` (B1: the SP router overlap knob, review fixes folded in, a fault-injected bitwise test whose two mutants without the join / the fork fail it) and `muse/s19-l4guard` (B5: the level-4 plan guard), both kept in
+`/home/user/vllm`; the production vLLM tree is unchanged (1eb639f807).

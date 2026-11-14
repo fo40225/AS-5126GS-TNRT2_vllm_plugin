@@ -1,6 +1,6 @@
 #!/bin/bash
 # Confirms in the log of a speculative boot that the launch profile of env/spec_k7.env took effect.
-# Usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]    (defaults 384 and 256)
+# Usage: [SPEC_EXPECT_MNBT=8199] check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]    (defaults 384 and 256)
 # The vLLM branch logs once per process: "sequence-parallel residual stream for batches of at least <floor> tokens
 # (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=<env>, CUDA graphs up to <cap> tokens)". The floor is
 # max(env, 257, cap + 1): the env value alone does not make a launch (floor 513 with the default capture list).
@@ -18,6 +18,10 @@
 # apply it logs "DRAFT_FC_SHARD=2 does not apply" and no success line, and is NOT a flag-on launch (FAIL here). The projection moves ~726 MiB of the stress transients and
 # idle memory per rank, so an r2e-on launch with it may carry --kv-cache-memory-bytes up to FCSHARD_ON_MAX_BYTES (11,134,914,560); without it (flag 0, an older tree, a
 # fallback) at most R2E_ON_MAX_BYTES (10,373,877,760: with the larger value S_live falls to ~630 MiB, under the 1,256 MiB floor). SPEC_EXPECT_FCSHARD=on|off demands the state.
+# S1-9 L5 (B3, aligned prefill chunks): the profile also carries --max-num-batched-tokens 8199 (K = 7: the chunks are 8192 tokens = a multiple of 8 instead of 8185, no F.pad staging
+# copy in sp_reduce_scatter, no 7-token tail step; -2.7 .. -3.5 % TTFT at 16k / 32k). The vLLM line "Chunked prefill is enabled with max_num_batched_tokens=<n>" must read the expected value
+# (SPEC_EXPECT_MNBT, default 8199; 8192 for a launch without the flag) and, next to a harness serve_cmd.txt, the flag must be there (8199) or absent (8192). The KV bytes of the profile
+# (11,134,914,560) are the same for both values; the S_live of the S1-7 stress is 1,278 MiB with 8199 (1,356.7 with 8192).
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
@@ -71,5 +75,22 @@ if [ -r "$cmd" ]; then
     fi
   fi
 fi
-[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap r2e=$r2e fcshard=$fcs ($pool)"
+# prefill chunk (S1-9 L5, B3)
+mnbt=${SPEC_EXPECT_MNBT:-8199}
+seen_mnbt=$(grep -a -o -E 'Chunked prefill is enabled with max_num_batched_tokens=[0-9]+' "$log" | sed -E 's/.*=//' | sort | uniq -c)
+if [ -z "$seen_mnbt" ]; then
+  echo "FAIL no \"Chunked prefill is enabled with max_num_batched_tokens=\" line in $log (expected $mnbt)"; rc=1
+elif [ "$(echo "$seen_mnbt" | wc -l)" != 1 ] || ! echo "$seen_mnbt" | grep -q -E "^ *[0-9]+ $mnbt\$"; then
+  echo "FAIL expected max_num_batched_tokens=$mnbt; found (count value):"; echo "$seen_mnbt"; rc=1
+fi
+if [ -r "$cmd" ]; then
+  if [ "$mnbt" = 8192 ]; then
+    if grep -q -E -e '--max-num-batched-tokens[ =]' "$cmd" && ! grep -q -E -e '--max-num-batched-tokens[ =]8192([^0-9]|$)' "$cmd"; then
+      echo "FAIL serve_cmd.txt carries a --max-num-batched-tokens other than 8192"; rc=1
+    fi
+  elif ! grep -q -E -e "--max-num-batched-tokens[ =]$mnbt([^0-9]|\$)" "$cmd"; then
+    echo "FAIL serve_cmd.txt has no --max-num-batched-tokens $mnbt"; rc=1
+  fi
+fi
+[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap r2e=$r2e fcshard=$fcs mnbt=$mnbt ($pool)"
 exit $rc
