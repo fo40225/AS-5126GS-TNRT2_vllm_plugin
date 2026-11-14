@@ -290,7 +290,7 @@
   "bytes": 2097152,
   "calls": 62,
   "note": "",
-  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "row": "2bx (2097152, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -318,7 +318,7 @@
   "bytes": 2097152,
   "calls": 1,
   "note": "",
-  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "row": "2bx (2097152, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -361,7 +361,7 @@
   "bytes": 2097152,
   "calls": 11,
   "note": "draft rows assumed = T",
-  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "row": "2bx (2097152, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -389,7 +389,7 @@
   "bytes": 2097152,
   "calls": 62,
   "note": "",
-  "row": "2bx (2097152, 2, 8, 512, 1)",
+  "row": "2bx (2097152, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -461,7 +461,7 @@
   "bytes": 5242880,
   "calls": 62,
   "note": "",
-  "row": "2bx (5242880, 2, 8, 512, 1)",
+  "row": "2bx (6291456, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -475,7 +475,7 @@
   "bytes": 2621440,
   "calls": 62,
   "note": "",
-  "row": "2bx (2621440, 2, 8, 512, 1)",
+  "row": "2bx (3145728, 2, 8, 256, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -489,7 +489,7 @@
   "bytes": 5242880,
   "calls": 1,
   "note": "",
-  "row": "2bx (5242880, 2, 8, 512, 1)",
+  "row": "2bx (6291456, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {
@@ -533,7 +533,7 @@
   "bytes": 5242880,
   "calls": 11,
   "note": "draft rows assumed = T",
-  "row": "2bx (5242880, 2, 8, 512, 1)",
+  "row": "2bx (6291456, 2, 16, 128, 1)",
   "table": "_AR_BX_TABLE (tuned bx, warm b2b)"
  },
  {

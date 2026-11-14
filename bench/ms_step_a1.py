@@ -1,6 +1,6 @@
 """ms/step estimate of a table change (S1-9 L9 A1): sum over the collectives of a band of (calls per step) x (dispatch time delta).
 
-usage: ms_step_a1.py <sizes.json> <before.jsonl> <after.jsonl> [--tag-before X --tag-after Y]
+usage: ms_step_a1.py <sizes.json> <before.jsonl> <after.jsonl> [--tag-before X[,X2] --tag-after Y[,Y2]] [--targets t1,t2,...]
 sizes.json: list of {band, site, op (AR / RS / AG0 / AG-1), shape, bytes, calls} (docs/a1_table_retune.md, generated from the model code
 and the round-5 op log). before / after: bench_a1_tables.py --mode dispatch rows. A band's delta is reported per protocol (warm, spacer,
 cold = model-like cold, coldw = spike cold); the microbench has no EP straggler skew and no eager CPU cost, so the numbers are the
@@ -29,7 +29,7 @@ def load(path, tag):
     d = {}
     for line in open(path):
         r = json.loads(line)
-        if tag is None or r.get("tag") == tag:
+        if tag is None or r.get("tag") in tag.split(","):
             d.setdefault(r["target"], []).append(r)
     out = {}
     for t, rs in d.items():
@@ -49,6 +49,11 @@ def main():
                 tb = v
             else:
                 ta = v
+    only = None
+    if "--targets" in args:  # restrict the sum to the table cells that were changed (the other sizes only add measurement noise)
+        i = args.index("--targets")
+        only = set(args[i + 1].split(","))
+        del args[i:i + 2]
     sizes = json.load(open(args[0]))
     b, a = load(args[1], tb), load(args[2], ta)
     protos = ("warm", "spacer", "cold", "coldw")
@@ -56,6 +61,8 @@ def main():
     missing = set()
     for r in sizes:
         t = target_name(r["op"], r["shape"])
+        if only is not None and t not in only:
+            continue
         if t not in b or t not in a:
             missing.add(t)
             continue

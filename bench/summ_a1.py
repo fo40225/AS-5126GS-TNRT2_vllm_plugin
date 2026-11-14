@@ -1,7 +1,8 @@
 """Summaries of bench_a1_tables.py output (S1-9 L9 A1).
 
 usage: summ_a1.py sweep <jsonl> [...]            adoption verdict per (target, finalist) under the pre-registered rule
-       summ_a1.py cmp <before.jsonl> <after.jsonl> [--tag-before X --tag-after Y]   per-size dispatch timing and digest comparison
+       summ_a1.py cmp <before.jsonl> <after.jsonl> [--tag-before X[,X2] --tag-after Y[,Y2]]   per-size dispatch timing (median over the
+       launches of the tags) and digest comparison (every launch of every tag must agree)
 
 Rule (sweep): a finalist replaces the baseline dispatch of a size only if
   * baseline and finalist are bitwise equal to the contract emulation on every rank and all four data kinds,
@@ -82,7 +83,7 @@ def cmp(before, after, tb=None, ta=None):
         d = {}
         for l in open(p):
             r = json.loads(l)
-            if tag is None or r.get("tag") == tag:
+            if tag is None or r.get("tag") in tag.split(","):
                 d.setdefault(r["target"], []).append(r)
         return d
 
@@ -94,10 +95,15 @@ def cmp(before, after, tb=None, ta=None):
         rb, ra = b[t], a[t]
         mb = {p: statistics.median(med(r, p) for r in rb) for p in ("warm", "spacer", "cold", "coldw")}
         ma = {p: statistics.median(med(r, p) for r in ra) for p in ("warm", "spacer", "cold", "coldw")}
-        same = all(rb[0]["digests"][k] == ra[0]["digests"][k] for k in rb[0]["digests"])
+        same = all(r["digests"][k] == rb[0]["digests"][k] for r in rb + ra for k in rb[0]["digests"])
         oks = all(all(r["bitwise_contract"].values()) for r in rb + ra)
-        print(f"{t:20s} {rb[0]['bytes'] / 1024:8.0f} | " + " ".join(f"{mb[p]:8.1f}" for p in mb) + " | " + " ".join(f"{ma[p] - mb[p]:+8.1f}" for p in mb)
-              + f" | digests {'IDENTICAL' if same else 'DIFFER'} contract {'ok' if oks else 'FAIL'}")
+        d = {p: ma[p] - mb[p] for p in mb}
+        tol = {"warm": max(1.0, 0.02 * mb["warm"]), "spacer": max(1.0, 0.015 * mb["spacer"]), "coldw": max(1.5, 0.03 * mb["coldw"])}
+        worse = [p for p in tol if d[p] > tol[p]]
+        gain = -d["cold"] > max(1.5, 0.03 * mb["cold"])
+        verdict = "REGRESS(" + ",".join(worse) + ")" if worse else ("GAIN" if gain else "same")
+        print(f"{t:20s} {rb[0]['bytes'] / 1024:8.0f} | " + " ".join(f"{mb[p]:8.1f}" for p in mb) + " | " + " ".join(f"{d[p]:+8.1f}" for p in mb)
+              + f" | digests {'IDENTICAL' if same else 'DIFFER'} contract {'ok' if oks else 'FAIL'} | {verdict}")
 
 
 if __name__ == "__main__":
