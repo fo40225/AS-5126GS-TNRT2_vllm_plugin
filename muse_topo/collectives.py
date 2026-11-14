@@ -184,6 +184,15 @@ _RS_TABLE = [
     (4 << 20, 1 << 20, 4, 256, 1, 0),  # 2 MiB 66 us (73), 4 MiB 126 us (150)
     (1 << 62, 1 << 20, 8, 256, 1, 0),  # 16 MiB 496 us (598), 64 MiB 1973 us (2373), 128 MiB 4024 us (4790)
 ]
+# reduce_scatter with the bf16 exchange (bf16 inputs while bf16_exchange is on, the production setting): the 4-block row of _RS_TABLE (1 .. 4 MiB)
+# was tuned for the exact fp32 exchange (it moves twice the bytes across the socket cut, so fewer blocks were enough); with the bf16 partials 8 blocks
+# of 256 threads win there (S1-9 L9 A1, bench/bench_a1_tables.py, 8 processes, CUDA graph, dispatch path, warm / cold us per call, old row -> this row:
+# 1.5 MiB 46.1 / 50.7 -> 36.7 / 39.1, 2 MiB 60.3 / 66.2 -> 47.1 / 50.1, 3 MiB 87.8 / 96.3 -> 67.6 / 71.2, 4 MiB 115.3 / 127.1 -> 88.1 / 92.8). The old
+# rows up to 1 MiB and from 6 MiB to 128 MiB already had 8 blocks: unchanged within 1 %. Same arithmetic and bits for every geometry (bitwise against
+# the torch emulation of the contract on every size, identical output digests before / after).
+_RS_BX_TABLE = [
+    (1 << 62, 1 << 20, 8, 256, 1, 0),
+]
 # large all_gather: (largest shard bytes, chunk bytes, blocks, block threads, cut); used from _AG_LARGE_MIN bytes of shard
 _AGL_TABLE = [
     (1 << 62, 1 << 19, 8, 1024, 1),  # out 2 MiB 52 us (H1a 56, NCCL 72), 16 MiB 416 us (479 / 588), 128 MiB 3315 us (3890 / 4660)
@@ -884,7 +893,8 @@ class TopoComm:
         x, out, user_out = self._stage(x, out)
         nbytes = x.numel() * x.element_size()
         self._note("reduce_scatter", x, "large")
-        _, ch, g, blk, un, cut = _pick(_RS_TABLE, nbytes)
+        table = _RS_BX_TABLE if self.bf16_exchange and x.dtype == torch.bfloat16 else _RS_TABLE
+        _, ch, g, blk, un, cut = _pick(table, nbytes)
         return self._unstage(self._reduce_scatter_large(x, out, ch, g, blk, un, None, cut), user_out)
 
     # ------------------------------------------------------------------------------------------------
