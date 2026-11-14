@@ -15,7 +15,7 @@
 # never a foreign process (the S1-10 harness did this for every process of its session).
 # 0.33.0-DERIVED (S1-10R phase 3, 2026-11-11): the default per-rank bytes P* = 51,814,072,320 (48.26 GiB) come from the A_N figures measured on 0.33.0 (node 7 = 105,586 MiB limits);
 # the margin M = 6.6 GiB was kept (re-itemised) and the W_N footprints were re-measured (workers 3,865 MiB anon + 319 MiB shmem, EngineCore 1,174 MiB, API server 1,354 MiB: unchanged
-# within 4 percent of the W_N values in the code below). P* holds only while the node-7 reclaimable slab stays small (302 MiB at the measurement, 6,688 MiB in the 0.32.0 study; slab is not in A_N):
+# within 5 percent of the W_N values in the code below: EngineCore 1,174 against 1,229 MiB, API server 1,354 against 1,331, worker anon + shmem 4,184 against 4,096 MiB). P* holds only while the node-7 reclaimable slab stays small (302 MiB at the measurement, 6,688 MiB in the 0.32.0 study; slab is not in A_N):
 # this preflight, run before every ON boot, is what catches a regrown slab. The idle A_N it sees (no server) is about W_N above the server-up A_N of the sizing.
 # usage: [MUSE_OFFLOAD_PER_RANK_BYTES=<bytes>] [MUSE_OFFLOAD_MIN_LEFT_MIB=4096] [MUSE_OFFLOAD_NODE_ROOT=/sys/devices/system/node] preflight_offload.sh
 # Exit 0 = every GPU node can take the tier, 1 = a node is short, 2 = unreadable meminfo.

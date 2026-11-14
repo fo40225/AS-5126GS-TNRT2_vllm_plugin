@@ -180,7 +180,7 @@ a 48 x 5 x 6000-token chat; snapshot 06:20:54 server time, no memory pressure du
 | 4 (6, 7) | 38,103.0 | 79,434.3 | 2,103.8 | **119,641.2** | 118,063 | 20,814 |
 
 **P* = L * floor((105,586.3 MiB - 6.6 GiB) / (2 L)) = 158,124 L = 51,814,072,320 B per rank** (48.2556 GiB, +7.2 % over the 45 GiB tier; 2,529,984 CPU blocks per rank in the speculative profile, 790,620 in the non-speculative ones; 414,512,578,560 B = 386 GiB for the eight ranks, `cpu_bytes_to_use` = 8 x P*).
-(`scripts/preflight_offload.sh` uses M = 6,758 MiB, one L more than 6.6 * 2^30 B would give: P* from the preflight margin would be 51,814,400,000 B; the sizing value is the one above.)
+(`scripts/preflight_offload.sh` uses the rounded margin M = 6,758 MiB, slightly below 6.6 * 2^30 B; fed into the formula it would give 51,814,400,000 B, one L more than the sizing value above, which uses the exact 6.6 GiB.)
 Why node 7 gained 6.7 GiB: the old OFF boot (`numa_end.txt` of `s110_a_off_b_spec`) carried 6,688 MiB of reclaimable slab on node 7 (1.3-1.4 GiB on the other nodes) that A_N does not count; now it is 302 MiB on node 7 and 0.16-0.24 GiB elsewhere; the old figure with SReclaimable (105,581 MiB) equals today's A_7.
 Foreign memory on node 7 is unchanged (13,242 MiB server up, 13,027 idle before the boot, 13,014 after shutdown; 13.3 GiB in S1-10; owner not traced), as is anon (8,945 MiB). **Condition:** the slab is state dependent (uptime was 13 h); if it regrows on node 7, A_7 and P* fall back toward 45 GiB, so run `scripts/preflight_offload.sh` before every ON boot.
 Node 7 also holds 71.5 GiB of cold Inactive(file) that the tier populate has to evict.
@@ -215,7 +215,7 @@ Same S1-7 procedure on the 0.33.0 tree (probe tree = `sm120-dev/src` `f6a60ab9d7
 tier **P* = 51,814,072,320 B per rank** (page tables 2 MiB per GiB = 96.5 MiB), bound, speculative boots with `--max-num-scheduled-tokens 8192` and the fused boundary default on. Floors 1,256 MiB (speculative) / 500 MiB (non-speculative). Start = the no-tier bytes, step down by the shortfall, confirm by a boot.
 S_live = min over GPUs of idle free memory - largest live growth of torch's allocated peak. Confirmed boots: 0 errors, preemptions, OOM, tracebacks, NCCL warnings or watchdog trips, health 200.
 
-| profile | 0.33.0 no-tier bytes | **offload-on bytes** | blocks (bpb) | KV tokens per rank | step vs no tier | S_live at the start bytes | S_live at the confirmed bytes |
+| profile | no-tier start bytes (spec: S1-13 on 0.33.0; ns: S1-9 bytes, confirmed on 0.33.0 by the v033-port validation, S_live 503.1 / 500.8 MiB) | **offload-on bytes** | blocks (bpb) | KV tokens per rank | step vs no tier | S_live at the start bytes | S_live at the confirmed bytes |
 |---|---|---|---|---|---|---|---|
 | spec | 11,720,212,480 (S1-13) | **11,645,337,600** | 568,620 (20,480) | 1,639,394 | -74,874,880 B (-3,656 blocks) | 1,184.6 (shortfall 71.4) | **1,256.6** >= 1,256 PASS |
 | ns256 | 16,957,243,392 | **16,854,810,624** (16,074 MiB) | 257,184 (65,536) | 2,893,281 | -102,432,768 B | 403.8 (shortfall 96.2) | **501.8** >= 500 PASS |
@@ -225,9 +225,9 @@ Confirmed boots: spec READY 94,159 MiB, idle free 3,093.4, live growth 1,836.8, 
 Intermediate boots (ns256: 16,856,317,952 -> 499.8; 16,856,055,808 -> 499.8; ns128: 17,258,250,240 -> 499.1) stayed 0.2-0.9 MiB under the floor. **The GPU KV allocation is quantized to 2 MiB**: idle free moved by exactly +72 / +96 / +94 MiB for steps of 71.4 / 96.2 / 94.9 MiB, and the literal 4-block ns256 step (0.25 MiB) was a no-op.
 Step by `ceil(shortfall / 2 MiB)` granules (POST-HOC deviation from "shortfall in whole blocks", which cost two extra boots; one ns256 boot at 16,856,055,808 was INVALID, rank 2 graph capture 1.99 GiB instead of 0.72 and an OOM in the first burst, cause unattributed, the re-run of the same bytes was clean).
 Spec (7 blocks) and ns128 (3 blocks) are not granule-maximal (568,627 and 263,328 blocks would give the same idle free); not booted. The tier on 0.33.0 costs the GPU 96.5 MiB of page tables, 6.5 MiB more than the 90 MiB of the 45 GiB tier.
-The GPU bytes with the tier are 74.9 / 102.4 / 100.5 MB below the no-tier bytes; the smaller tier-off figures of S1-13 stay valid for launches without the tier.
+The GPU bytes with the tier are 74.9 / 102.4 / 100.5 MB below the no-tier start bytes; the larger tier-off bytes stay valid for launches without the tier.
 The frozen gate drivers (`bench/s110/master_gate.sh`, `master_det.sh`) still hold the 0.32.0 literals (spec ON 11,525,693,440, ns256 16,957,243,392, ns128 17,357,799,424, control 11,573,411,840) because the frozen tools are byte-identical by rule; the phase 4 drivers have to be copies that take the offload-on bytes from `env/offload.env`
-(or `MUSE_OFFLOAD_KV_BYTES_OVERRIDE`, as the phase 3 stress driver did) and the no-tier controls from S1-13.
+(or `MUSE_OFFLOAD_KV_BYTES_OVERRIDE`, as the phase 3 stress driver did) and the spec no-tier control from S1-13 (11,720,212,480; the ns controls are the S1-9 bytes).
 
 
 ## 6. Determinism (G5)
@@ -323,4 +323,4 @@ The draft KV groups (detected from `kv_cache_spec.is_draft` or `KVCacheGroupSpec
 `verdict_gate.py` is NOT changed and still evaluates the old D4; the D4' verdict is the chk JSON.
 
 **Gate inputs after phase 3 (2026-11-11).** `env/offload.env` is itself a frozen gate input; its md5 in `ADOPTION_RULE_FINAL_AMENDMENT3.md5` was re-recorded when the 0.33.0-derived values of sections 4a and 5a replaced the 0.32.0 ones (P* 51,814,072,320 B; GPU bytes 11,645,337,600 / 16,854,810,624 / 17,257,267,200), before any 0.33.0 gate boot.
-All other pinned tools (`bench/s110/*`, `env/host.env`, `env/spec_k7.env`) are unchanged. The frozen drivers keep their 0.32.0 byte literals; the phase 4 drivers take the offload-on bytes from `env/offload.env`.
+All other pinned tools (`bench/s110/*`, `env/host.env`, `env/spec_k7.env`) are unchanged. The frozen drivers keep their 0.32.0 byte literals (`master_det.sh` line 46 expects them while its ON arm reads `$MUSE_OFFLOAD_KV_BYTES`; `master_gate.sh` lines 44-46 likewise); no phase 4 driver exists yet: the phase 4 drivers have to be copies that take the offload-on bytes from `env/offload.env`, with their own md5s recorded before the first boot.
