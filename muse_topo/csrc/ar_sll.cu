@@ -182,13 +182,17 @@ __global__ void __launch_bounds__(512) ar1_kernel(const Ctx c, const uint4* __re
 // Algorithm 2: 3-phase reduce-scatter style. Slice j of the message (np/4 packs) belongs to island rank
 // owners[j]. (a) push slice j to its owner, (b) the owner forms P_I[slice], exchanges it (fp32) with its partner
 // (same slice index in the other island) and computes out[slice], (c) the owner pushes out[slice] to the island.
+// BX (bf16 inputs only, the opt-in bf16 exchange of large.cu): both island partials are rounded to bf16 before the
+// final add, so the partner exchange carries one 16 B pack per input pack instead of two and the socket cut, the
+// bottleneck of the medium sizes, carries half the bytes. Every element is computed exactly like the BX path of the
+// large algorithm (large.cu: rs_body), so the two give the same bits.
 // ----------------------------------------------------------------------------------------------
-template <int D, int U>
+template <int D, int U, bool BX>
 __global__ void __launch_bounds__(512) ar2_kernel(const Ctx c, const uint4* __restrict__ in, uint4* __restrict__ out,
                                                   int sp) {
   constexpr int EPW = Tr<D>::EPW;
   constexpr int EL = 4 * EPW;
-  constexpr int PK = EPW;
+  constexpr int PK = BX ? 1 : EPW;  // exchanged packs per input pack
   uint32_t old;
   const uint64_t e = epoch_begin(c, old);
   const int par = e & 1;
@@ -273,16 +277,28 @@ __global__ void __launch_bounds__(512) ar2_kernel(const Ctx c, const uint4* __re
 #pragma unroll
     for (int k = 0; k < U; ++k) {
       const int i = i0 + k * stride;
-      uint32_t w[EL];
+      if constexpr (BX) {
+        // both partials are rounded to bf16 (the partner receives the rounded one, I keep the rounded one); the fp32
+        // canonicalization comes first, exactly as in rs_body of large.cu
 #pragma unroll
-      for (int j = 0; j < EL; ++j) {
-        w[j] = canon(__float_as_uint(p[k][j]));
-        p[k][j] = __uint_as_float(w[j]);
+        for (int j = 0; j < EL; ++j) p[k][j] = __uint_as_float(canon(__float_as_uint(p[k][j])));
+        const uint4 q = canon(pack_pack<D>(p[k]));
+        if (i < sp) st_v4(txb + i, q);
+        unpack_pack<D>(q, p[k]);
+      } else {
+        uint32_t w[EL];
+#pragma unroll
+        for (int j = 0; j < EL; ++j) {
+          w[j] = canon(__float_as_uint(p[k][j]));
+          p[k][j] = __uint_as_float(w[j]);
+        }
+        if (i < sp) {
+#pragma unroll
+          for (int j = 0; j < PK; ++j)
+            st_v4(txb + (int64_t)PK * i + j, make_uint4(w[4 * j], w[4 * j + 1], w[4 * j + 2], w[4 * j + 3]));
+        }
       }
       if (i < sp) {
-#pragma unroll
-        for (int j = 0; j < PK; ++j)
-          st_v4(txb + (int64_t)PK * i + j, make_uint4(w[4 * j], w[4 * j + 1], w[4 * j + 2], w[4 * j + 3]));
 #pragma unroll
         for (int q = 0; q < 4; ++q)
           if (q != ip) st_v4(rxa + q * sa + i, sent4());
@@ -325,16 +341,24 @@ __global__ void __launch_bounds__(512) ar2_kernel(const Ctx c, const uint4* __re
       y[k] = sent4();
       if (i < sp) {
         float res[EL];
+        if constexpr (BX) {
+          float qv[EL];
+          unpack_pack<D>(r[k][0], qv);
 #pragma unroll
-        for (int j = 0; j < PK; ++j) {
-          const uint32_t qw[4] = {r[k][j].x, r[k][j].y, r[k][j].z, r[k][j].w};
+          for (int m = 0; m < EL; ++m) res[m] = (c.island == 0) ? (p[k][m] + qv[m]) : (qv[m] + p[k][m]);
+          st_v4(rxb + i, sent4());
+        } else {
 #pragma unroll
-          for (int m = 0; m < 4; ++m) {
-            const float qv = __uint_as_float(qw[m]);
-            const float pv = p[k][4 * j + m];
-            res[4 * j + m] = (c.island == 0) ? (pv + qv) : (qv + pv);
+          for (int j = 0; j < PK; ++j) {
+            const uint32_t qw[4] = {r[k][j].x, r[k][j].y, r[k][j].z, r[k][j].w};
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+              const float qv = __uint_as_float(qw[m]);
+              const float pv = p[k][4 * j + m];
+              res[4 * j + m] = (c.island == 0) ? (pv + qv) : (qv + pv);
+            }
+            st_v4(rxb + (int64_t)PK * i + j, sent4());
           }
-          st_v4(rxb + (int64_t)PK * i + j, sent4());
         }
         y[k] = canon(pack_pack<D>(res));
         out[(int64_t)op * sp + i] = y[k];
@@ -396,9 +420,13 @@ template <int D, int U>
 static void run_ar1(const Ctx& c, const void* in, void* out, int np, int grid, int block, cudaStream_t s) {
   launch_k(ar1_kernel<D, U>, c, grid, block, s, c, static_cast<const uint4*>(in), static_cast<uint4*>(out), np);
 }
-template <int D, int U>
+template <int D, int U, bool BX>
 static void run_ar2(const Ctx& c, const void* in, void* out, int sp, int grid, int block, cudaStream_t s) {
-  launch_k(ar2_kernel<D, U>, c, grid, block, s, c, static_cast<const uint4*>(in), static_cast<uint4*>(out), sp);
+  launch_k(ar2_kernel<D, U, BX>, c, grid, block, s, c, static_cast<const uint4*>(in), static_cast<uint4*>(out), sp);
+}
+template <int D, int U>
+static void run_ar2_exact(const Ctx& c, const void* in, void* out, int sp, int grid, int block, cudaStream_t s) {
+  run_ar2<D, U, false>(c, in, out, sp, grid, block, s);
 }
 
 #define DISPATCH_DU(FN, ...)                                \
@@ -433,9 +461,17 @@ void launch_ar1(const Ctx& c, int dtype, const void* in, void* out, int64_t nbyt
 }
 
 void launch_ar2(const Ctx& c, int dtype, const void* in, void* out, int64_t nbytes, int grid, int block, int unroll,
-                cudaStream_t s) {
+                int bx, cudaStream_t s) {
   const int sp = static_cast<int>(nbytes >> 6);  // packs per slice
-  DISPATCH_DU(run_ar2, c, in, out, sp, grid, block, s);
+  if (bx && dtype == kBF16) {
+    switch (unroll) {
+      case 1: run_ar2<kBF16, 1, true>(c, in, out, sp, grid, block, s); break;
+      case 2: run_ar2<kBF16, 2, true>(c, in, out, sp, grid, block, s); break;
+      default: run_ar2<kBF16, 4, true>(c, in, out, sp, grid, block, s); break;
+    }
+    return;
+  }
+  DISPATCH_DU(run_ar2_exact, c, in, out, sp, grid, block, s);
 }
 
 }  // namespace muse_topo

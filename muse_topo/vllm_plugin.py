@@ -71,6 +71,10 @@ Environment (all optional):
 ``MUSE_TOPO_LARGE_BF16_EXCHANGE``  1 (opt-in, class deterministic_different): the large all-reduce / reduce_scatter
                              exchange both island partials rounded to bf16 (bf16 inputs only; fp16 / fp32 keep the exact
                              exchange); default 0 (exact fp32 partials). Batch invariant only inside the large algorithm
+``MUSE_TOPO_MEDIUM_BX``      0 keeps the exact fp32 exchange for the all-reduces below ``ar_large_min_bx`` (2 MiB) when
+                             ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1``; default 1: those bf16 all-reduces from
+                             ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES`` bytes on use the bf16 exchange as well (algorithm 2 with
+                             rounded island partials, r3c; same bits as the large algorithm, class deterministic_different)
 ``MUSE_TOPO_FUSED``          0 disables the fused collective + epilogue kernels (``TopoComm.supports_boundary_rows``
                              then declines every batch and the model runs the two steps); default 1
 ``MUSE_TOPO_LOG_OPS``        0 (default): the per-op summary goes to the debug log; 1: info log on group rank 0;
@@ -227,11 +231,14 @@ def _attach(self, routed: frozenset[str]) -> None:
     self.topo_trace = _OpTrace(self.rank)
     self.topo_ops = routed
     logger.info("muse_topo plugin: TopoComm active for group %s on rank %d (ops=%s, timeout %.0f s, workspace %.1f "
-                "MiB, max all_reduce of the medium path %d B, large algorithms %s, large bf16 exchange %s)",
+                "MiB, max all_reduce of the medium path %d B, large algorithms %s, large bf16 exchange %s, medium bf16 "
+                "exchange %s)",
                 self.unique_name, self.rank, ",".join(sorted(routed)), kwargs["timeout_s"],
                 getattr(comm, "workspace_bytes", 0) / 2**20, getattr(comm, "max_bytes", 0),
                 "on" if getattr(comm, "large", False) else "off",
-                "ON (deterministic_different)" if getattr(comm, "bf16_exchange", False) else "off")
+                "ON (deterministic_different)" if getattr(comm, "bf16_exchange", False) else "off",
+                "from %d B" % comm.ar_bx_min if getattr(comm, "bf16_exchange", False) and getattr(comm, "medium_bx", False)
+                else "off")
 
 
 # ------------------------------------------------------------------------------------------------

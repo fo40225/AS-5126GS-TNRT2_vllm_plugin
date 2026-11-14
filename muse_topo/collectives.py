@@ -99,6 +99,9 @@ _AR_TABLE = [
     (4194304, 2, 8, 256, 1),
     (1 << 62, 2, 4, 256, 2),
 ]
+# all_reduce with the bf16 exchange of the island partials (algorithm 2 only, bf16 inputs, used from _AR_BX_MIN bytes when the
+# bf16 exchange is on); same row format. PLACEHOLDER: the exact-exchange configurations until the sweep has run.
+_AR_BX_TABLE = list(_AR_TABLE)
 _AG_TABLES = {
     0: [  # layout 0: dim = -1 (column concatenation)
         (1024, 1, 2, 128, 1),
@@ -157,6 +160,8 @@ _AGL_TABLE = [
 # 90.2 (a tie), 2 MiB 120.4 vs 115.8, 2.5 MiB 150.9 vs 143.0, 3 MiB 179.3 vs 169.2: the crossover is at 2 MiB. The full-model EP8 runs
 # (docs/h2_vllm_plugin.md) confirm the tables end to end.
 _AR_LARGE_MIN = 2 << 20  # messages below use the H1a algorithms (up to max_bytes): they win at 1 MiB (61.3 vs 63.6 us)
+_AR_BX_MIN = 64 << 10  # bf16 all-reduces from this size on use the bf16 exchange of algorithm 2 (when it is on)
+_AR_LARGE_MIN_BX = 2 << 20  # ... and the large algorithm from this size on
 _RS_MIN_BYTES = 128 << 10
 _AG_LARGE_MIN = 256 << 10  # shards from this size on use the large engine instead of the H1a flag path (10.4 vs 11.4 us at 128 KiB)
 _LARGE_MAX_BYTES = 2 << 30
@@ -224,6 +229,11 @@ class TopoComm:
         self.bf16_exchange = (os.environ.get("MUSE_TOPO_LARGE_BF16_EXCHANGE", "0") == "1"
                               if bf16_exchange is None else bool(bf16_exchange))
         self.ar_large_min = _AR_LARGE_MIN
+        self.medium_bx = os.environ.get("MUSE_TOPO_MEDIUM_BX", "1") != "0"
+        self.ar_bx_min = int(os.environ.get("MUSE_TOPO_MEDIUM_BX_MIN_BYTES", _AR_BX_MIN))
+        self.ar_large_min_bx = _AR_LARGE_MIN_BX
+        self.ar_bx_table = _AR_BX_TABLE
+        self._load_tuning_file(os.environ.get("MUSE_TOPO_AR_TUNING_FILE", ""))
         self.ag_large_min = _AG_LARGE_MIN
         self.rs_min_bytes = _RS_MIN_BYTES
         self._closed = True
@@ -288,6 +298,24 @@ class TopoComm:
         self._strict_stream = os.environ.get("MUSE_TOPO_STRICT_STREAM", "0") == "1"
         logger.info("muse_topo active on rank %d (island %d, partner %d, workspace %.1f MiB): %s", rank, i.island,
                     i.partner, self.workspace_bytes / 2**20, i.summary)
+
+    def _load_tuning_file(self, path: str) -> None:
+        """Experiment hook (bench/make_table_medium.py writes the file): JSON with optional keys ``bx_table`` (rows of
+        _AR_BX_TABLE), ``bx_min`` (bytes) and ``large_min_bx`` (bytes). Must be the same on every rank."""
+        if not path:
+            return
+        import json
+
+        with open(path) as f:
+            t = json.load(f)
+        if "bx_table" in t:
+            self.ar_bx_table = [tuple(int(v) for v in row) for row in t["bx_table"]]
+        if "bx_min" in t and "MUSE_TOPO_MEDIUM_BX_MIN_BYTES" not in os.environ:
+            self.ar_bx_min = int(t["bx_min"])
+        if "large_min_bx" in t:
+            self.ar_large_min_bx = int(t["large_min_bx"])
+        logger.info("muse_topo: all_reduce tuning from %s (bx_min %d, large_min_bx %d, %d table rows)", path,
+                    self.ar_bx_min, self.ar_large_min_bx, len(self.ar_bx_table))
 
     # ------------------------------------------------------------------------------------------------
     def _agree(self, cpu_group, reason: str, what: str, exc: BaseException | None = None) -> None:
@@ -418,15 +446,25 @@ class TopoComm:
         self._order_stream()
         x, out, user_out = self._stage(x, out)
         nbytes = x.numel() * x.element_size()
-        if self._large_ok(nbytes) and (nbytes > self.max_bytes or nbytes >= self.ar_large_min):
+        large_ar = self.ar_large_min_bx if self._medium_bx(x, nbytes) else self.ar_large_min
+        if self._large_ok(nbytes) and (nbytes > self.max_bytes or nbytes >= large_ar):
             self._note("all_reduce", x, "large")
             _, mode, ch, rg, ag, blk, un, crs, cag = _pick(_AR_LARGE_TABLE, nbytes)
             return self._unstage(self._all_reduce_large(x, out, mode, ch, rg, ag, blk, un, None, crs, cag), user_out)
+        if self._medium_bx(x, nbytes):
+            algo, grid, block, unroll = _pick(self.ar_bx_table, nbytes)[1:]
+            self._note("all_reduce", x, "2bx")
+            return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out, bx=True), user_out)
         algo, grid, block, unroll = _pick(_AR_TABLE, nbytes)[1:]
         self._note("all_reduce", x, algo)
         return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out), user_out)
 
-    def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None):
+    def _medium_bx(self, x: torch.Tensor, nbytes: int) -> bool:
+        """Whether this all_reduce takes the bf16 exchange of the medium algorithm (bf16 input, the size window of
+        ``ar_bx_min`` and up); a function of dtype and size only, so it is the same on every rank."""
+        return self.bf16_exchange and self.medium_bx and x.dtype == torch.bfloat16 and nbytes >= self.ar_bx_min
+
+    def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None, bx=False):
         if out is None:
             out = torch.empty_like(x)
         nbytes = x.numel() * x.element_size()
@@ -435,7 +473,7 @@ class TopoComm:
             grid = max(1, min(max_grid, items))
         if grid is None:
             grid = max(1, min(max_grid, _cdiv(items, block * unroll)))
-        self._c.all_reduce(x, out, algo, grid, block, unroll)
+        self._c.all_reduce(x, out, algo, grid, block, unroll, int(bool(bx) and x.dtype == torch.bfloat16))
         return out
 
     # ------------------------------------------------------------------------------------------------

@@ -112,8 +112,9 @@ inline WsLayout make_layout(int64_t max_bytes, int64_t a1_max, int64_t g_max, in
 // Launch entry points (implemented in the .cu files, called from bindings.cpp).
 void launch_ar1(const Ctx& c, int dtype, const void* in, void* out, int64_t nbytes, int grid, int block,
                 int unroll, cudaStream_t s);
+// bx = 1 (bf16 inputs only): the opt-in bf16 exchange of the island partials (ar_sll.cu), else the exact fp32 exchange.
 void launch_ar2(const Ctx& c, int dtype, const void* in, void* out, int64_t nbytes, int grid, int block,
-                int unroll, cudaStream_t s);
+                int unroll, int bx, cudaStream_t s);
 void launch_ag_ll(const Ctx& c, const void* in, void* out, int64_t shard_bytes, int64_t row_bytes, int layout,
                   int grid, int block, int unroll, cudaStream_t s);
 // All-reduce of bf16 [T, 8192] fused with the residual boundary of boundary.cuh (T <= 64, one CTA per row).

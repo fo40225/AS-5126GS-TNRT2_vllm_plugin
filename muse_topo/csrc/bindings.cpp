@@ -320,19 +320,21 @@ struct Comm {
     CK(cudaGetLastError());
   }
 
-  void all_reduce(const at::Tensor& x, at::Tensor out, int algo, int grid, int block, int unroll) {
+  void all_reduce(const at::Tensor& x, at::Tensor out, int algo, int grid, int block, int unroll, int bx) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && out.is_contiguous() && out.sizes() == x.sizes(), "bad tensors");
     c10::cuda::CUDAGuard g(x.device());
     const int64_t nbytes = x.numel() * x.element_size();
     const int dt = dtype_code(x);
     cudaStream_t s = at::cuda::getCurrentCUDAStream();
     check_geometry(algo == 3 ? 1024 : 512, grid, block, unroll);
+    TORCH_CHECK(!bx || algo == 2, "bf16 exchange is only defined for all-reduce algorithm 2");
     if (algo == 1) {
       TORCH_CHECK(nbytes % 16 == 0 && nbytes <= c.L.a1_slot, "ar1: size not supported");
       launch_ar1(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, s);
     } else if (algo == 2) {
       TORCH_CHECK(nbytes % 64 == 0 && nbytes / 4 <= c.L.a2_slot, "ar2: size not supported");
-      launch_ar2(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, s);
+      TORCH_CHECK(!bx || dt == kBF16, "bf16 exchange is only defined for bf16 inputs");
+      launch_ar2(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, unroll, bx, s);
     } else if (algo == 3) {
       TORCH_CHECK(nbytes % 64 == 0 && nbytes / 4 <= c.L.a2_slot && grid <= kMaxBlocks, "ar2 flag: size not supported");
       launch_ar2_flag(c, dt, x.data_ptr(), out.data_ptr(), nbytes, grid, block, s);
@@ -503,7 +505,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<Comm>(m, "Comm")
       .def(py::init<int, int, int, int, int, std::vector<std::vector<int>>, std::vector<int>, std::vector<int>,
                     std::vector<int64_t>, int64_t, int64_t, int64_t, int64_t, double, int>())
-      .def("all_reduce", &Comm::all_reduce)
+      .def("all_reduce", &Comm::all_reduce, py::arg("x"), py::arg("out"), py::arg("algo"), py::arg("grid"),
+           py::arg("block"), py::arg("unroll"), py::arg("bx") = 0)
       .def("all_reduce_boundary", &Comm::all_reduce_boundary)
       .def("all_gather_boundary", &Comm::all_gather_boundary)
       .def("all_gather_rmsnorm", &Comm::all_gather_rmsnorm)
