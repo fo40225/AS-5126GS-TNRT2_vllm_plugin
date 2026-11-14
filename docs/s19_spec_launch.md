@@ -505,3 +505,40 @@ cap FAILS by default (the control arm of the A/B is checked with `SPEC_EXPECT_MN
 
 **Status.** Implemented on host branch `s114-mnst`; adoption is decided by the pre-registered S1-14 A/B (`muse_wf/specs/S1-14_v033_regressions.md`, F2 cells: 32k cold prefill wall, 64k wall, cold tok/s; guards 8192 wall, mixed churn,
 AL, KV blocks, GPU MiB at READY).
+
+## S1-10R Phase 0: the speculative profile runs with the fused boundary off (`VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`), 2026-11-11
+
+**Question.** S1-14 F1 (the communicator-fused boundaries kept on SM120 beside FlashInfer's dual norm, vLLM `0261903b9e`) left one unattributed number: speculative c1 real greedy -3.5 % with AL 4.856 -> 4.671 on 16 replayed prompts
+(z = 2.06). Pre-registered in `muse_wf/specs/S1-10R_regate_v033.md` (Phase 0) before measuring: arms FB1 = production, FB0 = production + launch env `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`, one boot per arm
+(greedy is run-to-run identical), c1 greedy, gsm80 and mtbench80 (the sd harness data), `max_tokens` 256, acceptance from accepted / drafted counts, z = (rate_FB1 - rate_FB0) / SE per dataset,
+two-sided Bonferroni over the 2 cells (z_crit 2.24); set FB0 in `env/spec_k7.env` if FB1 is significantly lower in either cell AND no spec target step runs with T < 8.
+
+**Result** (production trees: vLLM `0261903b9e`, host `3192c6dd77`, spec profile with the bytes 11,720,212,480, mnbt 8199, mnst 8192; `check_spec_launch.sh` rc 0 for both boots; 80 requests per dataset, `cache_salt` per request):
+
+| dataset | FB1 accepted / drafted (AL, c1 tok/s) | FB0 accepted / drafted (AL, c1 tok/s) | z (FB1 - FB0) |
+|---|---|---|---|
+| gsm80 | 16440 / 28980 (4.971, 253.9) | 16441 / 29050 (4.962, 255.9) | +0.32 |
+| mtbench80 | 15594 / 34944 (4.124, 231.4) | 15653 / 34328 (4.192, 238.4) | **-2.57** (< -2.24: FB1 significantly lower) |
+
+c1 tok/s with FB0: +0.8 % (gsm80), +3.0 % (mtbench80), informational (FB1 booted first, FB0 second). Greedy output is not identical across the arms (drafts gsm80 4140 vs 4150, mtbench80 4992 vs 4904): the switch changes the
+numerics at rounding level (accuracy policy: allowed). The z test treats the steps as independent, while the steps of one request are correlated, so the true SE is larger than the binomial one; the rule was applied as written.
+
+**T >= 8 evidence (code plus metrics).** `draft_tokens / drafts` = 7.000 exactly in all four cells (every verify step carried 7 drafts = 8 rows per request); per request `completion_tokens <= 1 + verify_steps + accepted`
+for all 320 requests (a plain T = 1 target step would add a token without a histogram entry; none occurred; the largest overshoot, 7, is the last verify step at full T = 8 truncated at `max_tokens`); the scheduler does not clamp the
+spec tokens by `max_tokens` (`scheduler.py` ~808) and pads decode requests to 1 + K rows (~1310-1325). The fused decode boundaries (the pooler all-gather / unpooler boundary epilogues of `ops/fused_boundary.py`, decode T <= 8
+in the host communicator) therefore have no speed role in the speculative launch (S1-14 F1 itself gave spec c1 +0.05 %), while the non-speculative lines (T = 1 per request) keep them.
+
+**Decision.** `SET_FUSED_BOUNDARY_0_IN_SPEC`: `env/spec_k7.env` exports `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0` (a preset value is kept with `:=`, so `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1` before sourcing gives the FB1 arm of an A/B).
+`env/host.env` does not touch the variable, so the non-speculative lines (ns128, ns256) keep the vLLM default 1 = the S1-14 F1 behaviour; the speculative profile is the only place that sets it.
+
+**KV bytes.** Not re-derived: 11,720,212,480 was derived (S1-13) with the fused boundary on. The FB0 boot of the A/B ran at these bytes (READY GPU memory 94,139 MiB against 94,133 MiB with FB1) and served the 160 requests without
+errors; the S1-7 stress was not repeated for FB0. FB0 takes the cuBLAS GEMV + `comm.all_reduce` path (`docs/r2d_fused_epilogue.md`, `docs/r3c_medium_ar.md`); its S_live margin is unmeasured, and the S1-7 stress of S1-10R Phase 3
+(which derives the ON-tier bytes of this profile anyway) is the place to cover it.
+
+**Check.** The model and the communicator log nothing about this switch (`vllm/envs.py` reads it into the `fuses_boundary_collectives` attributes at construction), so `scripts/check_spec_launch.sh` cannot read it from `serve.log`. It reads
+the environment snapshot next to the log, an `env.txt` (the S1-10R drivers write `env | grep -E '^(MUSE_|VLLM_MUSE|NCCL_|VLLM_PLUGINS)'` there): `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1>` is the state, a snapshot that lists other
+`VLLM_MUSE_SPARK_` variables but not this one means unset = the vLLM default 1, no snapshot means unverified. `SPEC_EXPECT_FB=0|1` demands the state and FAILS when it cannot be confirmed; without it the expectation is the value exported
+in the checking shell (a shell that sourced `env/spec_k7.env` expects 0) and is compared only when a snapshot exists. A value other than 0 / 1 in the snapshot FAILS. The OK line ends in `mnst=8192 fb=<0|1|unverified>`.
+`bench/test_check_spec_launch.sh` covers snapshots with 0, 1, unset, empty and invalid values, the explicit and the shell expectation, and the profile file (FB0 default, preset kept, `host.env` untouched).
+
+**Status.** Implemented on host branch `s110r-fb0` (from main `3192c6dd77`); takes effect on the server with the host deploy (the vLLM tree is unchanged).

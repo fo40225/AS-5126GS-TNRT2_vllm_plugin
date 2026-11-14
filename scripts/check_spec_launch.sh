@@ -43,6 +43,11 @@
 # S1-14 F2 (scheduled-token cap): the profile also carries --max-num-scheduled-tokens 8192 (MUSE_SPEC_MNST of env/spec_k7.env; the DFlash drafter has 0 slots on vLLM 0.33.0, so without the cap the chunks are 8199 tokens). The cap
 # is read from vLLM's startup line "non-default args: {... 'max_num_scheduled_tokens': <n> ...}" and, next to a harness serve_cmd.txt, from the flag. SPEC_EXPECT_MNST=<n> (default: this shell's MUSE_SPEC_MNST, else 8192) | off|0 (no cap, the plain port) demands the state. Every "non-default args" line of the log (a relaunch
 # appended to serve.log, a second API server) must carry the cap. The KV bytes are expected not to depend on the cap (max_num_batched_tokens stays 8199; to be verified by the S1-14 A/B), and no KV token number is checked.
+# S1-10R Phase 0 (fused boundary): env/spec_k7.env exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 (spec only). The model and the communicator log NOTHING about this switch (vllm/envs.py reads it
+# into the fuses_boundary_collectives attributes of the layers, no log line), so the state cannot come from the serve.log. It is read from the environment snapshot a harness writes next to the log:
+# an env.txt (output of `env | grep -E '^(MUSE_|VLLM_MUSE|NCCL_|VLLM_PLUGINS)'`, as the S1-10R drivers write it); a line VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=<0|1> is the state, a snapshot that has other
+# VLLM_MUSE_SPARK_ lines but not this one means "unset" = the vLLM default 1. No env.txt (or one without any VLLM_MUSE_SPARK_ line) = unverified. SPEC_EXPECT_FB=0|1 demands the state (FAIL when it
+# cannot be confirmed); without it the expectation is the value exported in the checking shell (a shell that sourced env/spec_k7.env expects 0) and is only compared when the snapshot exists.
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
@@ -267,5 +272,31 @@ else
     echo "FAIL serve_cmd.txt has no --max-num-scheduled-tokens $mnst"; rc=1
   fi
 fi
-[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt mnst=$mnst$cap_bytes_note ($pool)"
+# fused boundary (S1-10R Phase 0): nothing is logged by the model, the state comes from the env.txt snapshot next to the log
+fb=unverified
+fb_file=$(dirname "$log")/env.txt
+if [ -r "$fb_file" ]; then
+  fb_raw=$(grep -a -E '^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=' "$fb_file" | tail -1 | sed -E 's/^[^=]*=//')
+  if grep -a -q -E '^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=' "$fb_file"; then
+    case "$fb_raw" in
+      0|1) fb=$fb_raw ;;
+      *) echo "FAIL $fb_file has VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY='$fb_raw' (not 0 or 1)"; rc=1; fb=invalid ;;
+    esac
+  elif grep -a -q -E '^VLLM_MUSE_SPARK_' "$fb_file"; then
+    fb=1   # unset in a snapshot that lists the other VLLM_MUSE_SPARK_ variables: the vLLM default
+  fi
+fi
+case "${SPEC_EXPECT_FB:-}" in ""|0|1) ;; *) echo "check_spec_launch: SPEC_EXPECT_FB must be 0 or 1, got '$SPEC_EXPECT_FB'" >&2; exit 2 ;; esac
+want_fb=${SPEC_EXPECT_FB:-}
+if [ -z "$want_fb" ]; then
+  case "${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-}" in 0|1) [ "$fb" != unverified ] && want_fb=$VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY ;; esac
+fi
+if [ -n "$want_fb" ] && [ "$fb" != invalid ] && [ "$fb" != "$want_fb" ]; then
+  if [ "$fb" = unverified ]; then
+    echo "FAIL the fused boundary state cannot be confirmed: no env.txt with VLLM_MUSE_SPARK_ variables next to $log, SPEC_EXPECT_FB=$want_fb demanded"; rc=1
+  else
+    echo "FAIL the fused boundary (VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY) is $fb in $fb_file, expected $want_fb"; rc=1
+  fi
+fi
+[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt mnst=$mnst fb=$fb$cap_bytes_note ($pool)"
 exit $rc

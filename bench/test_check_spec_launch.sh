@@ -1,6 +1,6 @@
 #!/bin/bash
 # Regression test of scripts/check_spec_launch.sh (S1-9 L11: the graph-floor line, the cap > 256 bytes rule and the default floor of a
-# larger capture list, S1-14 F2: the scheduled-token cap) on synthetic boot logs. No GPU, no vLLM: usage  bash bench/test_check_spec_launch.sh   Exit 0 = all cases as expected.
+# larger capture list, S1-14 F2: the scheduled-token cap, S1-10R Phase 0: the fused boundary state) on synthetic boot logs. No GPU, no vLLM: usage  bash bench/test_check_spec_launch.sh   Exit 0 = all cases as expected.
 here=$(cd "$(dirname "$0")/.." && pwd)
 check=$here/scripts/check_spec_launch.sh
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
@@ -162,5 +162,38 @@ for v in 8k -5 9000; do
 done
 got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=4096 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
 if [ "$got" = "11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 4096" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=4096 overrides the cap, profile bytes are not coupled to MUSE_SPEC_MNST"; else echo "FAIL spec_k7.env MNST=4096: got '$got'"; fails=$((fails+1)); fi
+# S1-10R Phase 0: the fused boundary state comes from an env.txt snapshot next to the log (the model logs nothing about it)
+fbenv() { mkdir -p "$d/$1"; cp "$d/prod/serve.log" "$d/prod/serve_cmd.txt" "$d/$1/"; printf '%s\n' "${@:2}" > "$d/$1/env.txt"; }
+fbenv fb0 'MUSE_SPEC_KV_BYTES=11720212480' 'VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2' 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0'
+fbenv fb1 'MUSE_SPEC_KV_BYTES=11720212480' 'VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2' 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1'
+fbenv fbunset 'MUSE_SPEC_KV_BYTES=11720212480' 'VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2'
+fbenv fbempty 'MUSE_TOPO_ENABLE=1' 'NCCL_GRAPH_FILE=/x'
+fbenv fbbad 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=maybe'
+run fb0 0 "env.txt FB=0, no expectation" -- "$d/fb0/serve.log"
+run fb0 0 "env.txt FB=0, 0 demanded" SPEC_EXPECT_FB=0 -- "$d/fb0/serve.log"
+run fb0 1 "env.txt FB=0, 1 demanded" SPEC_EXPECT_FB=1 -- "$d/fb0/serve.log"
+run fb0 0 "env.txt FB=0, shell that sourced the profile exports 0" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 -- "$d/fb0/serve.log"
+run fb0 1 "env.txt FB=0, shell exports 1 (FB1 control checked as the profile)" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1 -- "$d/fb0/serve.log"
+run fb1 0 "env.txt FB=1 (FB1 arm), 1 demanded" SPEC_EXPECT_FB=1 -- "$d/fb1/serve.log"
+run fb1 1 "env.txt FB=1, the profile default 0 exported in the shell" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 -- "$d/fb1/serve.log"
+run fb1 0 "env.txt FB=1, SPEC_EXPECT_FB=1 wins over the shell value 0" SPEC_EXPECT_FB=1 VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 -- "$d/fb1/serve.log"
+run fbunset 0 "env.txt without the variable = vLLM default 1, 1 demanded" SPEC_EXPECT_FB=1 -- "$d/fbunset/serve.log"
+run fbunset 1 "env.txt without the variable = default 1, 0 demanded (profile not sourced)" SPEC_EXPECT_FB=0 -- "$d/fbunset/serve.log"
+run fbunset 1 "env.txt without the variable, the shell exports 0" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 -- "$d/fbunset/serve.log"
+run fbempty 1 "env.txt with no VLLM_MUSE_SPARK_ line cannot confirm, 0 demanded" SPEC_EXPECT_FB=0 -- "$d/fbempty/serve.log"
+run fbempty 0 "env.txt with no VLLM_MUSE_SPARK_ line, only the shell value: not compared" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 -- "$d/fbempty/serve.log"
+run fbbad 1 "env.txt FB value not 0 or 1" -- "$d/fbbad/serve.log"
+run prod 1 "no env.txt, 0 demanded: cannot be confirmed" SPEC_EXPECT_FB=0 -- "$d/prod/serve.log"
+run prod 0 "no env.txt, shell exports 0 (the sourced profile): not compared" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 -- "$d/prod/serve.log"
+run prod 2 "garbage SPEC_EXPECT_FB" SPEC_EXPECT_FB=on -- "$d/prod/serve.log"
+out=$(env -i PATH="$PATH" bash "$check" "$d/fb0/serve.log" 2>&1); if echo "$out" | grep -q 'mnst=8192 fb=0'; then echo "ok   the OK line carries fb=0"; else echo "FAIL OK line: $out"; fails=$((fails+1)); fi
+out=$(env -i PATH="$PATH" bash "$check" "$d/prod/serve.log" 2>&1); if echo "$out" | grep -q 'mnst=8192 fb=unverified'; then echo "ok   the OK line says fb=unverified without an env.txt"; else echo "FAIL OK line: $out"; fails=$((fails+1)); fi
+# env/spec_k7.env: FB0 for the speculative profile only, a preset value is kept; host.env does not touch the variable
+got=$(env -i PATH="$PATH" bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-unset}" 2>&1)
+if [ "$got" = "0" ]; then echo "ok   spec_k7.env: the speculative profile exports VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0"; else echo "FAIL spec_k7.env FB default: got '$got' wanted 0"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1 bash -c "source $here/env/spec_k7.env; env | grep ^VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=" 2>&1)
+if [ "$got" = "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1" ]; then echo "ok   spec_k7.env: a preset FB=1 is kept and exported (the FB1 arm of an A/B)"; else echo "FAIL spec_k7.env FB preset: got '$got'"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" bash -c "source $here/env/host.env; echo \${VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY:-unset}" 2>&1)
+if [ "$got" = "unset" ]; then echo "ok   host.env (non-speculative lines): the fused boundary variable stays unset = vLLM default 1"; else echo "FAIL host.env FB: got '$got'"; fails=$((fails+1)); fi
 [ $fails = 0 ] && echo "ALL CASES PASSED" || echo "$fails case(s) FAILED"
 exit $((fails > 0))
