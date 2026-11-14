@@ -200,6 +200,81 @@ lighthouse"); the model starts its reply with its native `to=self` analysis chan
 word the analysis differently after a few tokens (the topo all-reduce is the fp32 sum with a single final rounding, NCCL's bf16 ring rounds at every hop,
 so near-tied logits flip), which is the expected effect of the `more_accurate` class, not a defect.
 
+## Microbatched prefill (vLLM `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP`, default ON, `=0` turns it off; track r2e, 2026-10-24)
+
+Prefill of one 8192-token chunk (real weights, plugin, no SP) is 1323 ms of which 735 ms are collectives that run serially
+with 584 ms of compute. The branch can split an eager batch of >= 2050 tokens into two microbatches (V2 runner, one thread
+per microbatch, attention metadata per microbatch, the second one starts mid-request) that alternate at the TP collectives:
+the collective of one microbatch runs on a high-priority comm stream while the other one computes. The flag is ON by
+default (accuracy class `deterministic_different`: the halves change M of the cuBLAS GEMMs); decode and CUDA-graph batches are untouched.
+
+What the plugin has to know about it:
+
+* One `TopoComm` serves both streams. A spec idea was a second workspace for the comm stream; it is not needed: every collective
+  of an overlapped step goes on the one comm stream in the order the two threads hand off (the same on every rank), the call
+  counter is device state, and the hand-off events keep the collectives of consecutive steps (decode graph replays on the
+  main stream, overlapped prefill on the comm stream) totally ordered. `TopoComm._order_stream` only sees a stream change
+  between such steps (one warning per rank, benign). Two communicators could not add bandwidth either: the socket cut is the
+  bottleneck, and the large kernels are comm-bound (860 ms busy of 959 ms per 8192-token step, 66 % of it hidden).
+* The result of a collective that runs on the comm stream is allocated on the COMPUTE stream (`_output_stream`, `_alloc` in
+  `vllm_plugin.py`; the branch names the stream through `vllm.v1.worker.ubatching.dbo_collective_output_stream`). Allocated
+  on the comm stream it lives in a second allocator pool that the compute stream cannot reuse; on a GPU that is nearly full
+  (`--gpu-memory-utilization 0.95`) the caching allocator then frees and re-allocates its blocks every step (profile of an
+  8192-token step on rank 0: 202 cudaMalloc, 186 cudaFree, 365 cudaEventSynchronize, stalls of 17-29 ms on one rank after the
+  other, the others wait in the collective): 1292 ms per step against 1316 without overlap. With the result on the compute stream:
+  23 cudaMalloc, 959 ms.
+* The large kernels spin-wait on their peers, and now run beside GEMM / attention kernels: the comm stream has the highest
+  priority (default priority loses 14 %, -1 and -5 are the same), so that their blocks get an SM as soon as a compute block
+  retires. Kernels of the compute stream never wait for a collective of the other microbatch, so a delayed block only delays.
+
+Measured, real weights (SEED 9000 protocol of `scripts/locked_run_topo.sh`, pp t/s ctx10 / ctx50 / ctx90; branch `r2e-prefill-overlap`):
+
+| stream | without (fin_r_topo / fin_r_topo_sp) | with microbatching (`r2e_r_ov2` / `r2e_r_ov_sp`) | gain |
+|---|---|---|---|
+| replicated (no SP) | 6174 / 5934 / 5651 | 8240 / 7735 / 7155 | +33 / +30 / +27 % |
+| sequence parallel (`VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=1`) | 7709 / 7424 / 6986 | 8803 / 8406 / 7778 | +14 / +13 / +11 % |
+
+c1 512/128 stays 4057 (4072 without; 4452 vs 4470 with SP: below the threshold) and the decode TPOT stays 10.5-10.7 ms: a decode or
+CUDA-graph batch is never split.
+
+Single-request prefill latency (`bench/prefill_probe.py`, `scripts/prefill_chain.sh`, 1-token completions of random ids, mean of
+3 (2 at 64k), one server per row, dummy weights, replicated stream / sequence-parallel stream):
+
+| prompt tokens | 2100 | 4300 | 8192 | 16384 | 65536 |
+|---|---|---|---|---|---|
+| replicated, off | 0.349 s | 0.687 | 1.296 | 2.565 | 10.595 |
+| replicated, microbatched | 0.266 | 0.499 | 0.928 | 1.829 | 7.850 |
+| SP, off | 0.281 | 0.558 | 1.029 | 2.044 | 8.619 |
+| SP, microbatched | 0.253 | 0.467 | 0.877 | 1.729 | 7.333 |
+
+(`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS` below the floor of 2050 is raised to it: both halves must stay above the
+sequence-parallel minimum of the model so that the two threads issue the same number of collectives.)
+
+Tried and dropped (all dummy weights, 16384 tokens, replicated stream unless noted): block counts of the large kernels x0.5
+2.12 s (x1 1.86, x2 1.90; SP x2 1.86 vs 1.79); chunk 2 / 4 MiB per block 1.87 / 1.88 s (1 MiB 1.86); 48 KB of dynamic shared
+memory per block (to keep GEMM blocks off the SMs of the collective) 1.87 s, 64 and 96 KB do not launch; comm stream priority 0
+2.11 s; three / four microbatches 1.825 / 1.821 s at 16384 and 7.76 s at 65536 (two: 1.829 / 7.85; SP 1.722 / 1.703 and 7.15 against 1.729 and
+7.33), at most 2.5 % better beyond 16k tokens and 28 % slower at 2100 tokens (0.341 s against 0.266), so two stay the default; hand-off before the enqueue of the collective (the all2all users' order, one thread
+switch earlier) 2.66 s = no gain at all, because the collective then starts only after the CPU has enqueued the sibling's
+whole segment.
+
+Accuracy (real weights, `bench/e2e_overlap.py`: 21 prompts of 9..23000 tokens, mixed batches and chunked prefill, greedy,
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`; two passes per process, `nccl/compare.py`):
+
+* Run-to-run: with the flag on, pass 1 and pass 2 of one process are bitwise identical (21/21 requests, tokens, logprobs, prompt
+  logprobs) on both streams, and two processes with the flag on are bitwise identical on the replicated stream.
+* Against the unsplit batch (`deterministic_different`, rounding level): replicated 16/21 greedy continuations identical, the
+  sampled-token logprob differs by a median of 1.1e-4 (p90 0.048, p99 0.31) and the prompt-token logprobs by a median of 4e-6 (p99 0.28;
+  mean 0.0031 on tokens with logprob > -1); sequence parallel 16/21 identical, sampled-token median 5e-6 (p99 0.13). The same
+  comparison between the two unsplit streams (replicated against SP) gives 17/21. No rank differs: every TP rank sees the same
+  split (the batch is rank-uniform) and the plugin's collectives are rank-identical.
+* GSM8K smoke (`/raid/vllm-runtime/work/final/acc` harness, 200 items, two passes A / B, effort high, real weights): replicated 97.5 / 96.5 %
+  with the flag against 96.5 / 94.5 % without; sequence parallel 96.0 / 98.0 % with against 96.5 / 98.0 % without. No degradation.
+
+Reproduce: `flock -w 43200 /raid/vllm-runtime/sm120-dev/gpu.lock bash scripts/prefill_chain.sh <configs.txt>` with lines like
+`overlap|VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP=1`; `scripts/run_src_topo.sh` rows with the same variable in the environment;
+`runsrc_topo.sh bench/e2e_overlap.py out.json` (twice, the flag off and on) and `nccl/compare.py a.json b.json`.
+
 ## Limits and notes
 
 * KV sizing and the workspace (review correction): the 61 MiB workspace is allocated in `CudaCommunicator.__init__`, which runs inside
