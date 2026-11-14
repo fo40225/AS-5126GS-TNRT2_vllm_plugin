@@ -100,6 +100,13 @@ t "M3: MUSE_SPEC_GRAPH_CAP=512 with MUSE_OFFLOAD=0 and an operator override prin
   'export MUSE_OFFLOAD=0 MUSE_SPEC_GRAPH_CAP=512 MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520; source $E/spec_k7.env 2>&1 >/dev/null | grep -c "not derived"'
 t "A1: MUSE_OFFLOAD=0 keeps an operator MUSE_SPEC_KV_BYTES_OVERRIDE without offload.env (cap 384 launches)" "11346923520 11346923520" \
   'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520 MUSE_OFFLOAD=0; MUSE_SPEC_GRAPH_CAP=384 source $E/spec_k7.env; echo "${MUSE_SPEC_KV_BYTES_OVERRIDE:-} $MUSE_SPEC_KV_BYTES"'
+# S1-11 review minors (muse_wf/s1-10r/adoption_review_r2.json): m1 fixed in code, m3 / m4 closed by pinning the behaviour
+t "m1: a child shell that inherits the ON exports and runs ON again prints no 'discarded' NOTE (the value is the profile's own)" "0" \
+  'source $E/host.env; source $E/spec_k7.env; bash -c "source \$E/host.env; source \$E/spec_k7.env" 2>&1 >/dev/null | grep -c discarded'
+t "m1: an operator override that differs from the ON bytes still prints the NOTE (and is discarded)" "1 11645337600" \
+  'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520; n=$(source $E/spec_k7.env 2>&1 >/dev/null | grep -c discarded); source $E/spec_k7.env 2>/dev/null; echo "$n $MUSE_SPEC_KV_BYTES"'
+t "m1: the exports of a child ON-after-ON equal those of the parent (only the NOTE changed)" "same" \
+  'source $E/host.env; source $E/spec_k7.env; a=$(export -p | grep -v -E "SHLVL|_=" | sort | md5sum); b=$(bash -c "source \$E/host.env; source \$E/spec_k7.env; export -p" 2>/dev/null | grep -v -E "SHLVL|_=" | sort | md5sum); [ "$a" = "$b" ] && echo same || echo differ'
 # A3 literal proofs: every exported variable (export -p, sorted) of the default launch equals the gated order's; the OFF launch equals main 942acddc48's
 exps() { env -i PATH="$PATH" "${@:2}" bash -c "$1" 2>/dev/null | sort; }
 if [ "$(exps "source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "source $here/env/host.env; source $here/env/offload.env; source $here/env/spec_k7.env; export -p")" ]; then
