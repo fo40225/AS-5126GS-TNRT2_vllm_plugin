@@ -50,6 +50,9 @@ LENGTHS = [
 ]
 GEN_TOKENS = int(os.environ.get("E2E_GEN_TOKENS", "128"))
 LP_PROMPTS = 8   # `lp` pass: the first prompts with 600 .. 9100 tokens
+# The reset-retry probe must stay below one 16-token block: a full block would leave a finished-request store pending in the connector, and
+# Scheduler.reset_prefix_cache checks the GPU pool BEFORE the connector reset releases that store, so the next retry would pin the blocks again (livelock).
+RETRY_PROBE_TOKENS = 8
 
 
 def lp_dicts(lps):
@@ -149,7 +152,7 @@ def main():
         for i in range(40):
             if llm.reset_prefix_cache():
                 return i
-            llm.generate([{"prompt_token_ids": prompts[0][:16]}], SamplingParams(max_tokens=1), use_tqdm=False)
+            llm.generate([{"prompt_token_ids": prompts[0][:RETRY_PROBE_TOKENS]}], SamplingParams(max_tokens=1), use_tqdm=False)
             time.sleep(0.5)
         raise RuntimeError(f"GPU prefix cache reset kept failing before {tag}")
 
@@ -157,7 +160,7 @@ def main():
         for i in range(40):
             if llm.reset_prefix_cache(reset_connector=True):
                 return i
-            llm.generate([{"prompt_token_ids": prompts[0][:16]}], SamplingParams(max_tokens=1), use_tqdm=False)
+            llm.generate([{"prompt_token_ids": prompts[0][:RETRY_PROBE_TOKENS]}], SamplingParams(max_tokens=1), use_tqdm=False)
             time.sleep(0.5)
         raise RuntimeError(f"full prefix cache reset kept failing before {tag}")
 
