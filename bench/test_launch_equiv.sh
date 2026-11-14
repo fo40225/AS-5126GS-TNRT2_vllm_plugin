@@ -47,13 +47,17 @@ prove ns128_0 serve_nonspec.sh ns128 "ns128, MUSE_OFFLOAD=0 = S1-14 production p
 prove ns256_0 serve_nonspec.sh ns256 "ns256, MUSE_OFFLOAD=0 = 0.33.0 validation boot v033s3_ns256_1 (serve line)" MUSE_OFFLOAD=0
 dry ns256_off serve_nonspec.sh ns256 MUSE_OFFLOAD=0
 if norm "$d/ns256_off/env.txt" | cmp -s - "$ref/ns128_0.env.txt"; then ok "ns256 no tier: env.txt byte-equal to the S1-14 host.env-only record (ns128_0)"; else bad "ns256 no tier: env.txt vs the S1-14 record" "$(diff <(norm "$d/ns256_off/env.txt") "$ref/ns128_0.env.txt" | head -4)"; fi
-flags=$(sed -E 's/^[^ ]+ [^ ]+ flags //; s#host_topo_v033#host_topo#' "$ref/ns256_0.flags_line.txt")
-miss=0; for kv in $flags; do norm "$d/ns256_off/env.txt" | grep -q -x -F -- "$kv" || { miss=1; echo "    flags-line entry not in the script environment: $kv"; }; done
-extra=$(norm "$d/ns256_off/env.txt" | grep -v -x -F -f <(echo "$flags" | tr ' ' '\n') | tr '\n' ' ')
-# two extra variables, both explained: PYTHONPATH is outside the filter of that boot's flags line, VLLM_PLUGINS=muse_topo came with host a26c2be, after that boot
-if [ $miss = 0 ] && [ "$extra" = "PYTHONPATH=/raid/vllm-runtime/host_topo:/raid/vllm-runtime/sm120-dev/src VLLM_PLUGINS=muse_topo " ]; then
-  ok "ns256 no tier: every entry of the validation boot's flags line is in the environment; the extras are PYTHONPATH (not in that line's filter) and VLLM_PLUGINS=muse_topo (host a26c2be, after that boot)"
-else bad "ns256 no tier vs the validation flags line" "extra: '$extra'"; fi
+# the serve line of the newer S1-10R gate boot s110r_ns256_OFF_1 (host a26c2be+) is the same line
+if cmp -s "$d/ns256_off/serve_cmd.txt" "$ref/ns256_0b.serve_cmd.txt"; then ok "ns256 no tier: serve line byte-equal to the S1-10R gate boot s110r_ns256_OFF_1 too"; else bad "ns256 no tier: serve line vs s110r_ns256_OFF_1"; fi
+for fl in ns256_0 ns256_0b; do
+  flags=$(sed -E 's/^[^ ]+ [^ ]+ flags //; s#host_topo_v033#host_topo#; s#host_topo_s110r#host_topo#' "$ref/$fl.flags_line.txt")
+  miss=0; for kv in $flags; do norm "$d/ns256_off/env.txt" | grep -q -x -F -- "$kv" || { miss=1; echo "    flags-line entry not in the script environment: $kv"; }; done
+  extra=$(norm "$d/ns256_off/env.txt" | grep -v -x -F -f <(echo "$flags" | tr ' ' '\n') | tr '\n' ' ')
+  # the extras: PYTHONPATH is outside the filter of that boot's flags line; VLLM_PLUGINS is outside it too (set since host a26c2be, so not set in v033s3_ns256_1, set in s110r_ns256_OFF_1)
+  if [ $miss = 0 ] && [ "$extra" = "PYTHONPATH=/raid/vllm-runtime/host_topo:/raid/vllm-runtime/sm120-dev/src VLLM_PLUGINS=muse_topo " ]; then
+    ok "ns256 no tier: every entry of the flags line of $fl is in the environment; the extras are PYTHONPATH and VLLM_PLUGINS=muse_topo (not in that line's filter)"
+  else bad "ns256 no tier vs the flags line of $fl" "extra: '$extra'"; fi
+done
 # the scripts from a dirty calling shell give the same records (the scrub): the operator inputs MUSE_OFFLOAD aside, nothing inherited changes the launch
 dirty=(MUSE_SPEC_MNST=0 MUSE_SPEC_GRAPH_CAP=384 MUSE_TOPO_ENABLE=0 MUSE_OFFLOAD_PER_RANK_BYTES=1 MUSE_OFFLOAD_NUMA_BIND=0 MUSE_SPEC_KV_BYTES_OVERRIDE=1 MUSE_OFFLOAD_KV_BYTES_OVERRIDE=1
   VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 VLLM_MUSE_SPARK_SM120_DRAFT_FP8=0 VLLM_SERVER_DEV_MODE=0 SPEC_EXPECT_FB=0 NCCL_P2P_LEVEL=NVL NCCL_IB_DISABLE=0 NCCL_GRAPH_FILE=/x VLLM_PLUGINS=other _MUSE_X=1)
