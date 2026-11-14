@@ -9,8 +9,10 @@
 #   2. exports the runtime block of the gated boots (venv, caches, PYTHONPATH = host folder + vLLM tree) and sources env/host.env and the profile files;
 #   3. builds the serve line and writes serve_cmd.txt and env.txt exactly like the gated boots (printf %q of every argument; the same env filter);
 #   4. refuses to start when the GPUs are busy or, for a tier-ON launch, scripts/preflight_offload.sh fails;
-#   5. starts the server in its own session, waits for /health, saves the READY facts (cache_config_info.txt, pid_environ.txt, swap record);
-#   6. runs the post-boot checks. A failed check stops the server (its whole session) and exits 1, unless --keep-on-fail was given.
+#   5. starts the server in its own session (launch/lc_child.sh records the child's own pid / session / start time in server.sess after setsid), waits for /health, saves the
+#      READY facts (cache_config_info.txt, pid_environ.txt, swap record);
+#   6. runs the post-boot checks. A failed
+#      check stops the server (its recorded session) and exits 1, unless --keep-on-fail was given.
 # On success the server keeps running (detached, own session); stop it with launch/stop_server.sh <out dir>.
 #
 # Exit codes: 0 = READY and every check passed (server left running); 1 = a post-boot check failed (server stopped unless --keep-on-fail);
@@ -29,7 +31,12 @@
 #   MUSE_LAUNCH_SMI         nvidia-smi executable (default nvidia-smi)
 #   MUSE_LAUNCH_VENV        venv activate script (default $LAUNCH_DEV/.venv/bin/activate; `none` = do not activate, tests)
 #   MUSE_LAUNCH_STOP_ITERS  polls to wait for the TERM before the KILL (default 60), MUSE_LAUNCH_STOP_POLL_S seconds apart (default 2)
+#   MUSE_LAUNCH_SETSID      the setsid executable (default setsid; tests delay it to widen the race window of the session capture)
+#   MUSE_LAUNCH_SESS_WAIT_S seconds to wait for the server's own session record (default 30)
 #   MUSE_LAUNCH_GPU_TRIES   tries (MUSE_LAUNCH_GPU_WAIT_S = 5 s apart) for the GPUs to be free (< 2000 MiB in use in total) before the launch is refused (default 90)
+
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/session.sh"
 
 lc_usage() {
   echo "usage: $1 $([ "$2" = nonspec ] && echo "<ns128|ns256> ")[--out DIR] [--keep-on-fail] [--keep-env] [--dry-run]" >&2
@@ -63,6 +70,8 @@ lc_init() {
   LC_PREFLIGHT=${MUSE_LAUNCH_PREFLIGHT:-$LC_ROOT/scripts/preflight_offload.sh}
   LC_SMI=${MUSE_LAUNCH_SMI:-nvidia-smi}
   LC_VENV_IN=${MUSE_LAUNCH_VENV-}
+  LC_SETSID=${MUSE_LAUNCH_SETSID:-setsid}
+  LC_SESS_WAIT_S=${MUSE_LAUNCH_SESS_WAIT_S:-30}
   LC_STOP_ITERS=${MUSE_LAUNCH_STOP_ITERS:-60}
   LC_STOP_POLL_S=${MUSE_LAUNCH_STOP_POLL_S:-2}
   LC_GPU_TRIES=${MUSE_LAUNCH_GPU_TRIES:-90}
@@ -217,18 +226,44 @@ lc_gpus_free() {
   return 1
 }
 
-# lc_stop: TERM the server's session, then KILL it and its leftovers (never a pattern kill: the session id is ours)
+# lc_await_session: waits for the server's own session record (launch/lc_child.sh writes it after setsid); sets LC_SID from it. rc 0 recorded and plausible,
+# 1 the child died or no record appeared in time, 2 a record that is not a session of its own (the stop then signals the pid alone, never a group).
+lc_await_session() {
+  local n=$(( LC_SESS_WAIT_S * 10 )) i
+  for i in $(seq 1 "$n"); do
+    if sx_read_record "$LC_OUT/server.sess"; then
+      if [ "$SX_PID" = "$LC_SPID" ] && [ "$SX_SID" = "$SX_PID" ] && [ "$SX_PGRP" = "$SX_PID" ] && sx_guard "$SX_SID"; then LC_SID=$SX_SID; return 0; fi
+      LC_ODD_PID=$SX_PID
+      return 2
+    fi
+    kill -0 "$LC_SPID" 2> /dev/null || { sx_read_record "$LC_OUT/server.sess" && continue; return 1; }
+    sleep 0.1
+  done
+  return 1
+}
+
+# lc_kill_pid <pid>: TERM then KILL of one process we started, no group, no sweep (used when the server's session is not known)
+lc_kill_pid() {
+  local i
+  kill -TERM "$1" 2> /dev/null
+  for i in $(seq 1 "$LC_STOP_ITERS"); do kill -0 "$1" 2> /dev/null || return 0; sleep "$LC_STOP_POLL_S"; done
+  kill -KILL "$1" 2> /dev/null
+}
+
+# lc_stop: TERM the recorded server session, then KILL it and its leftovers (never a pattern kill). Only the session in $LC_OUT/server.sess is signalled, and only when
+# its leader is the recorded pid with the recorded start time and the session does not contain this launcher or its parent (launch/session.sh); without a usable
+# record only the pid we started is signalled.
 lc_stop() {
   [ -n "${LC_SPID:-}" ] || return 0
-  local sid=${LC_SID:-$LC_SPID} l i
-  kill -TERM -- "-$sid" 2> /dev/null
-  for i in $(seq 1 "$LC_STOP_ITERS"); do
-    kill -0 "$LC_SPID" 2> /dev/null || break
-    sleep "$LC_STOP_POLL_S"
-  done
-  kill -KILL -- "-$sid" 2> /dev/null
-  l=$(ps -eo pid,sid,pgid,args | awk -v g="$sid" '$2 == g || $3 == g {print $1}')
-  if [ -n "$l" ]; then kill -KILL $l 2> /dev/null; lc_log "KILLED leftovers of the session: $(echo $l)"; fi
+  local msg
+  if [ -n "${LC_SID:-}" ]; then
+    msg=$(sx_stop "$LC_OUT/server.sess" "$LC_STOP_ITERS" "$LC_STOP_POLL_S")
+    [ -n "$msg" ] && lc_log "STOP $(echo "$msg" | tr '\n' '|')"
+  else
+    lc_kill_pid "$LC_SPID"
+    [ -n "${LC_ODD_PID:-}" ] && [ "$LC_ODD_PID" != "$LC_SPID" ] && lc_kill_pid "$LC_ODD_PID"
+    lc_log "STOP no usable session record: signalled pid $LC_SPID only (no session or group)"
+  fi
   LC_STOPPED=1
   lc_gpus_free 90 || lc_log "WARN GPU memory still in use after the stop"
   lc_log "STOPPED gpu_used_mib=$(lc_gpus_used 2> /dev/null)"
@@ -294,12 +329,20 @@ lc_main() {
   LC_STOPPED=0; LC_ARMED=1; LC_NFAIL=0
   trap lc_on_exit EXIT
   trap 'lc_log "SIGNAL received"; lc_stop; echo "RESULT aborted signal" >> "$LC_STATUS"; exit 3' TERM INT HUP
-  (cd "$LC_OUT" && exec setsid "$LC_VLLM" "${LC_SERVE[@]:1}" > "$LC_OUT/serve.log" 2>&1 < /dev/null) &
+  rm -f "$LC_OUT/server.sess"
+  (cd "$LC_OUT" && exec "$LC_SETSID" bash "$LC_ROOT/launch/lc_child.sh" "$LC_OUT/server.sess" "$LC_VLLM" "${LC_SERVE[@]:1}" > "$LC_OUT/serve.log" 2>&1 < /dev/null) &
   LC_SPID=$!
   echo "$LC_SPID" > "$LC_OUT/serve.pid"
-  LC_SID=$(ps -o sid= -p "$LC_SPID" 2> /dev/null | tr -d ' ')
-  [ -n "$LC_SID" ] || LC_SID=$LC_SPID
-  [ "$LC_SID" = "$LC_SPID" ] || lc_log "WARN server pid $LC_SPID is not its session leader (sid $LC_SID): the stop uses the session id"
+  # the child records its own session after setsid; reading it with ps right after the fork could return this launcher's session
+  lc_await_session; local arc=$?
+  if [ $arc != 0 ]; then
+    lc_log "LAUNCHED pid=$LC_SPID out=$LC_OUT"
+    lc_log "SESSION_UNKNOWN rc=$arc: no usable session record of the server in ${LC_SESS_WAIT_S}s (child alive: $(kill -0 "$LC_SPID" 2> /dev/null && echo yes || echo no))"
+    lc_stop
+    echo "RESULT fail SESSION_UNKNOWN" >> "$LC_STATUS"
+    LC_ARMED=0
+    exit 3
+  fi
   lc_log "LAUNCHED pid=$LC_SPID sid=$LC_SID out=$LC_OUT"
   while :; do
     if curl -sf -o /dev/null "$url/health"; then state=READY; break; fi

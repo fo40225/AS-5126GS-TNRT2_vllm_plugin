@@ -159,6 +159,98 @@ expect_fail keep "--keep-on-fail: a failed check exits 1 and the server keeps ru
 pid=$(cat "$d/keep/serve.pid"); kill -0 "$pid" 2> /dev/null && bad "stop_server.sh stops the kept server" "pid $pid still running" || pass "stop_server.sh stopped the kept server"
 expect_fail keep2 "--keep-on-fail does not keep a server that never became healthy" 3 'TIMEOUT' 0 serve_spec.sh "" STUB_STATE=spec_1 STUB_MODE=hang MUSE_LAUNCH_READY_S=2 -- --keep-on-fail
 
+# ---- review r2 M2: the session of the server is the one the child recorded after setsid, never one read with ps before it ran
+sentinel_run() { # <name> <seconds to wait before a TERM or 0> <env assignments...>: the launcher runs in its own session next to a sentinel process of that session
+  local name=$1 term_after=$2; shift 2
+  rm -rf "${d:?}/$name" "${d:?}/$name.rc"; mkdir -p "$d/$name"
+  (setsid bash -c 'sleep 300 & echo $! > "$1/sentinel"; shift; exec "$@"' _ "$d/$name" env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" \
+    MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port \
+    STUB_MARK="$d/$name.mark" "$@" bash "$here/launch/serve_spec.sh" --out "$d/$name/out" > "$d/$name.stdout" 2>&1; echo $? > "$d/$name.rc") &
+  local bg=$!
+  if [ "$term_after" != 0 ]; then
+    for _ in $(seq 1 50); do [ -s "$d/$name/out/serve.pid" ] && break; sleep 0.1; done
+    sleep "$term_after"
+    local l; l=$(ps -eo pid,args | awk -v o="$d/$name/out" 'index($0, "serve_spec.sh") && index($0, o) && !index($0, "awk") {print $1; exit}')
+    [ -n "$l" ] && kill -TERM "$l"
+  fi
+  wait $bg
+  sent=$(cat "$d/$name/sentinel" 2> /dev/null)
+  sent_alive=no; kill -0 "$sent" 2> /dev/null && sent_alive=yes
+  [ -n "$sent" ] && kill "$sent" 2> /dev/null
+}
+# a late setsid (1.5 s): the old capture read the LAUNCHER's session id in that window
+sentinel_run race_ok 0 MUSE_LAUNCH_SETSID="$stub/slow_setsid" STUB_STATE=spec_1
+o=$d/race_ok/out; read -r rp rs rg rt < "$o/server.sess"
+if [ "$(cat "$d/race_ok.rc")" = 0 ] && [ "$(result race_ok/out | sed 's#.*##')" = "" ] && grep -q 'RESULT pass' "$o/status.txt" && [ "$rp" = "$(cat "$o/serve.pid")" ] && [ "$rs" = "$rp" ] && [ "$rg" = "$rp" ] \
+   && [ "$rs" != "$(ps -o sid= -p "$sent" 2> /dev/null | tr -d ' ')" ] && grep -q "LAUNCHED pid=$rp sid=$rp " "$o/status.txt" && [ "$sent_alive" = yes ]; then pass "M2: a late setsid: the launch passes, server.sess names the server's own session (pid = sid = pgrp), sentinel untouched"
+else bad "M2: late setsid, passing launch" "rc=$(cat "$d/race_ok.rc") record='$rp $rs $rg $rt' sentinel=$sent_alive $(grep -a -E 'LAUNCHED|RESULT' "$o/status.txt" | tr '\n' '|')"; fi
+bash "$here/launch/stop_server.sh" "$o" > /dev/null 2>&1
+alive_pid() { kill -0 "$1" 2> /dev/null && echo yes || echo no; }
+# the same late setsid on a failure path (the server dies right after READY would be due): the stop must hit the server's session only
+sentinel_run race_die 0 MUSE_LAUNCH_SETSID="$stub/slow_setsid" STUB_STATE=spec_1 STUB_MODE=die
+o=$d/race_die/out
+if [ "$(cat "$d/race_die.rc")" = 3 ] && grep -q 'RESULT fail DIED' "$o/status.txt" && [ "$sent_alive" = yes ] && [ "$(alive_pid "$(cat "$o/serve.pid")")" = no ]; then pass "M2: a late setsid and a server that dies: exit 3, the launcher's own session (sentinel) is untouched"
+else bad "M2: late setsid, failure path" "rc=$(cat "$d/race_die.rc") sentinel=$sent_alive $(grep -a -E 'LAUNCHED|STOP|RESULT' "$o/status.txt" | tr '\n' '|')"; fi
+sentinel_run race_hang 0 MUSE_LAUNCH_SETSID="$stub/slow_setsid" STUB_STATE=spec_1 STUB_MODE=hang MUSE_LAUNCH_READY_S=2
+o=$d/race_hang/out
+if [ "$(cat "$d/race_hang.rc")" = 3 ] && grep -q 'RESULT fail TIMEOUT' "$o/status.txt" && [ "$sent_alive" = yes ] && [ "$(alive_pid "$(cat "$o/serve.pid")")" = no ]; then pass "M2: a late setsid and a server that never becomes healthy: stopped, sentinel untouched"
+else bad "M2: late setsid, timeout path" "rc=$(cat "$d/race_hang.rc") sentinel=$sent_alive $(grep -a -E 'LAUNCHED|STOP|RESULT' "$o/status.txt" | tr '\n' '|')"; fi
+# TERM inside the setsid delay window (no session record yet): the child pid is signalled alone, nothing else
+sentinel_run race_term 0.5 MUSE_LAUNCH_SETSID="$stub/slow_setsid" STUB_SETSID_DELAY=4 STUB_STATE=spec_1 STUB_MODE=hang
+o=$d/race_term/out
+sleep 0.2
+if [ "$(cat "$d/race_term.rc")" = 3 ] && grep -q 'SIGNAL received' "$o/status.txt" && grep -q 'signalled pid .* only' "$o/status.txt" && [ "$sent_alive" = yes ] && [ "$(alive_pid "$(cat "$o/serve.pid")")" = no ] && [ ! -s "$d/race_term.mark" ]; then pass "M2: TERM inside the late-setsid window: exit 3, the child pid alone is stopped, no group signal, sentinel untouched, no server started"
+else bad "M2: TERM inside the setsid window" "rc=$(cat "$d/race_term.rc") sentinel=$sent_alive $(grep -a -E 'LAUNCHED|SIGNAL|STOP|RESULT' "$o/status.txt" | tr '\n' '|')"; fi
+# the launcher refuses a record that says the server is in the launcher's own session (setsid replaced by a no-op): the pid is stopped alone, the session of the launcher is not signalled
+printf '#!/bin/bash\nexec "$@"\n' > "$d/fake_setsid"; chmod +x "$d/fake_setsid"
+sentinel_run race_nosetsid 0 MUSE_LAUNCH_SETSID="$d/fake_setsid" STUB_STATE=spec_1 STUB_MODE=hang
+o=$d/race_nosetsid/out
+if [ "$(cat "$d/race_nosetsid.rc")" = 3 ] && grep -q 'SESSION_UNKNOWN' "$o/status.txt" && grep -q 'signalled pid .* only' "$o/status.txt" && [ "$sent_alive" = yes ] && [ "$(alive_pid "$(cat "$o/serve.pid")")" = no ]; then pass "M2: a server that is not in a session of its own is refused (SESSION_UNKNOWN, exit 3), only its pid is stopped, sentinel untouched"
+else bad "M2: no setsid" "rc=$(cat "$d/race_nosetsid.rc") sentinel=$sent_alive $(grep -a -E 'LAUNCHED|SESSION|STOP|RESULT' "$o/status.txt" | tr '\n' '|')"; fi
+
+# stop_server.sh: only a recorded session whose leader matches the recorded pid and start time, never a session that contains the caller
+mkdir -p "$d/ss1"
+setsid -f bash -c 'exec -a vllm_foreign sleep 120' < /dev/null > /dev/null 2>&1
+fpid=$(ps -eo pid,args | awk '$2 == "vllm_foreign" && $3 == "120" {print $1; exit}')
+if [ -n "$fpid" ]; then
+  fstart=$(sed -E 's/^.*\) //' "/proc/$fpid/stat" | awk '{print $20}'); fsid=$(ps -o sid= -p "$fpid" | tr -d ' ')
+  echo "$fpid" > "$d/ss1/serve.pid"
+  echo "$fpid $fsid $fsid $((fstart + 1))" > "$d/ss1/server.sess"
+  bash "$here/launch/stop_server.sh" "$d/ss1" > "$d/ss1.out" 2>&1; rc=$?
+  if [ $rc = 3 ] && kill -0 "$fpid" 2> /dev/null && grep -q 'not the recorded session leader' "$d/ss1.out"; then pass "stop_server.sh: a leader whose start time differs from the record (a recycled pid) is not signalled (exit 3)"
+  else bad "stop_server.sh with a wrong start time" "rc=$rc $(cat "$d/ss1.out")"; fi
+  echo "$fpid $fsid $fsid $fstart" > "$d/ss1/server.sess"
+  bash "$here/launch/stop_server.sh" "$d/ss1" > "$d/ss1.out" 2>&1; rc=$?
+  sleep 0.3
+  if [ $rc = 0 ] && ! kill -0 "$fpid" 2> /dev/null; then pass "stop_server.sh: the recorded session with the matching start time is stopped (exit 0)"
+  else bad "stop_server.sh with the right record" "rc=$rc $(cat "$d/ss1.out")"; kill "$fpid" 2> /dev/null; fi
+else bad "stop_server.sh tests: could not start the foreign process"; fi
+# a record that names the caller's own session (or its parent's) is refused whatever the process looks like
+mkdir -p "$d/ss2"
+(exec -a vllm_samesess sleep 120) &
+spid2=$!
+sleep 0.2
+mysid=$(ps -o sid= -p $$ | tr -d ' '); st2=$(sed -E 's/^.*\) //' "/proc/$spid2/stat" | awk '{print $20}')
+echo "$spid2" > "$d/ss2/serve.pid"; echo "$spid2 $mysid $mysid $st2" > "$d/ss2/server.sess"
+bash "$here/launch/stop_server.sh" "$d/ss2" > "$d/ss2.out" 2>&1; rc=$?
+if [ $rc = 3 ] && kill -0 "$spid2" 2> /dev/null && grep -q 'contains this script' "$d/ss2.out"; then pass "stop_server.sh: a session that contains the caller (or its parent) is never signalled (exit 3)"
+else bad "stop_server.sh with the caller's session" "rc=$rc $(cat "$d/ss2.out")"; fi
+kill "$spid2" 2> /dev/null
+# a session whose leader is gone but whose workers live on (a crashed API server): the orphans are cleaned one by one
+mkdir -p "$d/ss3"
+setsid bash "$here/launch/lc_child.sh" "$d/ss3/server.sess" bash -c '(exec -a vllm_orphan sleep 120 > /dev/null 2>&1 &) ; sleep 0.3; exit 0' < /dev/null > /dev/null 2>&1 &
+for _ in $(seq 1 30); do [ -s "$d/ss3/server.sess" ] && break; sleep 0.1; done
+wait $! 2> /dev/null
+sleep 0.2
+read -r lp _ < "$d/ss3/server.sess"; echo "$lp" > "$d/ss3/serve.pid"
+opid=$(ps -eo pid,args | awk '$2 == "vllm_orphan" {print $1; exit}')
+if [ -n "$opid" ] && ! kill -0 "$lp" 2> /dev/null; then
+  bash "$here/launch/stop_server.sh" "$d/ss3" > "$d/ss3.out" 2>&1; rc=$?
+  sleep 0.3
+  if [ $rc = 0 ] && ! kill -0 "$opid" 2> /dev/null; then pass "stop_server.sh: leader gone, the orphaned member of the recorded session is stopped"
+  else bad "stop_server.sh orphan cleanup" "rc=$rc $(cat "$d/ss3.out")"; kill "$opid" 2> /dev/null; fi
+else bad "stop_server.sh orphan setup" "orphan=$opid leader alive=$(kill -0 "$lp" 2> /dev/null && echo yes || echo no)"; [ -n "$opid" ] && kill "$opid" 2> /dev/null; fi
+
 # ---- --dry-run: the records only, no server
 run dry serve_spec.sh STUB_STATE=spec_1 -- --dry-run
 if [ $rc = 0 ] && [ ! -s "$d/dry.mark" ] && [ -s "$d/dry/serve_cmd.txt" ] && [ -s "$d/dry/env.txt" ] && [ ! -e "$d/dry/serve.pid" ] && [ "$(result dry)" = "RESULT dryrun" ]; then pass "--dry-run writes serve_cmd.txt and env.txt and starts nothing"

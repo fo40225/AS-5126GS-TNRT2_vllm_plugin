@@ -60,7 +60,8 @@ AS-5126GS-TNRT2_vllm_plugin/
 ├── launch/                      production launch scripts（S1-11，第 4.7 節）：
 │   ├── serve_spec.sh            speculative profile（tier 預設 ON，`MUSE_OFFLOAD=0` = 先前的 launch）
 │   ├── serve_nonspec.sh         `<ns128|ns256>`（ns256 tier 預設 ON，ns128 預設 OFF，`MUSE_OFFLOAD=1` / `0` 覆寫）
-│   ├── stop_server.sh           以 `serve.pid` 的 session 停止 launch 出來的 server
+│   ├── stop_server.sh           以 `server.sess`（server 自己在 setsid 之後記下的 pid / session / start time）停止 launch 出來的 server
+│   ├── session.sh / lc_child.sh session 的記錄與保護（lc_child.sh 在 setsid 之後記下自己的 session，再 exec server）
 │   └── lib.sh                   共用流程（清環境、source env 檔、serve line、preflight、等 READY、開機後檢查、錯誤時停 server）
 ├── scripts/
 │   ├── deploy_host.sh           本機 -> 伺服器 mirror 的 rsync（只同步本資料夾）
@@ -245,13 +246,13 @@ launch/serve_spec.sh --out /raid/vllm-runtime/work/launch/spec                  
 MUSE_OFFLOAD=0 launch/serve_spec.sh --out ...                                       # 沒有 tier
 launch/serve_nonspec.sh ns256 --out ...                                             # tier ON（預設）
 launch/serve_nonspec.sh ns128 --out ...                                             # 沒有 tier（預設）；MUSE_OFFLOAD=1 打開
-launch/stop_server.sh /raid/vllm-runtime/work/launch/spec                           # 停止（TERM 整個 session，再 KILL）
+launch/stop_server.sh /raid/vllm-runtime/work/launch/spec                           # 停止（TERM 記錄下來的 session，再 KILL；leader 的 pid + start time 必須與記錄相同，包含 launcher 或其 parent 的 session 永遠不送 signal）
 ```
 
 * 選項：`--out DIR`（輸出目錄，預設 `./launch_<profile>_tier<0|1>_<時間>`）、`--keep-on-fail`（檢查失敗時不停 server）、`--keep-env`（不清 calling shell 的 export，做實驗用）、`--dry-run`（只寫 `serve_cmd.txt` 與 `env.txt`，不碰 GPU / venv / preflight）。
   shared GPU 時把整個指令包在 `flock -w 43200 /raid/vllm-runtime/sm120-dev/gpu.lock ...` 裡：server 會繼承 lock 的 fd，所以 lock 直到 server 結束才釋放。
 * 結束碼：0 = READY 且所有檢查通過（server 留著繼續跑）；1 = 開機後檢查失敗（除非 `--keep-on-fail`，server 已停止）；2 = 拒絕啟動（輸入錯誤、GPU 忙、preflight 失敗、env 檔錯誤，什麼都沒啟動）；3 = server 一直沒有 READY（死掉、逾時或被中斷，已停止）；64 = 用法錯誤。
-* 輸出目錄：`serve_cmd.txt`、`env.txt`（與 gated boot 同樣的寫法與 filter）、`serve.log`、`serve.pid`、`status.txt`（最後一行 `RESULT ...`）、`preflight.txt`、`cache_config_info.txt`（`/metrics` 的 `vllm:cache_config_info`，block 數只在這裡）、`pid_cmdline.txt`、`pid_environ.txt`、`pid_environ_expected.txt`、`clean_ref/`（clean shell 的 dry run）、`gpu_mem_ready.txt`、`check_*.txt`。
+* 輸出目錄：`serve_cmd.txt`、`env.txt`（與 gated boot 同樣的寫法與 filter）、`serve.log`、`serve.pid`、`server.sess`（`<pid> <sid> <pgrp> <start time>`，由 server 自己的 child process 在 setsid 之後寫入）、`status.txt`（最後一行 `RESULT ...`）、`preflight.txt`、`cache_config_info.txt`（`/metrics` 的 `vllm:cache_config_info`，block 數只在這裡）、`pid_cmdline.txt`、`pid_environ.txt`、`pid_environ_expected.txt`、`clean_ref/`（clean shell 的 dry run）、`gpu_mem_ready.txt`、`check_*.txt`。
   `status.txt` 有 swap 紀錄（launch / READY 的 swap used、`pswpin` / `pswpout` 差）。
 * 開機後檢查（任何一個失敗都是失敗）：`env`（server process 的 live environ 經過與 gated boot 的 `pid_environ.txt` 相同的 filter，必須與 clean shell（`env -i`，只帶 `MUSE_OFFLOAD`）dry run 推導出的 `clean_ref/pid_environ_expected.txt` 逐行相同；`--keep-env` 時改比 calling shell 自己的紀錄，status.txt 有 `KEEP_ENV` 行）、speculative：`SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD=$MUSE_OFFLOAD scripts/check_spec_launch.sh`、`scripts/check_offload_launch.sh`、`scripts/check_kv_launch.sh spec <1|0>`；
   non-speculative：`scripts/check_offload_launch.sh`（tier OFF 時 `MUSE_OFFLOAD_EXPECT=off`）與 `scripts/check_kv_launch.sh <ns128|ns256> <1|0>`（`--kv-cache-memory-bytes`、`--max-num-seqs`、ns256 的 capture cap 256 / ns128 無 cap、

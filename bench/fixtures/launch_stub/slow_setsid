@@ -1,0 +1,5 @@
+#!/bin/bash
+# setsid that starts late (STUB_SETSID_DELAY seconds, default 1.5): the window in which the child still runs in the launcher's session
+# (bench/test_launch_flow.sh, review r2 M2). Used through MUSE_LAUNCH_SETSID.
+sleep "${STUB_SETSID_DELAY:-1.5}"
+exec setsid "$@"
