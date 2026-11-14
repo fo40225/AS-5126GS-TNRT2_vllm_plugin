@@ -54,7 +54,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 ├── muse_topo-0.1.dist-info/     entry_points.txt：[vllm.general_plugins] muse_topo = muse_topo.vllm_plugin:register
 │                                （放在 PYTHONPATH 上就會被 vLLM 找到，不需要 pip install）
 ├── env/host.env                 主機環境變數：NCCL_P2P_LEVEL=SYS、MUSE_TOPO_ENABLE=1、bf16 exchange 與 NCCL graph file（2026-10-24 起預設 ON），其他選項以註解列出
-├── env/spec_k7.env              speculative decoding（RadixArk DFlash2 K=7）專用的 launch profile：`--max-cudagraph-capture-size 256` 搭配 `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`，另設 `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1`（S1-9 lever 2：speculative 下的 prefill microbatch overlap，opt-in），並提供該組合的 exact KV bytes `MUSE_SPEC_KV_BYTES=10373877760`（1,460,755 tokens；旗標與 bytes 必須成對，未設旗標的 speculative launch 維持 10526351360；只在 host.env 之後 source，見 `docs/s19_spec_launch.md`）
+├── env/spec_k7.env              speculative decoding（RadixArk DFlash2 K=7）專用的 launch profile：`--max-cudagraph-capture-size 256` 搭配 `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`，另設 `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1`（S1-9 lever 2：speculative 下的 prefill microbatch overlap，opt-in），另 export `VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2`（S1-9 L4：DFlash2 aux projection 由 target forward 在各 rank 的 rows 上做，vLLM 預設），並提供該組合的 exact KV bytes `MUSE_SPEC_KV_BYTES=11134914560`（1,567,918 tokens；旗標為 2 時才用，否則 10373877760 = 1,460,755 tokens；旗標與 bytes 必須成對，由 `check_spec_launch.sh` 檢查，未設 r2e 旗標的 speculative launch 維持 10526351360；只在 host.env 之後 source，見 `docs/s19_spec_launch.md`）
 ├── scripts/
 │   ├── deploy_host.sh           本機 -> 伺服器 mirror 的 rsync（只同步本資料夾）
 │   ├── run_src_topo.sh          /raid/vllm-runtime/musetest/run_src.sh 的副本：把本資料夾加進 PYTHONPATH、source env/host.env，

@@ -5,7 +5,10 @@ Launch-scoped, no vLLM code change: `env/spec_k7.env` (sourced after `env/host.e
 5b827b215a (0ffa57b714 plus the SP test file, the runtime code is identical) + this folder.
 
 **S1-9 lever 2 (the microbatched prefill beside the drafter, "r2e") is part of this profile since 2026-11-01**: `env/spec_k7.env` also sets
-`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1` and the KV bytes are now **10,373,877,760** (1,460,755 tokens per rank). See the section "S1-9 lever 2" at the end of this file.
+`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1` and the KV bytes were **10,373,877,760** (1,460,755 tokens per rank). See the section "S1-9 lever 2" at the end of this file.
+
+**S1-9 L4 (the DFlash2 aux projection on each rank's rows, `VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2`, the vLLM default) moves the bytes to 11,134,914,560** (543,697 blocks = 1,567,918 tokens per rank, +7.3 %):
+`env/spec_k7.env` exports the flag and sets `MUSE_SPEC_KV_BYTES` from it (11,134,914,560 with the flag at 2, 10,373,877,760 otherwise). See the section "S1-9 L4" at the end of this file.
 
 ## What it changes
 
@@ -42,13 +45,13 @@ requests), graph pool 2.11 -> 1.22 GiB per rank. Non-speculative launches, `envs
 
 The stage C line (`/tmp/muse_wf/s1-8/stageC/RESULTS.md` Part 5.3) plus the two settings and the KV bytes re-derived for this graph set:
 
-    source $HOST_DIR/env/host.env; source $HOST_DIR/env/spec_k7.env     # MIN_TOKENS=384, r2e opt-in, MUSE_SPEC_SERVE_ARGS, MUSE_SPEC_KV_BYTES=10373877760
+    source $HOST_DIR/env/host.env; source $HOST_DIR/env/spec_k7.env     # MIN_TOKENS=384, r2e opt-in, FC_SHARD=2, MUSE_SPEC_SERVE_ARGS, MUSE_SPEC_KV_BYTES=11134914560 (10373877760 before S1-9 L4)
     vllm serve unsloth/Muse-Spark-Open-816B-A42B-NVFP4 --tensor-parallel-size 8 --max-model-len 131072 --gpu-memory-utilization 0.95 \
       --enable-expert-parallel --max-num-seqs 128 --kv-cache-dtype fp8 --quantization modelopt_fp4 ... --speculative-config '<RadixArk K=7, block, probabilistic>' \
       --per-request-spec-decode-metrics detailed $MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES
 
-i.e. `--max-cudagraph-capture-size 256 --kv-cache-memory-bytes 10373877760` (506,537 blocks = 1,460,755 KV tokens per rank, 11.14x "maximum concurrency for
-131,072 tokens per request") and the env `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384` + `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1` (lever 2; with the
+i.e. `--max-cudagraph-capture-size 256 --kv-cache-memory-bytes 11134914560` since S1-9 L4 (543,697 blocks = 1,567,918 KV tokens per rank, 11.96x "maximum concurrency for 131,072 tokens per request";
+10373877760 = 506,537 blocks = 1,460,755 tokens, 11.14x, before L4 and for any launch whose log lacks "the aux projection runs in the target's forward") and the env `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384` + `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1` (lever 2; with the
 lever-1-only profile the bytes were 10,526,351,360 = 513,982 blocks = 1,482,225 tokens, the value of every launch that does NOT set the opt-in). The bytes are valid without `prompt_logprobs` / `echo` (S1-7 section 4: a
 chunked prompt_logprobs request can kill the engine at the gate tier); a deployment that must accept them drops `--kv-cache-memory-bytes` (util-0.95 default pool, not PLL-tested for
 this profile). Without this profile (default capture list) the S1-7 value stays 9,676,390,400.
@@ -183,3 +186,35 @@ also those without a prompt of 2050 tokens or more (none of whose rows move).
 that needs its own S1-7 derivation. (2) The drafter's attention groups build one metadata builder set instead of two (no visible change of the idle footprint: 93,629 against 93,627 MiB). (3) The microbatches share the experts' scratch because, under expert parallelism, no collective reads scratch rows and the prepare/finalize does not yield inside the expert op; both are asserted.
 (4) Launch lines of the other speculative rows are unchanged: do not source `env/spec_k7.env` for them.
 
+## S1-9 L4: the DFlash2 aux projection on each rank's rows (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2)
+
+Status: the A/B passed every performance criterion of the pre-registered rule and the pairing below is implemented, but the rule's per-cell acceptance-length guard failed on two default-sampling cells
+(a zero-variance replay artifact, see "Gate"); the merge of the vLLM branch `muse/s19-draftshard` (head 0b6bf921fe) and of this folder's branch `s19-l4` waits for that decision. Until then the production launch stays at 10,373,877,760.
+
+**What.** The RadixArk DFlash2 draft's aux fc ([5 x 8192 -> 8192], 671 MB, replicated) ran in the propose step on all rows of the verify batch or prefill chunk, after the target had all-gathered its 5 aux taps under the
+sequence-parallel stream (5 gathers of 3.3 ms per 8185-token chunk, the fc 19.6 ms). With `FC_SHARD=2` the target's forward runs it where the taps are made: each rank projects its own T / 8 rows with the full weight and ONE
+[T / 8, 8192] gather replaces the 5 tap gathers; below the SP floor (decode, inside the FULL graph) every rank projects all rows with its 1/8 slice of the output rows of the weight and gathers. Draft numerics only (another GEMM tiling,
+identical on all ranks); the rejection sampler keeps the output distribution. `FC_SHARD=1` (column-sharded weight, -563 MiB) is an opt-in memory alternative, unmeasured in the A/B. The kernel-projection shard and the early seq-lens fetch of the
+implementer's profile sessions are not in the tree (no measured gain).
+
+**Bytes (S1-7 procedure, probe tree, REPS = 2, stress A1 B C1 C2 D H I L X with the eligible mix).** At 10,373,877,760: clean, idle free 3,893.4 MiB (3,623.4 before: +270), live growth 1,813.2 MiB (2,269.0 before: the prefill transient
+shrinks, 456 MiB), **S_live 2,080.2 MiB**. Rule: step up by 725.8 MiB to **11,134,914,560** (543,697 blocks, 1,567,918 tokens per rank, +107,163 = +7.3 %): clean, **S_live 1,354.2 MiB** (floor 1,256), 0 errors / mismatches / preemptions / OOM,
+1 retry. The flag and the bytes are ONE property: with the flag at 0 (or an older tree, or a fallback) the larger value leaves S_live of ~630 MiB. `env/spec_k7.env` derives the bytes from the flag and `scripts/check_spec_launch.sh` fails a boot
+whose log lacks the success line "the aux projection runs in the target's forward (...DRAFT_FC_SHARD=2)" while serve_cmd.txt carries more than 10,373,877,760 (a launch that sets the flag but falls back logs "DRAFT_FC_SHARD=2 does not apply").
+
+**Gate (one lock hold, boots OFF ON CTL OFF ON OFF ON; OFF = flag 0 at 10,373,877,760, ON = default 2 at 11,134,914,560, CTL = the production tree, same job; all boots cfgcheck OK, 0 preemptions).**
+out tok/s, ON vs OFF (3 sessions per arm, Welch 2.78 x se): real-prompt greedy c64 / c128 +3.20 % / +3.81 %, default sampling c64 / c128 +3.32 % / +3.82 % (pooled primary score **+3.54 %**), c1 +1.75 % (greedy) / +0.09 % (default),
+c16 +1.74 % / +3.68 %, c32 +1.30 % / +3.13 %, greedy c40 (the eager non-SP band) +2.57 %, t1k64 c16 / c64 +2.36 % / +2.21 %. Natural 8192-token prompts (prefill side): c16 +4.08 %, c64 +3.58 %, c1 +2.89 % (pooled c16 + c64 **+3.83 %**), TTFT p50 of one
+8192 / 16384 / 32768-token request 787 -> 755 ms (**-4.0 %**), 1,556 -> 1,491 (-4.2 %), 3,154 -> 3,025 (-4.1 %), TPOT at c16 -3.5 %. The control: OFF vs the production tree -0.03 % (and bit-identical AL at c1): the flags-off code is production.
+Acceptance length: draft-weighted mean ON - OFF over 16 cells **+0.000** (z 0.0). The two cells that failed the pre-registered per-cell AL guard ("<= -0.05 AND beyond noise", Welch with se floored at 0.15 %) are default sampling c1 (-0.128) and c32 (-0.055):
+the three sessions of an arm replay one realization (unseeded requests take the same np.random seed stream in every boot: at c1 every OFF and CTL session has AL 4.7791 / 4.6930 for the two reps and every ON session 4.5014 / 4.7154, sd 0), so the test
+compares two single draws of 24 / 128 requests; with a sampling error from the accept counts they are z = -1.29 and -1.23, and no cell is at z <= -2.9 (post hoc, `AL_ANALYSIS.txt` in the L4 scratch).
+
+**Accuracy / determinism.** GSM8K 200x2 at c64 with speculation: ON greedy 191 + 198 = 389/400 = 97.25 % (band 95.5-98.0), ON default sampling 197 + 197 = 394/400 = 98.5 %; OFF greedy 389/400 = 97.25 %, OFF default 392/400 = 98.0 %; 0 errors.
+Determinism (offline TP8 + EP8, production profile, 85 prompts, 128 tokens): two cold ON processes identical 85/85 for greedy and for seeded t1k64 in both passes, pass 1 vs pass 2 identical 85/85 in every process; OFF vs ON is diagnostic only
+(draft numerics differ at rounding level): greedy 35/85 identical, seeded 20/85.
+
+**Non-speculative guard** (production tree vs the L4 tree, ns128 at 16,688,807,936, 2 sessions per arm, no speculator so the aux projection is inert): mix greedy c1 / c64 -0.71 % / +0.14 %, t1k64 c1 / c64 -0.46 % / +0.15 %,
+natural 8192-token c16 -0.05 %, all within noise, 0 preemptions.
+**Tests** (tree 0b6bf921fe, the gated tree): SP 8-GPU file 77, r2e 8-GPU file 61, the DFlash2 shard file 26 with the host plugin and 26 with NCCL (it includes the real `MuseSpark1xModel.forward` with the combiner under SP batches of 512 / 1024 / 8185 tokens and
+r2e microbatch splits, checked row by row against the projection of the taps), Muse suite 3645 passed / 198 skipped, tests/v1/spec_decode failing set identical to production (100).

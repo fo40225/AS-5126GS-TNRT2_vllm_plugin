@@ -13,6 +13,11 @@
 # batches of at least <n> tokens run as 2 microbatches ..." when the overlap is active (VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1 of the
 # profile); next to a harness serve_cmd.txt the --kv-cache-memory-bytes must then not exceed R2E_ON_MAX_BYTES (10,373,877,760), and without the
 # overlap not R2E_OFF_MAX_BYTES (10,526,351,360). SPEC_EXPECT_R2E=on|off additionally demands the state (default: either, paired).
+# S1-9 L4: the same pairing for the DFlash2 aux projection on each rank's rows (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2, the vLLM default since the L4 merge; env/spec_k7.env
+# exports it). The branch logs "the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2)" when it runs; a launch that sets the flag but cannot
+# apply it logs "DRAFT_FC_SHARD=2 does not apply" and no success line, and is NOT a flag-on launch (FAIL here). The projection moves ~726 MiB of the stress transients and
+# idle memory per rank, so an r2e-on launch with it may carry --kv-cache-memory-bytes up to FCSHARD_ON_MAX_BYTES (11,134,914,560); without it (flag 0, an older tree, a
+# fallback) at most R2E_ON_MAX_BYTES (10,373,877,760: with the larger value S_live falls to ~630 MiB, under the 1,256 MiB floor). SPEC_EXPECT_FCSHARD=on|off demands the state.
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
@@ -44,14 +49,27 @@ grep -a -q -E 'prefill batches of at least [0-9]+ tokens run as [0-9]+ microbatc
 if [ -n "${SPEC_EXPECT_R2E:-}" ] && [ "$SPEC_EXPECT_R2E" != "$r2e" ]; then
   echo "FAIL prefill overlap (r2e) is $r2e in the log, expected $SPEC_EXPECT_R2E"; rc=1
 fi
+# aux projection state of the boot (S1-9 L4)
+FCSHARD_ON_MAX_BYTES=${FCSHARD_ON_MAX_BYTES:-11134914560}
+fcs=off
+grep -a -q "the aux projection runs in the target's forward" "$log" && fcs=on
+if grep -a -q "DRAFT_FC_SHARD=2 does not apply" "$log"; then
+  echo "FAIL the aux projection fell back to the propose step (DRAFT_FC_SHARD=2 does not apply): not a flag-on launch"; rc=1
+fi
+if [ -n "${SPEC_EXPECT_FCSHARD:-}" ] && [ "$SPEC_EXPECT_FCSHARD" != "$fcs" ]; then
+  echo "FAIL aux projection on the target's rows is $fcs in the log, expected $SPEC_EXPECT_FCSHARD"; rc=1
+fi
 if [ -r "$cmd" ]; then
   bytes=$(grep -a -o -E -e '--kv-cache-memory-bytes[ =][0-9]+' "$cmd" | head -1 | grep -o -E '[0-9]+$')
   if [ -n "$bytes" ]; then
-    max=$R2E_OFF_MAX_BYTES; [ "$r2e" = on ] && max=$R2E_ON_MAX_BYTES
+    max=$R2E_OFF_MAX_BYTES
+    if [ "$r2e" = on ]; then
+      max=$R2E_ON_MAX_BYTES; [ "$fcs" = on ] && max=$FCSHARD_ON_MAX_BYTES
+    fi
     if [ "$bytes" -gt "$max" ]; then
-      echo "FAIL r2e $r2e with --kv-cache-memory-bytes $bytes > $max (the exact bytes are derived per r2e state)"; rc=1
+      echo "FAIL r2e $r2e, aux projection on the target's rows $fcs, with --kv-cache-memory-bytes $bytes > $max (the exact bytes are derived per state: without the projection on the target's rows, unset flag 0 or an older tree, at most $R2E_ON_MAX_BYTES)"; rc=1
     fi
   fi
 fi
-[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap r2e=$r2e ($pool)"
+[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap r2e=$r2e fcshard=$fcs ($pool)"
 exit $rc
