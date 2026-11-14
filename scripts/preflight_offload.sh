@@ -9,16 +9,18 @@
 #                                                              0.3 GiB shmem each) and, on node 3 the EngineCore (1.2 GiB), on node 7 the API server (1.3 GiB)
 #   LEFT_N  = A_N - NEED_N                                     predicted reclaimable memory left once the server is up
 # FAIL (exit 1) when any LEFT_N < MUSE_OFFLOAD_MIN_LEFT_MIB (default 4,096: the floor of the original G3 guard); WARN when LEFT_N < the margin M = 6.6 GiB of the
-# sizing formula (docs/s110_numa_offload.md section 4). Measured with the shipped 45 GiB tier on node 7: 10.4 GiB left at READY.
+# sizing formula (docs/s110_numa_offload.md section 4). Measured with the 0.32.0 45 GiB tier on node 7: 10.4 GiB left at READY (the 0.33.0 tier P* is 48.26 GiB per rank, node 7 binds it).
 # Only a server of ours may be running: workers already up are counted in neither A_N nor W_N here (a second server would make the numbers meaningless).
 # OOM protection (not done here): start the server session with `echo 1000 > /proc/self/oom_score_adj` so that an OOM kill of this launch hits the server and
 # never a foreign process (the S1-10 harness did this for every process of its session).
-# 0.32.0-DERIVED (S1-10R): the default per-rank bytes (45 GiB), the margin M = 6.6 GiB and the W_N process footprints (workers 3.7 GiB anon + 0.3 GiB shmem, EngineCore 1.2 GiB,
-# API server 1.3 GiB) are 2026-11-07 measurements on the 0.32.0 line, before three reboots and the NIC mode change; S1-10R phase 3 re-measures A_N and the footprints on 0.33.0.
+# 0.33.0-DERIVED (S1-10R phase 3, 2026-11-11): the default per-rank bytes P* = 51,814,072,320 (48.26 GiB) come from the A_N figures measured on 0.33.0 (node 7 = 105,586 MiB limits);
+# the margin M = 6.6 GiB was kept (re-itemised) and the W_N footprints were re-measured (workers 3,865 MiB anon + 319 MiB shmem, EngineCore 1,174 MiB, API server 1,354 MiB: unchanged
+# within 4 percent of the W_N values in the code below). P* holds only while the node-7 reclaimable slab stays small (302 MiB at the measurement, 6,688 MiB in the 0.32.0 study; slab is not in A_N):
+# this preflight, run before every ON boot, is what catches a regrown slab. The idle A_N it sees (no server) is about W_N above the server-up A_N of the sizing.
 # usage: [MUSE_OFFLOAD_PER_RANK_BYTES=<bytes>] [MUSE_OFFLOAD_MIN_LEFT_MIB=4096] [MUSE_OFFLOAD_NODE_ROOT=/sys/devices/system/node] preflight_offload.sh
 # Exit 0 = every GPU node can take the tier, 1 = a node is short, 2 = unreadable meminfo.
 root=${MUSE_OFFLOAD_NODE_ROOT:-/sys/devices/system/node}
-per_rank=${MUSE_OFFLOAD_PER_RANK_BYTES:-48318382080}
+per_rank=${MUSE_OFFLOAD_PER_RANK_BYTES:-51814072320}
 min_left=${MUSE_OFFLOAD_MIN_LEFT_MIB:-4096}
 margin_mib=6758          # M = 6.6 GiB
 if [ "${MUSE_OFFLOAD:-1}" = 0 ]; then echo "preflight_offload: MUSE_OFFLOAD=0, nothing to check"; exit 0; fi

@@ -1,10 +1,10 @@
 # NUMA-local KV CPU offload (S1-10): SimpleCPUOffloadConnector + `--numa-bind`, exact per-rank tier
 
-> **Status 2026-11-11 (S1-10R): the numbers in this document are 0.32.0 numbers.** The gate of this study ran on vLLM 0.32.0 (`268c64b0e2` + `9388ed1133`) with host `6f47eb1790`;
-> production is now the 0.33.0 line (`sm120-muse-spark-open` `0261903b9e`, host `3192c6dd77`: spec KV bytes without a tier 11,720,212,480, `--max-num-scheduled-tokens 8192`, `NCCL_IB_DISABLE=1`, `VLLM_PLUGINS=muse_topo`).
-> Every flag-keyed or bytes value (the offload-on GPU bytes 11,525,693,440 / 16,957,243,392 / 17,357,799,424, the bytes per block-id 20,480 / 65,536, the 45 GiB per-rank tier, the per-node A_N and the margin M of section 4,
-> the S_live figures) is **0.32.0-derived and not re-derived on 0.33.0**; `env/offload.env` and the checks carry the same marks. S1-10R re-derives them (phase 3) and re-runs the gate chain (phase 4);
-> until then treat them as study facts, not as launch values for 0.33.0. The offload branch is rebased as `s110r-offload` onto host main `3192c6dd77` without changing the design or the frozen gate tools.
+> **Status 2026-11-11 (S1-10R phase 3): the performance and sizing study below is a 0.32.0 study; the launch values are re-derived on 0.33.0.** The gate of this study ran on vLLM 0.32.0 (`268c64b0e2` + `9388ed1133`) with host `6f47eb1790`;
+> production is now the 0.33.0 line (`sm120-muse-spark-open` `f6a60ab9d7`, host `942acddc48`: spec KV bytes without a tier 11,720,212,480, `--max-num-scheduled-tokens 8192`, fused boundary default on, `NCCL_IB_DISABLE=1`, `VLLM_PLUGINS=muse_topo`).
+> S1-10R phase 3 measured the flag-keyed and bytes values on that line (sections 4 and 5, subsections "0.33.0"): per-rank tier **P* = 51,814,072,320 B** (48.26 GiB), offload-on GPU bytes **spec 11,645,337,600 / ns256 16,854,810,624 / ns128 17,257,267,200**,
+> bytes per block-id unchanged (20,480 / 65,536); `env/offload.env` and the checks carry these. Everything else in the tables of sections 1-5 (the 45 GiB tier, the A_N of the 0.32.0 box, the 90 MiB page tables, the old S_live figures, the reuse and decode numbers) stays a
+> **0.32.0 measurement**, kept as the study record. The 0.33.0 gate chain (phase 4) has not run: the new values are gate inputs, not an adoption. The offload branch is `s110r-offload` (rebased onto host main without changing the design or the frozen gate tools).
 
 Launch-scoped plus two generic vLLM commits (branch `muse/s110-offload` on `sm120-muse-spark-open` 268c64b0e2): 9388ed1133 "Keep a local KV cache connector from turning on the multimodal embedding path of a text-only launch" (needed) and
 359cdc74aa "Add a NUMA memory policy option (bind | preferred)" (optional, section 8). Host side: `env/offload.env` (sourced after `env/host.env`, before `env/spec_k7.env`), `scripts/check_offload_launch.sh` (the boot check), `bench/s110/` (the tools).
@@ -14,8 +14,8 @@ Measured on `sm120-muse-spark-open` 268c64b0e2 + 9388ed1133 and host 6f47eb1790,
 traffic gains; the final gate of section 10 adds Zipf-popular documents with fresh question suffixes next to 64 background decoders). With the tier on, the 64k / 118k re-admission TTFT falls from 6.30 / 12.44 s to 0.29 / 0.47 s
 (speculative profile; non-speculative 6.20 / 12.27 s -> 0.20 / 0.32 s), a working set 1.6x the GPU pool that cycles through the pool is served at 217k instead of 10.9k prompt tokens/s (non-speculative 286k instead of 11.3k; TTFT p50 0.24 s against 5.9 s,
 p99 0.50 s against 12.0 s), a multi-turn chat whose histories overflow the pool finishes in 322 s instead of 760 s. Decode without reuse stays within -0.5 % (speculative: pooled gmean over c1 / c16 / c64 / c128, three boots against three; non-speculative -0.1 %).
-The tier is one `torch.zeros` + `cudaHostRegister` per rank (SimpleCPUOffloadConnector), 45 GiB per rank (48,318,382,080 B; node 7 binds it), placed 100 % on the GPU's own node by `--numa-bind`; the exact GPU KV bytes move to 11,525,693,440 (speculative, -0.41 %;
-the page tables of the tier take 90 MiB) and stay 16,957,243,392 (ns256). The native OffloadingConnector was measured on the same workloads and is not used: it pins the whole region in every worker (+100 s .. +21 min boot and 8x the GPU page tables at a 24 GiB tier),
+The tier is one `torch.zeros` + `cudaHostRegister` per rank (SimpleCPUOffloadConnector), 45 GiB per rank in the 0.32.0 study (48,318,382,080 B; node 7 binds it; 0.33.0: P* = 48.26 GiB = 51,814,072,320 B, section 4), placed 100 % on the GPU's own node by `--numa-bind`; the exact GPU KV bytes moved to 11,525,693,440 (speculative, -0.41 %;
+the page tables of the tier take 90 MiB) and stayed 16,957,243,392 (ns256) on 0.32.0 (0.33.0 with the larger tier: 11,645,337,600 / 16,854,810,624, section 5). The native OffloadingConnector was measured on the same workloads and is not used: it pins the whole region in every worker (+100 s .. +21 min boot and 8x the GPU page tables at a 24 GiB tier),
 its decode gmean is 0.979 .. 0.988, and under speculation a CPU hit does not reproduce the GPU hit (the draft group is not restored faithfully). A vLLM bug found on the way (a `kv_both` connector switched the text-only launch to the multimodal embedding path: +128 MiB
 and a model on input embeddings) is fixed in the branch.
 
@@ -121,7 +121,7 @@ Pass 1 (log of any boot with a small tier): `SimpleCPUOffloadScheduler: Allocati
 (258,747 blocks = 16,957,243,392 B; K = 16 tensors). The scheduler's CPU pool is derived from the GPU config (`num_gpu_blocks * cap // gpu_total_bytes`), each worker allocates `cap // total_bytes_per_block`: the two agree when
 `cap` is a multiple of `bpb` (the check script fails a log where they differ). A per-rank value that is a multiple of **L = 327,680 B** (lcm of both `bpb`) therefore gives an exact block count in every profile.
 
-Pass 2 (the formula). Host memory is not specific to a profile, so one formula serves all of them (and SG2 at 1M context, where only `bpb` and the bytes per token change):
+Pass 2 (the formula; the figures in this section are the 0.32.0 study with the 45 GiB tier, the 0.33.0 re-derivation is section 4a). Host memory is not specific to a profile, so one formula serves all of them (and SG2 at 1M context, where only `bpb` and the bytes per token change):
 
     A_N   = MemFree_N + Active(file)_N + Inactive(file)_N         (MiB of GPU node N with the server up, tier off, bound, after the workloads; slab and shmem not counted)
     P*    = L * floor( (min_N A_N - M) / (2 * L) )                  per rank, the same for every rank (every rank must hold the same number of CPU blocks)
@@ -143,7 +143,7 @@ The tier is therefore limited by node 7: **P* = 45 GiB = 48,318,382,080 B per ra
 the GiB, which leaves M = 6.57 GiB on node 7 by the formula and 10.4 GiB measured at READY) (a multiple of L; 2,359,296 CPU blocks in the speculative profile, 737,280 in the non-speculative ones; 360 GiB, 35.7 % of the RAM, in total).
 (The 18 GiB per node that nodes 0 / 3 / 4 could still give is the price of equal block counts per rank and of the foreign memory on node 7; `--numa-membind-policy preferred`, section 8, is the option that uses it.)
 
-Verification by boot (SIM bound, speculative profile, strict membind, watchdog at 1,024 MiB of MemFree + file cache per node, oom_score_adj 1000 on every process of the session):
+Verification by boot (0.32.0 study; SIM bound, speculative profile, strict membind, watchdog at 1,024 MiB of MemFree + file cache per node, oom_score_adj 1000 on every process of the session):
 
 | tier per rank | READY (s) | node 7 MemFree + file cache at READY (MiB) | direct reclaim scanned : stolen | major faults during the boot | smoke: CPU hit TTFT of a 65k prompt |
 |---|---|---|---|---|---|
@@ -167,10 +167,35 @@ CPU bytes per token (speculative profile, per rank; SG2 reuses them): 15 KV grou
 **5,120 B per token** of prompt (4 x 20,480 B per 16 tokens) plus a fixed **28.8 MB per stored prefix** (11 groups x 128 window blocks x 20,480 B); measured: a 32,832-token document loads 9,612 blocks per rank = 196.9 MB = 6.0 KB per token, a 65,584-token prompt 17,804 blocks (4 x 4,099 + 11 x 128).
 Non-speculative profiles: 4,096 B per token (1 full group x 65,536 B per 16 tokens) plus 25.2 MB (3 x 128 x 65,536 B); a 65,584-token prompt loads 4,483 blocks. The 45 GiB tier holds about 245 documents of 32k tokens (7.9 M tokens), 76 prompts of 118k, 8 prefixes of 2^20 tokens (5.40 GB each, fp8; 9 only with 10^6-token prefixes).
 
+### 4a. 0.33.0 re-derivation (S1-10R phase 3, 2026-11-11; `muse_wf/s1-10r/phase3_an.json`)
+
+A_N was measured on vLLM `f6a60ab9d7` / host `942acddc48` with the server up (production spec profile, `--kv-cache-memory-bytes 11720212480`, tier off, `--numa-bind`, worker anon 100 % on its own node; decode c1 / 16 / 64 / 128, the reuse cycle of 76 documents x 32,768 tokens (1.51 x the pool),
+a 48 x 5 x 6000-token chat; snapshot 06:20:54 server time, no memory pressure during the run). The formula, L = 327,680 B and M = 6.6 GiB are unchanged:
+
+| node (GPUs) | MemFree | Active(file) | Inactive(file) | **A_N (MiB)** | A_N on 0.32.0 | left at P* (both ranks) |
+|---|---|---|---|---|---|---|
+| 3 (0, 1) | 52,618.8 | 66,473.2 | 170.8 | **119,262.8** | 117,205 | 20,435 MiB |
+| 0 (2, 3) | 62,429.1 | 54,158.4 | 2,056.6 | **118,644.1** | 117,738 | 19,817 |
+| 7 (4, 5) | 33,289.0 | 734.7 | 71,562.6 | **105,586.3** (limiter) | 98,892 | 6,759 |
+| 4 (6, 7) | 38,103.0 | 79,434.3 | 2,103.8 | **119,641.2** | 118,063 | 20,814 |
+
+**P* = L * floor((105,586.3 MiB - 6.6 GiB) / (2 L)) = 158,124 L = 51,814,072,320 B per rank** (48.2556 GiB, +7.2 % over the 45 GiB tier; 2,529,984 CPU blocks per rank in the speculative profile, 790,620 in the non-speculative ones; 414,512,578,560 B = 386 GiB for the eight ranks, `cpu_bytes_to_use` = 8 x P*).
+(`scripts/preflight_offload.sh` uses M = 6,758 MiB, one L more than 6.6 * 2^30 B would give: P* from the preflight margin would be 51,814,400,000 B; the sizing value is the one above.)
+Why node 7 gained 6.7 GiB: the old OFF boot (`numa_end.txt` of `s110_a_off_b_spec`) carried 6,688 MiB of reclaimable slab on node 7 (1.3-1.4 GiB on the other nodes) that A_N does not count; now it is 302 MiB on node 7 and 0.16-0.24 GiB elsewhere; the old figure with SReclaimable (105,581 MiB) equals today's A_7.
+Foreign memory on node 7 is unchanged (13,242 MiB server up, 13,027 idle before the boot, 13,014 after shutdown; 13.3 GiB in S1-10; owner not traced), as is anon (8,945 MiB). **Condition:** the slab is state dependent (uptime was 13 h); if it regrows on node 7, A_7 and P* fall back toward 45 GiB, so run `scripts/preflight_offload.sh` before every ON boot.
+Node 7 also holds 71.5 GiB of cold Inactive(file) that the tier populate has to evict.
+M was kept: re-itemised on 0.33.0 (worker growth READY -> end +0.03 .. 0.08 GiB per node, in-run dip of free + file below the end value 0.5 GiB on node 7, mapped library pages 0.77-1.25 GiB per node, foreign drift +0.2 GiB, kernel high watermark 0.28 GiB, tool and log page cache about 1 GiB) it is again 3.5-4.5 GiB; no data supports 4.5 GiB.
+Process footprints (MiB): worker anon 3,865 + shmem 319, EngineCore 1,174, API server 1,354, the `W_N` of the preflight. THP madvise, NUMA balancing on, `zone_reclaim_mode` 0, as in S1-10.
+
+Bytes per block-id and the tier block count as logged by every ON boot of phase 3: **20,480 B** (speculative; K = 5 tensors; scheduler `Allocating 2529984 offload blocks (48.26 GB)` and eight worker lines `5 tensors, 2529984 CPU blocks`) and **65,536 B** (ns256 / ns128; K = 16 tensors; 790,620 blocks),
+`bpb = per_rank_bytes / blocks` exact in both; the draft slots 7 -> 0 change of 0.33.0 did not move them. `check_offload_launch.sh` passed on all ON boots. Populate: node anon + shmem rises by 10 GiB within 12-30 s of the worker start and reaches 95 % of the plateau 12-30 s later; READY 100-140 s.
+**Open point (swap).** 7 of the 9 valid ON boots at P* swapped out 3.7-5.5 GiB of unpinned worker / EngineCore / API-server anonymous memory (cold pages, no OOM kill, no errors; READY 119-140 s with swap against 100-110 s without). All six boots that started right after an ON teardown within the same hold swapped at boot, none of the four first-in-hold boots did;
+node MemFree dipped to 22-189 MiB during the boot. Cause not separated (restart right after a teardown vs node pressure at P*); a smaller P* is an unmeasured hypothesis. The phase 4 gate decides whether P* stays. `VmPin` reads 0 on every worker (`cudaHostRegister` does not show there); the tier side is numa_maps anon per worker (49.8-50.5 GiB, 100 % on the owner node).
+
 
 ## 5. GPU bytes with the tier on (S1-7 procedure)
 
-The tier costs GPU memory only through the page tables of `cudaHostRegister` (2 MiB per GiB registered per process, probe `gpu_overhead_probe.py`; 90 MiB at the 45 GiB tier), so the exact `--kv-cache-memory-bytes` of S1-7 / S1-9 is re-derived with the S1-7 procedure
+The tier costs GPU memory only through the page tables of `cudaHostRegister` (2 MiB per GiB registered per process, probe `gpu_overhead_probe.py`; 90 MiB at the 45 GiB tier), so the exact `--kv-cache-memory-bytes` of S1-7 / S1-9 is re-derived with the S1-7 procedure (the table is the 0.32.0 study with the 45 GiB tier; the 0.33.0 values are in section 5a)
 (probe tree = the fixed tree + `sitecustomize.py` allocator probe, NVML 10 ms sampler, stress A1 B C1 C2 D H I L M X (speculative) / A1 B C1 C2 D H I X, REPS = 2, tier 45 GiB, bound; floor 1,256 MiB speculative / 500 MiB non-speculative; the stress also exercises the tier with
 its prefix-hit phases H and I). S_live = idle free memory - exact growth of torch's allocated peak:
 
@@ -183,6 +208,26 @@ its prefix-hit phases H and I). S_live = idle free memory - exact growth of torc
 
 The bytes are now a property of "offload on": `env/offload.env` exports them (`MUSE_OFFLOAD_KV_BYTES`, and `MUSE_SPEC_KV_BYTES_OVERRIDE` for the speculative profile, which `env/spec_k7.env` reads), and `scripts/check_offload_launch.sh` fails a launch line whose
 `--kv-cache-memory-bytes` is above it. `scripts/check_spec_launch.sh` keeps its maxima (the stepped value is below them). Valid without `prompt_logprobs` / `echo` (S1-7 section 4). Re-derive after any change of the tier size (2 MiB per GiB), the sampler, the verify path, the graph set or the chunk size.
+
+### 5a. 0.33.0 re-derivation (S1-10R phase 3; `muse_wf/s1-10r/phase3_stress.json`)
+
+Same S1-7 procedure on the 0.33.0 tree (probe tree = `sm120-dev/src` `f6a60ab9d7` + `sitecustomize.py`, identical apart from that file; stress harness `work/s1-13/g`, A1 B C1 C2 D H I L M X speculative / A1 B C1 C2 D H I X non-speculative, REPS = 2, NVML 10 ms sampler),
+tier **P* = 51,814,072,320 B per rank** (page tables 2 MiB per GiB = 96.5 MiB), bound, speculative boots with `--max-num-scheduled-tokens 8192` and the fused boundary default on. Floors 1,256 MiB (speculative) / 500 MiB (non-speculative). Start = the no-tier bytes, step down by the shortfall, confirm by a boot.
+S_live = min over GPUs of idle free memory - largest live growth of torch's allocated peak. Confirmed boots: 0 errors, preemptions, OOM, tracebacks, NCCL warnings or watchdog trips, health 200.
+
+| profile | 0.33.0 no-tier bytes | **offload-on bytes** | blocks (bpb) | KV tokens per rank | step vs no tier | S_live at the start bytes | S_live at the confirmed bytes |
+|---|---|---|---|---|---|---|---|
+| spec | 11,720,212,480 (S1-13) | **11,645,337,600** | 568,620 (20,480) | 1,639,394 | -74,874,880 B (-3,656 blocks) | 1,184.6 (shortfall 71.4) | **1,256.6** >= 1,256 PASS |
+| ns256 | 16,957,243,392 | **16,854,810,624** (16,074 MiB) | 257,184 (65,536) | 2,893,281 | -102,432,768 B | 403.8 (shortfall 96.2) | **501.8** >= 500 PASS |
+| ns128 | 17,357,799,424 | **17,257,267,200** (16,458 MiB) | 263,325 (65,536) | 2,962,366 | -100,532,224 B | 405.1 (shortfall 94.9) | **501.1** >= 500 PASS |
+
+Confirmed boots: spec READY 94,159 MiB, idle free 3,093.4, live growth 1,836.8, 4 allocator retries, NVML min free 79.4, `check_spec_launch.sh` live OK (fb=1, mnst=8192, mnbt=8199); ns256 READY 95,519, idle 1,733.4, growth 1,231.6; ns128 READY 95,567, idle 1,685.4, growth 1,184.3.
+Intermediate boots (ns256: 16,856,317,952 -> 499.8; 16,856,055,808 -> 499.8; ns128: 17,258,250,240 -> 499.1) stayed 0.2-0.9 MiB under the floor. **The GPU KV allocation is quantized to 2 MiB**: idle free moved by exactly +72 / +96 / +94 MiB for steps of 71.4 / 96.2 / 94.9 MiB, and the literal 4-block ns256 step (0.25 MiB) was a no-op.
+Step by `ceil(shortfall / 2 MiB)` granules (POST-HOC deviation from "shortfall in whole blocks", which cost two extra boots; one ns256 boot at 16,856,055,808 was INVALID, rank 2 graph capture 1.99 GiB instead of 0.72 and an OOM in the first burst, cause unattributed, the re-run of the same bytes was clean).
+Spec (7 blocks) and ns128 (3 blocks) are not granule-maximal (568,627 and 263,328 blocks would give the same idle free); not booted. The tier on 0.33.0 costs the GPU 96.5 MiB of page tables, 6.5 MiB more than the 90 MiB of the 45 GiB tier.
+The GPU bytes with the tier are 74.9 / 102.4 / 100.5 MB below the no-tier bytes; the smaller tier-off figures of S1-13 stay valid for launches without the tier.
+The frozen gate drivers (`bench/s110/master_gate.sh`, `master_det.sh`) still hold the 0.32.0 literals (spec ON 11,525,693,440, ns256 16,957,243,392, ns128 17,357,799,424, control 11,573,411,840) because the frozen tools are byte-identical by rule; the phase 4 drivers have to be copies that take the offload-on bytes from `env/offload.env`
+(or `MUSE_OFFLOAD_KV_BYTES_OVERRIDE`, as the phase 3 stress driver did) and the no-tier controls from S1-13.
 
 
 ## 6. Determinism (G5)
@@ -212,10 +257,11 @@ Speculative production line with the tier (source order matters: `offload.env` s
       --max-num-seqs 128 --kv-cache-dtype fp8 --quantization modelopt_fp4 --limit-mm-per-prompt '{"image":0,"audio":0,"video":0}' --reasoning-parser muse --tool-call-parser muse --enable-auto-tool-choice \
       --speculative-config '{"draft_sample_method":"probabilistic","method":"dflash","model":"<RadixArk DFlash2 snapshot>","num_speculative_tokens":7,"rejection_sample_method":"block"}' \
       --per-request-spec-decode-metrics detailed $MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS
-    # = ... --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --kv-cache-memory-bytes 11525693440 --numa-bind \
-    #     --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":386547056640,"cpu_bytes_to_use_per_rank":48318382080}}'
+    # = ... --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 11645337600 --numa-bind \
+    #     --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":414512578560,"cpu_bytes_to_use_per_rank":51814072320}}'
+    # (0.33.0 values; the 0.32.0 study line was --kv-cache-memory-bytes 11525693440 with 386547056640 / 48318382080)
 
-Non-speculative (`MUSE_OFFLOAD_PROFILE=ns256 source env/offload.env` after `env/host.env`): `--max-num-seqs 256 --max-cudagraph-capture-size 256 --kv-cache-memory-bytes 16957243392 $MUSE_OFFLOAD_SERVE_ARGS` (ns128: `--max-num-seqs 128`, bytes 17,357,799,424, to be re-confirmed).
+Non-speculative (`MUSE_OFFLOAD_PROFILE=ns256 source env/offload.env` after `env/host.env`): `--max-num-seqs 256 --max-cudagraph-capture-size 256 --kv-cache-memory-bytes 16854810624 $MUSE_OFFLOAD_SERVE_ARGS` (ns128: `--max-num-seqs 128`, bytes 17,257,267,200; 0.33.0 values with the P* tier).
 Through the harness: `SERVE_EXTRA="$MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS" SPEC_CONFIG=dflash2_radixark ... serve_sd.sh <tag> ...` (the JSON has no spaces: `SERVE_EXTRA` is split on whitespace).
 
 After every boot: `scripts/check_spec_launch.sh <serve.log>` (speculative) and `scripts/check_offload_launch.sh <serve.log>` (with `env/offload.env` sourced in the checking shell). The second one checks from the log and `serve_cmd.txt`: the eight bindings
@@ -244,7 +290,7 @@ The boots at 80 GiB and the OFF boot after them were not run (decision after the
   8k / 32k / 118k prompts, random 512 / 128 rows with fixed seeds) must therefore either give every request its own `cache_salt` (the S1-9 L7 driver `--cycle`, `conc_driver_s110.py`) or reset the tier too: `POST /reset_prefix_cache?reset_external=true` (offline: `llm.reset_prefix_cache(reset_connector=True)`; a no-op without a connector).
   The sd harness is guarded since S1-10 (`/raid/vllm-runtime/work/sd/harness`: `bench_sd.sh`, `acceptance.py` and the mock server send `reset_external=true`, originals kept as `*.before_s110`, patch in `bench/s110/harness_reset_external.patch`); `scripts/conc_sweep.sh` does not reset at all (its repeated fixed-seed prompts hit the GPU cache
   with and without the tier alike, so its rows are symmetric). Any other row that resets only the GPU cache is invalid with the tier on. Tier-on numbers next to tier-off numbers of the same matrix must say which rows were salted.
-* S1-11: the launch line of section 7 is the production speculative line plus `--numa-bind` and the connector; the exact GPU bytes are 11,525,693,440 (speculative, stepped by the rule; the stress of the stepped value is in section 5) and 16,957,243,392 (ns256, unchanged).
+* S1-11: the launch line of section 7 is the production speculative line plus `--numa-bind` and the connector; the exact GPU bytes are, on 0.33.0 with the P* tier, 11,645,337,600 (speculative), 16,854,810,624 (ns256) and 17,257,267,200 (ns128), section 5a (0.32.0 with the 45 GiB tier: 11,525,693,440 and 16,957,243,392 unchanged).
   Boots to check: `check_spec_launch.sh` and `check_offload_launch.sh`. A restart after a tier run reads part of the weights cold (+40 s).
 * SG2 (1M context, NVFP4 KV): reuse the formula of section 4 unchanged (host memory is NOT independent of the context length: the model runner keeps a pinned UVA `all_token_ids` of [max_num_reqs, max_model_len] int32 per worker, 64 MiB at 128k with mns 128, 512 MiB at 1M, about 1 GiB at mns 256 and 1M,
   i.e. +0.9 .. 1.8 GiB per node at 1M against the 2.1 GiB of slack of M: P* = 45 GiB at 1M is unproven, re-derive A_N with the 1M launch), recompute `bpb` from the new `Allocating N offload blocks` line and the CPU bytes per token from the new group layout
@@ -275,3 +321,6 @@ every KV group restored and compared with an H copy, every request with cached t
 token ids, top-5 logprobs for the 8 `lp` requests of the greedy sweep, spec accepted / drafted counts per call (the scheduler's `make_spec_decoding_stats` is wrapped because it returns early while the stat logger is off). Any recorded error, missing record or uncovered piece is ARTIFACT, never PASS. `bench/test_chk_d4_verdict.py` runs the compare / control / verdict logic on synthetic digests (no GPU). Run it as a script (`python3 bench/test_chk_d4_verdict.py`; the checks sit in `main()` under `__main__`). The JSON carries `finished`; a progress write that would be PASS is stored as `RUNNING`, so only `finished == true` with PASS counts. The verdict is ARTIFACT when `n_det` is not 85.
 The draft KV groups (detected from `kv_cache_spec.is_draft` or `KVCacheGroupSpec.is_eagle_group`) and their restored-block counts are reported as a warning only. Profile note: `e2e_s110.py` has no `E2E_MNST`, so the gate's ON processes run without `--max-num-scheduled-tokens`; run the D4' process with `E2E_MNST` unset (or 0) to match them, and state any other choice in the result.
 `verdict_gate.py` is NOT changed and still evaluates the old D4; the D4' verdict is the chk JSON.
+
+**Gate inputs after phase 3 (2026-11-11).** `env/offload.env` is itself a frozen gate input; its md5 in `ADOPTION_RULE_FINAL_AMENDMENT3.md5` was re-recorded when the 0.33.0-derived values of sections 4a and 5a replaced the 0.32.0 ones (P* 51,814,072,320 B; GPU bytes 11,645,337,600 / 16,854,810,624 / 17,257,267,200), before any 0.33.0 gate boot.
+All other pinned tools (`bench/s110/*`, `env/host.env`, `env/spec_k7.env`) are unchanged. The frozen drivers keep their 0.32.0 byte literals; the phase 4 drivers take the offload-on bytes from `env/offload.env`.

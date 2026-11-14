@@ -10,8 +10,8 @@ t() {
   if [ "$got" = "$want" ]; then echo "ok   $desc"; else echo "FAIL case '$desc'"; echo "    wanted: $want"; echo "    got:    $got"; fails=$((fails+1)); fi
 }
 # Note: `VAR=x source file` restores VAR after the source (bash), so the documented off switch is `export MUSE_OFFLOAD=0` before sourcing.
-# the expected numbers below are the 0.32.0-derived values of env/offload.env (S1-10R phase 3 re-derives them; update both together)
-SPEC=11525693440; NS256=16957243392; PB=48318382080
+# the expected numbers below are the 0.33.0-derived values of env/offload.env (S1-10R phase 3, s1-10r/phase3_an.json and phase3_stress.json; update both together)
+SPEC=11645337600; NS256=16854810624; PB=51814072320
 t "spec defaults: bytes, bpb, spec override, serve args" "$SPEC 20480 $SPEC 1 1" \
   'source $E/offload.env; echo "$MUSE_OFFLOAD_KV_BYTES $MUSE_OFFLOAD_BPB $MUSE_SPEC_KV_BYTES_OVERRIDE $MUSE_OFFLOAD $(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c -- "--numa-bind --kv-transfer-config")"'
 t "serve args carry the exact per-rank bytes and 8x as the total" "1 1" \
@@ -38,8 +38,10 @@ t "numa bind off: no --numa-bind, connector kept" "0 1" \
   'MUSE_OFFLOAD_NUMA_BIND=0 source $E/offload.env; echo "$(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c -- "--numa-bind") $(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c SimpleCPUOffloadConnector)"'
 t "per-rank bytes override reaches the JSON (a multiple of the block lcm stays the caller's duty)" "1" \
   'MUSE_OFFLOAD_PER_RANK_BYTES=26214400000 source $E/offload.env; echo "$(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c "cpu_bytes_to_use_per_rank\":26214400000}")"'
-t "ns128 profile: 0.32.0-derived bytes and block size" "rc=0 off=1 kv=17357799424 bpb=65536" \
+t "ns128 profile: 0.33.0-derived bytes and block size" "rc=0 off=1 kv=17257267200 bpb=65536" \
   'MUSE_OFFLOAD_PROFILE=ns128 source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD kv=$MUSE_OFFLOAD_KV_BYTES bpb=$MUSE_OFFLOAD_BPB"'
+t "0.33.0 tier: P* is whole blocks of L, spec and ns (2,529,984 / 790,620) and the ns256 profile bytes" "0 2529984 790620 16854810624" \
+  'source $E/offload.env; echo "$((MUSE_OFFLOAD_PER_RANK_BYTES % 327680)) $((MUSE_OFFLOAD_PER_RANK_BYTES / 20480)) $((MUSE_OFFLOAD_PER_RANK_BYTES / 65536)) $(MUSE_OFFLOAD_PROFILE=ns256 source $E/offload.env; echo $MUSE_OFFLOAD_KV_BYTES)"'
 t "ns128 with an explicit MUSE_OFFLOAD_KV_BYTES_OVERRIDE replaces the bytes" "rc=0 off=1 kv=17000000000 bpb=65536" \
   'MUSE_OFFLOAD_PROFILE=ns128 MUSE_OFFLOAD_KV_BYTES_OVERRIDE=17000000000 source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD kv=$MUSE_OFFLOAD_KV_BYTES bpb=$MUSE_OFFLOAD_BPB"'
 t "ns128 with the tier off (the OFF arm of the stress / gate boots)" "rc=0 off=0 err=[]" \

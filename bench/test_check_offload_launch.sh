@@ -33,7 +33,7 @@ run() {
   elif [ -n "${MSG:-}" ] && ! echo "$out" | grep -q -- "$MSG"; then echo "FAIL case '$desc': rc ok but the message lacks '$MSG'"; echo "$out" | sed 's/^/    /'; fails=$((fails+1))
   else echo "ok   $desc"; fi
 }
-# fixture numbers (tier bytes, spec bytes per block-id 20,480, KV maximum) follow the 0.32.0-derived values of env/offload.env; the cases test the check logic, not the values
+# fixture numbers (a 24 GiB tier, spec bytes per block-id 20,480, a KV maximum of 11.5 GB) are synthetic and deliberately not the values of env/offload.env (0.33.0: P* 51,814,072,320, spec maximum 11,645,337,600); the cases test the check logic, not the values
 B=25769799680; BPB=20480; N=$(( B / BPB )); KVMAX=11500000000
 # the full expectation of a launch (what env/offload.env exports): every case of the simple mode needs all three
 X="MUSE_OFFLOAD_EXPECT_BYTES=$B MUSE_OFFLOAD_EXPECT_BPB=$BPB MUSE_OFFLOAD_EXPECT_KV_MAX=$KVMAX"

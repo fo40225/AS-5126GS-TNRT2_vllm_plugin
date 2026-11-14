@@ -10,16 +10,17 @@ check() { # desc want_rc want_msg [env...]
   out=$(env -i PATH="$PATH" MUSE_OFFLOAD_NODE_ROOT="$d" "$@" bash "$here/scripts/preflight_offload.sh" 2>&1); rc=$?
   if [ "$rc" != "$want" ] || ! echo "$out" | grep -q -- "$msg"; then echo "FAIL case '$desc': rc=$rc wanted $want / '$msg'"; echo "$out" | sed 's/^/    /'; fails=$((fails+1)); else echo "ok   $desc"; fi
 }
-# the idle server state of the study: node 7 A_N = 98,892 + 8,192 + 1,331 MiB without a server
-mkn 0 20000 97738; mkn 3 20000 98000; mkn 4 20000 98000; mkn 7 10000 98400
-check "shipped tier fits the study's nodes" 0 "PREFLIGHT OK"
+# the idle state (no server) derived from the 0.33.0 phase 3 A_N figures (server up: node 3 119,263, node 0 118,644, node 7 105,586, node 4 119,641 MiB) plus W_N
+# (two workers 8,192 MiB, node 3 + EngineCore 1,229, node 7 + API server 1,331); the shipped P* = 48.26 GiB leaves 6.9 GiB on node 7 (M = 6.6 GiB: no warning)
+mkn 0 20000 106844; mkn 3 20000 108700; mkn 4 20000 107900; mkn 7 10000 105400
+check "shipped tier fits the 0.33.0 nodes" 0 "PREFLIGHT OK"
 mkn 7 10000 60000
 check "node 7 short by 40 GiB fails" 1 "PREFLIGHT FAIL"
-mkn 7 10000 98400
+mkn 7 10000 105400
 check "a smaller tier fits" 0 "PREFLIGHT OK" MUSE_OFFLOAD_PER_RANK_BYTES=26214400000
-mkn 4 20000 87000
+mkn 4 20000 92000
 check "node 4 inside the warn band passes with a warning" 0 "WARN" 
-mkn 4 20000 98000
+mkn 4 20000 107900
 check "tier off: nothing to check" 0 "nothing to check" MUSE_OFFLOAD=0
 rm "$d/node3/meminfo"
 check "unreadable meminfo" 2 "cannot read"
