@@ -250,6 +250,26 @@ Single-request prefill latency (`bench/prefill_probe.py`, `scripts/prefill_chain
 (`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS` below the floor of 2050 is raised to it: both halves must stay above the
 sequence-parallel minimum of the model so that the two threads issue the same number of collectives.)
 
+Without the plugin (`MUSE_TOPO_ENABLE=0`, plain NCCL, same probe, 2100 / 8192 / 16384 tokens): replicated 0.393 / 1.473 / 2.952 s off,
+0.269 / 0.955 / 1.900 s microbatched; SP 0.333 / 1.203 / 2.418 s off, 0.291 / 1.003 / 2.003 s microbatched. The overlap is a branch feature
+and works on NCCL (a slower collective gives it more to hide); the plugin starts from the faster collective, so the replicated
+gain on NCCL is larger (-35 % against -28 % latency at 8192) while the absolute prefill speed with the plugin stays the best.
+
+Concurrency, real weights, plugin (`work/final/conc` protocol: random 512/128 and 2048/256 prompts, 4 x concurrency prompts, output tok/s;
+rows `fin_conc_r_topo`, `fin_conc_r_topo_sp`, `r2e_conc_r_ov`, `r2e_conc_r_ov_sp`); mixed batches (chunked prefill beside decodes)
+of at least 2050 tokens are split too:
+
+| prompt/output, concurrency | 1 | 4 | 16 | 64 | 128 |
+|---|---|---|---|---|---|
+| 512/128 replicated, off | 87.0 | 206.9 | 391.7 | 711.5 | 886.2 |
+| 512/128 replicated, microbatched | 86.6 | 208.3 | 415.5 (+6 %) | 794.2 (+12 %) | 1021.6 (+15 %) |
+| 512/128 SP, off | 87.1 | 211.5 | 412.1 | 786.5 | 1009.0 |
+| 512/128 SP, microbatched | 86.9 | 215.6 | 421.1 (+2 %) | 817.4 (+4 %) | 1059.8 (+5 %) |
+| 2048/256 replicated, off | 84.5 | 188.4 | 315.4 | 489.5 | 568.5 |
+| 2048/256 replicated, microbatched | 84.5 | 196.5 (+4 %) | 346.0 (+10 %) | 577.9 (+18 %) | 689.9 (+21 %) |
+| 2048/256 SP, off | 86.3 | 198.1 | 341.3 | 564.3 | 672.9 |
+| 2048/256 SP, microbatched | 86.4 | 202.2 (+2 %) | 356.1 (+4 %) | 602.0 (+7 %) | 725.3 (+8 %) |
+
 Tried and dropped (all dummy weights, 16384 tokens, replicated stream unless noted): block counts of the large kernels x0.5
 2.12 s (x1 1.86, x2 1.90; SP x2 1.86 vs 1.79); chunk 2 / 4 MiB per block 1.87 / 1.88 s (1 MiB 1.86); 48 KB of dynamic shared
 memory per block (to keep GEMM blocks off the SMs of the collective) 1.87 s, 64 and 96 KB do not launch; comm stream priority 0
@@ -276,6 +296,15 @@ Reproduce: `flock -w 43200 /raid/vllm-runtime/sm120-dev/gpu.lock bash scripts/pr
 `runsrc_topo.sh bench/e2e_overlap.py out.json` (twice, the flag off and on) and `nccl/compare.py a.json b.json`.
 
 ## Limits and notes
+
+* Memory of the microbatched prefill: two microbatches in flight keep the activations of both halves alive and the collectives allocate on
+  the compute stream's pool; at 8192 tokens the peak reserved memory of a rank rises by about 1.4 GiB (replicated stream: 84.9 -> 86.4 GiB,
+  measured on dummy weights with the allocator statistics of the V2 runner) and a ready server with real weights holds 90.7 GiB/GPU
+  against 89.2 (SP 91.6 against 90.2) of the 94.97 GiB. The memory profile of the worker runs the whole batch (a dummy run has no attention
+  metadata to split), so the KV cache is not sized for it. At `--gpu-memory-utilization 0.95` this is enough: all real-weight rows, the
+  sweeps above and the two GSM8K runs completed, with one benign allocator retry ("memory allocation failed ... retrying", 256 MiB with 150 MiB
+  free) in the 2048/256 concurrency-128 run of the replicated stream. A launch that runs closer to the limit can turn the retry into an
+  OOM: lower `--gpu-memory-utilization` by 0.01 or set `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP=0`.
 
 * KV sizing and the workspace (review correction): the 61 MiB workspace is allocated in `CudaCommunicator.__init__`, which runs inside
   `init_worker_distributed_environment` (`gpu_worker.py` line 509), BEFORE the worker takes `init_snapshot` (line 534). The
