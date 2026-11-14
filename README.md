@@ -86,7 +86,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
 │   ├── r3b_gemv_push.md         decode 的 pooler / unpooler GEMV 與 all-gather 融合（r3b）：算術與精度、protocol、環境變數、S1-4a 量測
 │   ├── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
-│   └── a1_table_retune.md       S1-9 L9 A1：bf16 exchange 下 dispatch table 的逐 size 重調（verify band c1 .. c128 與 prefill chunk 的 message size、reduce-scatter 8 blocks、2bx slabs、方法與 bitwise 證明）
+│   └── a1_table_retune.md       S1-9 L9 A1：bf16 exchange 下 dispatch table 的逐 size 重調（verify band c1 .. c128 與 prefill chunk 的 message size、reduce-scatter 8 blocks、2bx slabs、方法與 bitwise 證明）；S1-9 L10 model-level gate（2 x 2 factorial）通過，已合併
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
 

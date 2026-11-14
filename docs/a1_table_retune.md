@@ -294,7 +294,7 @@ python3 bench/summ_a1.py cmp <jsonl> <jsonl> --tag-before a,b --tag-after c,d   
 python3 bench/ms_step_a1.py bench/a1_sizes.json <jsonl> <jsonl> --tag-before a,b --tag-after c,d --targets <cells>
 ```
 
-## 8. Model-level gate (S1-9 L9 A1 gate, 2026-11-04 / 05): bitwise and hang-free, NOT adopted by the pre-registered rule
+## 8. Model-level gate 1 (S1-9 L9 A1 gate, 2026-11-04 / 05): bitwise and hang-free, NOT adopted by the pre-registered rule (re-gated and ADOPTED in section 9)
 
 Candidate = this branch at 58e9b9459d63 (`muse_topo/collectives.py` md5 43e85025db32, unchanged since 5a02275); OFF = production host tree a7e7a03 (server `host_topo`, identical to git main); both arms on the production vLLM tree
 6da60b3062 (all 2688 tracked `vllm/*.py` files of the commit identical on the server), the production speculative launch line (RadixArk DFlash2 K = 7, FP8 draft level 2, cap 256, MNBT 8199) at the same exact bytes
@@ -322,3 +322,36 @@ c16 -0.464 ms (predicted -0.09 .. -0.33). Nothing reached the real-prompt throug
 other way within noise (STEADY +0.48 ms, real greedy -0.76 %, default -0.50 %; predicted -1.3 .. -1.6 ms): look at c48 before any re-gate. The non-speculative guard was started (ON_1 of 6 boots) and stopped after the speculative
 primary had fixed the verdict; its ADOPT=no is "fewer than 3 sessions", not a guard trip. Not merged: the branch stays at 58e9b9459d63 plus this section for a decision on a re-gate (for example a STEADY-based primary written down in advance,
 or more sessions on the real-prompt cells), the revert of the 1.5 / 2 MiB rows is not needed (STEADY c16 improved, c32 flat).
+
+## 9. Model-level gate 2 (S1-9 L10, 2026-11-05 / 06): the A1 factor of a 2 x 2 factorial, ADOPTED
+
+The L9 rule pooled bands in which no effect was predicted. The L10 rule (`work/s1-9/L10/g/ADOPTION_RULE.txt` on the server, pre-registered before the first A/B boot, one rule for the two factors A1 x R2a) puts the primary on the predicted bands:
+STEADY step ms, real-prompt greedy and default tok/s and 512-token-output greedy tok/s at c48 / c64 / c96 / c128 (16 cells; c16 is secondary and guarded). Candidate = this branch (`muse_topo/collectives.py` md5 43e85025db32, the file of
+the gate), production vLLM tree 6da60b3062 in the A1 cells and the R2a feature tree in the BOTH cells (A1 tables + the dormant or active R2a host side), production host tree a7e7a03 in the control cells; three sessions per cell
+(CTL, A1, R2, BOTH; 12 speculative boots in three counterbalanced rounds, 2,461 .. 2,506 s each, all healthy: arm check, cfgcheck OK, 0 preemptions), each cell at its own exact bytes. Main effect of A1 = (A1 + BOTH) against (CTL + R2),
+pooled within-cell variance (df 8, t 2.31).
+
+| gate | result |
+|---|---|
+| tests on the combined mirror | `test_a1_tables.py` 709 checks x 8, `test_medium_bx.py` 192 x 8, `test_plugin.py --quick`, `tests_h1b.py` 284 x 8, R2a host tests 26 x 8, all 0 failures; 15-minute hang soak of the combined tables: 94,400 graph replays + 472 eager rounds, every result == emulation |
+| bitwise equality and determinism (e2e, 131 requests, 12 passes) | the combined host tree on the production vLLM tree == production in every pass for all requests (ids, top-5 logprobs, prompt logprobs) and two cold processes identical; the slab path is taken (688 "algorithm 2bx slabs" lines against 0 in production) |
+| primary (ALL16 pooled) | **+0.53 % SIG (>= +0.25 % required)**; pooled STEADY (c48 .. c128) **+0.88 % SIG**, pooled real-prompt tok/s (12 cells) +0.41 % SIG; A1 cell against CTL pooled +0.63 % SIG |
+| guards | none tripped (STEADY c1 / c16 / c32 / c40 -0.06 / +0.69 SIG / +0.26 / -0.04 %; real greedy / default c1 .. c40 -0.24 .. +1.04 %; churn c64 +0.36 %; natural 8192 c16 +0.32 %; TTFT 8k / 16k / 32k +0.19 / +0.28 / +0.16 %) |
+| non-speculative guard (bytes 17,357,799,424, 3 sessions each) | A1 against CTL: real greedy / default c1 +0.75 / +0.71 %, c64 +0.03 / -0.26 %, STEADY c1 / c64 +0.46 / -0.05 %: no cell worse beyond noise (the combined tree against CTL: all within +-0.14 %) |
+
+STEADY step ms (3 sessions per cell; CTL | A1 | R2 | BOTH; the A1 main effect pools A1 + BOTH against CTL + R2):
+
+```
+c1    16.935 | 16.926 | 17.225 | 17.252   A1 main effect -0.06 % noise  (the R2a cells are 0.29 ms slower at c1: an R2a effect, see docs/r2a_consumer_pipeline.md)
+c16   55.249 | 54.881 | 55.243 | 54.849   +0.69 % SIG        c32   81.798 | 81.490 | 81.549 | 81.436   +0.26 % noise      c40   95.036 | 95.035 | 94.869 | 94.950   -0.04 % noise
+c48   93.642 | 93.003 | 90.801 | 90.243   +0.65 % noise      c64  106.143 | 103.600 | 104.001 | 102.243  +2.09 % SIG      c96  130.189 | 129.570 | 126.378 | 125.220  +0.70 % SIG
+c128 152.951 | 152.956 | 147.625 | 147.322  +0.10 % noise
+```
+
+Reading: the gain sits where the microbench put it, at about the size of its lower end: c64 -2.5 / -1.8 ms (A1 against CTL / BOTH against R2; predicted -1.7 .. -2.1), c96 -0.6 / -1.2 ms, c16 -0.37 / -0.39 ms (predicted -0.09 .. -0.33); c128 (predicted -1.0 ms) and c48 (predicted -1.3 .. -1.6 ms) are
+not resolved (the cells' own session sd is 0.6 .. 1.4 ms at c48 and 1.0 ms at c128). The c48 sign of the L9 gate (-0.51 %, T = 384 at the sequence-parallel floor, reduce-scatter 3 MiB) is positive in both pairs here (A1 against CTL -0.64 ms,
+BOTH against R2 -0.56 ms; main effect +0.65 % noise, se 0.55 %): the L9 reading holds (the production step at c48 is bound by the ~94 ms of eager launch work, a GPU-side lever there is capped; `workers_busy_cores` is 1.01 per worker at
+every c, a busy-wait that carries no information). Real-prompt cells (128 out) +0.0 .. +0.9 %, none beyond a clear threshold individually, pooled +0.41 % SIG. A by-product: the torch allocation peak of the S1-7 stress is 32 MiB lower with the
+slab path than with the large all-reduce (1,810 against 1,842 MiB at the same bytes); not used here (the production bytes are unchanged).
+
+Merged to host main with the L10 gate numbers (the runtime files are the gated bytes: `muse_topo/collectives.py` md5 43e85025db32).
