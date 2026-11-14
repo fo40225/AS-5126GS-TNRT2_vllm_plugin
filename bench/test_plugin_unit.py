@@ -3,7 +3,7 @@
 usage: python bench/test_plugin_unit.py        (needs torch and the host folder on PYTHONPATH; takes a second)
 Checks the routing logic: topo path only when supports() holds and the op is routed, dim normalization, the dim != 0
 reduce_scatter fallback, the lazy fallback reason, the per-key counters, MUSE_TOPO_OPS parsing, and that register() is a
-no-op without MUSE_TOPO_ENABLE=1.
+no-op without MUSE_TOPO_ENABLE=1, and the RS + AG == AR capability.
 """
 import os
 import sys
@@ -137,6 +137,27 @@ def main():
         assert dc.topo_comm is None  # not the TP group
     finally:
         muse_topo.TopoComm = real
+    # capability reduce_scatter_all_gather_matches_all_reduce: needs a TopoComm, all three ops routed, the large
+    # algorithms and the exact fp32 exchange
+    Cap = type("Cap", (), {"reduce_scatter_all_gather_matches_all_reduce": property(vp._rs_ag_matches_ar)})
+    full = frozenset(vp._ALL_OPS)
+
+    def cap(comm, ops=full):
+        obj = Cap()
+        obj.topo_comm, obj.topo_ops = comm, ops
+        return obj.reduce_scatter_all_gather_matches_all_reduce
+
+    c = FakeComm(True)
+    c.large, c.bf16_exchange = True, False
+    assert cap(c) is True
+    assert cap(None, frozenset()) is False  # no TopoComm (not the TP group, host mismatch, MUSE_TOPO_ENABLE=0)
+    for missing in vp._ALL_OPS:
+        assert cap(c, full - {missing}) is False, missing
+    c.large = False
+    assert cap(c) is False  # reduce_scatter and the large all-reduce would go to NCCL
+    c.large, c.bf16_exchange = True, True
+    assert cap(c) is False  # the large algorithms round the partials, the small all-reduce does not
+    assert not Cap().__class__.__dict__["reduce_scatter_all_gather_matches_all_reduce"].fget(types.SimpleNamespace())
     # MUSE_TOPO_OPS parsing and the register() gate
     os.environ["MUSE_TOPO_OPS"] = "all_reduce, bogus"
     assert vp._routed_ops() == frozenset({"all_reduce"})

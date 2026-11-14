@@ -34,6 +34,19 @@ script to `PYTHONPATH` and source `env/host.env`; `scripts/runsrc_topo.sh` does 
 | `all_gather(x, dim)` | `supports("all_gather", x, dim)` -> topo kernel producing the requested layout directly (dim 0: rank-major, last dim: column concatenation; shards above 1 MiB take the chunked large engine), else original |
 | `reduce_scatter(x, dim)` | dim 0 and `supports("reduce_scatter", x, 0)` (T % 8 == 0, bf16/fp16/fp32, message >= 128 KiB) -> topo large reduce-scatter, else original (dim != 0 stays on NCCL) |
 | `destroy` | logs the per-key call counters, closes the topo communicator |
+| `reduce_scatter_all_gather_matches_all_reduce` (property, added by r2c) | `True` when the communicator owns a `TopoComm`, `MUSE_TOPO_OPS` routes all three ops, the large algorithms are on and the bf16 exchange is off; vLLM's base class says `False` (NCCL's reduce-scatter + all-gather rounds differently from its ring all-reduce) |
+
+The property is the plugin's side of one contract: every topo reduction is one fp32 sum in a fixed order with a single final
+rounding, whatever the algorithm and the message size, so `all_gather(reduce_scatter(x, dim 0), dim 0) == all_reduce(x)` bit
+for bit (`bench/tests_h1b.py`, and `bench/test_plugin.py` on the shapes of the Muse sequence-parallel stream) for every tensor the
+topo path takes: bf16 / fp16 / fp32, a row count that is a multiple of 8, a size that is a multiple of 128 B between 128 KiB and
+2 GiB. Callers that shard a reduction along the rows read the property to know that sharding leaves the reduced values
+unchanged; the Muse model's `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=auto` is the first user. The three switches that turn the
+property off are exactly the ones under which that equality does not hold: an op that is not routed (it falls back to NCCL),
+`MUSE_TOPO_LARGE=0` (reduce_scatter and the large all-reduce go to NCCL) and `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` (the large
+algorithms round the island partials to bf16, the all-reduce below 2 MiB does not). The collective is only one of the ops of a
+sharded stream: whether the stream as a whole equals the replicated one also depends on the GEMMs that run on the local rows
+(see the branch's `_SequenceParallelRowGate`).
 
 `supports()` is the only eligibility gate. Nothing else changes: not the EP group (same ranks, would cost a second
 workspace), not `gather`, `reduce_scatterv*`, `all_gatherv`, send/recv.
@@ -114,6 +127,29 @@ One lock acquisition: `scripts/run_h1a.sh h2b tests other`, `bench/run_h1b.sh h2
   9.5e-7, p99 8.6e-6, max 1.3e-5 (same as H2: the large algorithm and the small ones are bitwise identical by design).
 * Per-op summary of the e2e run (`bench/summarize_ops.py`): 188 keys, 188 on topo, 0 NCCL fallbacks, 0 rank disagreements;
   the shapes reach `[16384,8192]` (256 MiB all-reduce) and the `[1024,25256]` logits gather.
+
+### r2c (2026-10-24): sequence parallelism by default, `reduce_scatter_all_gather_matches_all_reduce`
+
+Branch side (`muse/r2c-sp-auto`): `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL` is `auto` by default and shards a prefill batch only
+when this property holds and the sharded stream is bit for bit the replicated one at that batch size. Validation, real
+checkpoint, plugin on, SRC = the r2c tree:
+
+* `bench/test_plugin.py --quick`: 173 checks x 8 ranks, 0 failures, with the new ones: the property is `True` with the
+  `TopoComm` and `False` without it, and `all_gather(reduce_scatter(x, 0), 0) == all_reduce(x)` bitwise (and identical on all
+  ranks) for the sequence-parallel shapes `[520, 8192]`, `[1024, 4096]`, `[3000, 8192]`, `[4104, 4096]`, `[8192, 8192]`,
+  `[8192, 4096]`; all on the topo path, none on NCCL. `bench/test_plugin_unit.py`: the property's three switches.
+* Shadow run of the SP stream (62 layers, 8 ranks, every row-sliced op also run replicated on the gathered batch, rows compared
+  bitwise): `reduce_scatter` rows == `all_reduce` rows in 992 / 992 / 992 / 3968 calls at T = 1308 / 3000 / 4308 / 8192, and the
+  expert path (partial + RS + AG) == the replicated runner forward (isolated from the router) in every call. The only ops that
+  differ at some sizes are the cuBLAS pooler / unpooler / fp32 router on ceil(T / 8) rows (different split-K than on T rows); at
+  T = 8192 they agree and the whole stream is identical, which is what the branch's per-size gate admits.
+* End to end (`VLLM_ENABLE_V1_MULTIPROCESSING=0`, greedy, 56 requests with a mixed batch and 12000 / 20000-token chunked prompts,
+  ids + top-5 logprobs + prompt logprobs): `auto` vs `0`: 56 / 56 bitwise equal (12 sharded 8192-token forwards, 744
+  `reduce_scatter` calls per shape on rank 0, all topo). With NCCL (`MUSE_TOPO_ENABLE=0`) `auto` keeps the stream replicated
+  (property `False`): 56 / 56 equal to flag `0`.
+* Real-weight benchmark, plugin, `SEED=9000 LOAD_FORMAT=auto`, pp t/s flag `0` -> `auto` (flag `1`): c1 512/128 4058 -> 3979
+  (4470), ctx 13,107 6181 -> 7051 (7709), ctx 65,536 5937 -> 7411 (7424), ctx 117,964 5649 -> 6937 (6986); output tok/s random
+  512/128 at c16 / c64 / c128: 392 -> 393 / 712 -> 748 / 886 -> 979 (flag `1`: 412 / 787 / 1009).
 
 ### H2 (2026-10-23, small-message algorithms; superseded by the H2b numbers above where they overlap)
 
