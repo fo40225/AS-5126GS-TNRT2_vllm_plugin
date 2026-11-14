@@ -44,7 +44,9 @@ topo path takes: bf16 / fp16 / fp32, a row count that is a multiple of 8, a size
 unchanged; the Muse model's `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=auto` is the first user. The three switches that turn the
 property off are exactly the ones under which that equality does not hold: an op that is not routed (it falls back to NCCL),
 `MUSE_TOPO_LARGE=0` (reduce_scatter and the large all-reduce go to NCCL) and `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` (the large
-algorithms round the island partials to bf16, the all-reduce below 2 MiB does not). The collective is only one of the ops of a
+algorithms round the island partials to bf16, the all-reduce below 2 MiB does not). `env/host.env` turns that last one ON since
+2026-10-24 (throughput decision), so under the host launch environment the property is False and `SEQUENCE_PARALLEL=auto` never
+engages; the branch's default is the forced `SEQUENCE_PARALLEL=1`. The collective is only one of the ops of a
 sharded stream: whether the stream as a whole equals the replicated one also depends on the GEMMs that run on the local rows
 (see the branch's `_SequenceParallelRowGate`).
 
@@ -62,11 +64,11 @@ the previous stream (one "collective issued on a second stream" warning per rank
 | variable | default | meaning |
 |----------|---------|---------|
 | `MUSE_TOPO_ENABLE` | 0 (`env/host.env`: 1) | master switch (plugin and `TopoComm`) |
-| `MUSE_TOPO_OPS` | `all_reduce,all_gather,reduce_scatter` | ops routed to the topo path (A/B switch) |
+| `MUSE_TOPO_OPS` | `all_reduce,all_gather,reduce_scatter,boundary` | ops routed to the topo path (A/B switch); `boundary` = the fused collective + epilogue kernels (`docs/r2d_fused_epilogue.md`) |
 | `MUSE_TOPO_TIMEOUT_S` | 600 (plugin) | spin timeout of the kernels, then `__trap()`; `TopoComm` alone defaults to 10 s, which is too short for start-up skew (per-rank JIT/Triton compiles run while the other ranks already wait inside a collective) |
 | `MUSE_TOPO_MAX_BYTES` | `TopoComm` default (8 MiB) | largest all-reduce of the decode/medium algorithms (the workspace grows with it); larger all-reduces (up to 2 GiB), reduce_scatter and big all-gather shards use the chunked large algorithms through the same workspace, so there is no reason to raise it |
 | `MUSE_TOPO_LARGE` | 1 | 0 disables the large algorithms (A/B switch: all-reduce above 8 MiB, reduce_scatter and all-gather shards above 1 MiB then go to NCCL, as in H2) |
-| `MUSE_TOPO_LARGE_BF16_EXCHANGE` | 0 | opt-in, class `deterministic_different`: the large all-reduce / reduce_scatter exchange the two island partials rounded to bf16 (bf16 inputs only, half the bytes over the socket cut; batch invariant only inside the large algorithm, so with the flag on a row can get different bits depending on the padded batch size across the 2 MiB threshold). See the benchmark below and `docs/h1b_collectives.md` |
+| `MUSE_TOPO_LARGE_BF16_EXCHANGE` | 0 in the plugin (`env/host.env`: 1, the throughput default of 2026-10-24) | class `deterministic_different`: the large all-reduce / reduce_scatter exchange the two island partials rounded to bf16 (bf16 inputs only, half the bytes over the socket cut; batch invariant only inside the large algorithm, so with the flag on a row can get different bits depending on the padded batch size across the 2 MiB threshold). See the benchmark below and `docs/h1b_collectives.md` |
 | `MUSE_TOPO_LOG_OPS` | 0 | one-time per-op summary at info level: 1 = group rank 0, 2 = every rank (0: debug level) |
 | `VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS` | 4 in vLLM (`env/host.env`: 8 with `MUSE_TOPO_ENABLE=1`) | vLLM branch knob, not a plugin variable: CTAs of the decode L2 weight prefetch behind the experts of each layer. The plugin's layer (160 us) is shorter than the NCCL one (296 us), so the 4-CTA launch (113 us) is still running when the next pooler and router weights are due; 8 CTAs: TPOT 10.69 -> 9.80 ms at batch 1 (real weights, c1 512/128), whereas on NCCL 8 CTAs cost +1.1% (17.09 against 16.90 ms). Cache hint, no numeric effect |
 
@@ -199,7 +201,7 @@ Exact path vs `c_muse_ep8`: decode tg +67 .. +69 % (TPOT 19.5 -> 11.5 .. 11.7 ms
 prefill pp +8.7 % (c1, 512 tokens), +13.4 % (ctx10), +13.0 % (ctx50), +12.9 % (ctx90). Against the NCCL run of the same tree
 the prefill gain is +9.4 / +11.9 / +12.4 / +12.9 %. At ctx90 the prefill takes 2.67 s less (14.4 chunks of 8192 tokens: about
 186 ms per chunk, the isolated per-call numbers predicted 194 ms: 62 x (9.20 + 4.60 - 7.10 - 3.58 ms)). With the opt-in bf16
-exchange (`MUSE_TOPO_LARGE_BF16_EXCHANGE=1`, class `deterministic_different`, default OFF) the ctx90 prefill is 4.40 s shorter
+exchange (`MUSE_TOPO_LARGE_BF16_EXCHANGE=1`, class `deterministic_different`; the plugin default is OFF, `env/host.env` turns it ON) the ctx90 prefill is 4.40 s shorter
 (about 306 ms per chunk; predicted 312 ms), pp +15 % (c1) and +23 .. +28 % (ctx rows) vs `c_muse_ep8`; decode is unchanged (the decode all-reduces are
 below the large threshold). The H2 prefill rows (128 MiB all-reduces on NCCL) moved from +0.1 % to +12.9 %.
 
