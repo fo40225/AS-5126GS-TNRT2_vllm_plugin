@@ -33,10 +33,12 @@ all_reduce = both, fused into one pipelined launch per chunk. Bitwise identical 
 all_gather(reduce_scatter(x), dim 0) == all_reduce(x) bitwise. ``out`` of all_reduce may alias ``x``.
 Opt-in ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (or ``bf16_exchange=True``): the two island partials are rounded to bf16 before
 the final add (half the cut bytes, class deterministic_different, still rank-identical and run-to-run deterministic). It
-applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm (fp16 and fp32 keep the exact exchange: an
-fp16 partial above 65504 would overflow) and must be the same on all ranks. It is batch invariant only inside the large
-algorithm: all_reduce messages below 2 MiB (and reduce_scatter vs all_reduce between 128 KiB and 2 MiB) use the exact small
-algorithms, so with the flag on an element can get different bits depending on which algorithm its message size selects.
+applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm and, unless ``MUSE_TOPO_MEDIUM_BX=0``, to the bf16
+all_reduce calls of the medium algorithm (algorithm 2, ``BX`` kernel variant) from ``ar_bx_min`` (64 KiB) up to ``max_bytes``,
+with the same arithmetic as the large algorithm, so every bf16 all_reduce of at least 64 KiB gets the same bits whichever algorithm
+its size selects (docs/r3c_medium_ar.md); fp16 and fp32 keep the exact exchange (an fp16 partial above 65504 would overflow) and the
+flag must be the same on all ranks. Messages below ``ar_bx_min``, the fused all-reduce + boundary kernels (T <= 8) and
+reduce_scatter below 2 MiB keep the exact fp32 exchange, so an element can still get different bits depending on its message size.
 ``MUSE_TOPO_LARGE=0`` disables the large algorithms (supports() then keeps the H1a limits).
 
 Calls are asynchronous on the current CUDA stream, CUDA-graph safe (no host state per call), and must be issued
@@ -53,6 +55,9 @@ Arithmetic contract of all_reduce (every size and algorithm; bitwise identical o
 
     P_I = ((x_{m0} + x_{m1}) + x_{m2}) + x_{m3}   in fp32, m0..m3 = ranks of island I ascending
     out = round_to_dtype(P_0 + P_1)               in fp32, single final rounding
+
+With the bf16 exchange (bf16 inputs, see above) the contract is ``out = round_bf16(bf16(P_0) + bf16(P_1))``: each island
+partial is rounded to bf16 (round to nearest even), the sum of the two is formed in fp32 and rounded once.
 
 Islands are the two sockets ({0,1,2,3} and {4,5,6,7} on this host); partner(r) = r ^ 4. Words of the exchanged
 payload that equal 0xFFFFFFFF (a NaN pattern) are replaced by 0xFFFFFFFE, so NaN payloads may change (NaN stays NaN).
@@ -99,9 +104,29 @@ _AR_TABLE = [
     (4194304, 2, 8, 256, 1),
     (1 << 62, 2, 4, 256, 2),
 ]
-# all_reduce with the bf16 exchange of the island partials (algorithm 2 only, bf16 inputs, used from _AR_BX_MIN bytes when the
-# bf16 exchange is on); same row format. PLACEHOLDER: the exact-exchange configurations until the sweep has run.
-_AR_BX_TABLE = list(_AR_TABLE)
+# all_reduce with the bf16 exchange of the island partials (algorithm 2 only, bf16 inputs, used from _AR_BX_MIN bytes when the bf16
+# exchange is on); same row format. Measured with bench/bench_medium.py on 2026-10-26 (8 processes, CUDA graph of back-to-back calls,
+# bf16 [T, 8192]; sweep of grid x block x unroll, every candidate verified bitwise against the torch emulation, best configuration
+# retimed with the full protocol, fewest threads within 1.5 %); the comments give the b2b time and, in brackets, the exact-exchange
+# time of the best _AR_TABLE-style configuration at the same size. docs/r3c_medium_ar.md has the full table.
+_AR_BX_TABLE = [
+    (65536, 2, 8, 128, 1),  # 64 KiB 6.7 us (exact 8.1)
+    (98304, 2, 6, 256, 1),  # 96 KiB 7.7 (9.9)
+    (131072, 2, 8, 256, 1),  # 128 KiB 9.0 (11.9)
+    (196608, 2, 6, 512, 1),  # 192 KiB 11.5 (16.1)
+    (262144, 2, 64, 64, 1),  # 256 KiB 13.8 (18.9)
+    (393216, 2, 12, 256, 1),  # 384 KiB 18.6 (25.8)
+    (524288, 2, 16, 256, 1),  # 512 KiB 22.5 (33.3)
+    (786432, 2, 8, 512, 1),  # 768 KiB 32.8 (47.7)
+    (1048576, 2, 8, 512, 1),  # 1 MiB 43.1 (62.5)
+    (1572864, 2, 16, 128, 1),  # 1.5 MiB 63.3 (94.6)
+    (2097152, 2, 16, 128, 1),  # 2 MiB 82.8 (123.7)
+    (3145728, 2, 8, 256, 1),  # 3 MiB 122.2 (183.0)
+    (4194304, 2, 16, 128, 1),  # 4 MiB 161.4 (243.8)
+    (6291456, 2, 16, 128, 1),  # 6 MiB 241.0 (357.9)
+    (8388608, 2, 16, 128, 1),  # 8 MiB 321.3 (480.3)
+    (1 << 62, 2, 16, 128, 1),
+]
 _AG_TABLES = {
     0: [  # layout 0: dim = -1 (column concatenation)
         (1024, 1, 2, 128, 1),
@@ -160,8 +185,11 @@ _AGL_TABLE = [
 # 90.2 (a tie), 2 MiB 120.4 vs 115.8, 2.5 MiB 150.9 vs 143.0, 3 MiB 179.3 vs 169.2: the crossover is at 2 MiB. The full-model EP8 runs
 # (docs/h2_vllm_plugin.md) confirm the tables end to end.
 _AR_LARGE_MIN = 2 << 20  # messages below use the H1a algorithms (up to max_bytes): they win at 1 MiB (61.3 vs 63.6 us)
-_AR_BX_MIN = 64 << 10  # bf16 all-reduces from this size on use the bf16 exchange of algorithm 2 (when it is on)
-_AR_LARGE_MIN_BX = 2 << 20  # ... and the large algorithm from this size on
+_AR_BX_MIN = 64 << 10  # bf16 all-reduces from this size on use the bf16 exchange of algorithm 2 (when it is on): 6.7 vs 8.1 us at 64 KiB
+# With the bf16 exchange algorithm 2 beats the large algorithm at every size up to its workspace limit (1 MiB 43.1 vs 64.3 us,
+# 2 MiB 82.8 vs 97.4, 8 MiB 321 vs 365: the large one moves the all-gather half of the result over the cut as well), so the large
+# algorithm only takes the messages above max_bytes.
+_AR_LARGE_MIN_BX = 1 << 62
 _RS_MIN_BYTES = 128 << 10
 _AG_LARGE_MIN = 256 << 10  # shards from this size on use the large engine instead of the H1a flag path (10.4 vs 11.4 us at 128 KiB)
 _LARGE_MAX_BYTES = 2 << 30

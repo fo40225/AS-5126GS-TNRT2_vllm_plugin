@@ -63,7 +63,10 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── locked_job.sh            在 GPU lock 下 detached 執行任意指令，log 與 DONE marker 寫到 work/host/logs
 │   ├── run_h1a.sh               小訊息演算法的驗證序列（steps：smoke tests bench_* topology unit ...）
 │   ├── run_h2.sh                vLLM plugin 的驗證序列（steps：plugin e2e_* compare ops bench* real_* ...）
-│   └── prefill_chain.sh         一次 lock 內依序啟動多組 server 設定、量單一 request 的 prefill latency（microbatched prefill 的 A/B；搭配 bench/prefill_probe.py）
+│   ├── prefill_chain.sh         一次 lock 內依序啟動多組 server 設定、量單一 request 的 prefill latency（microbatched prefill 的 A/B；搭配 bench/prefill_probe.py）
+│   ├── run_r3c.sh               medium all-reduce（r3c）的驗證 / 量測步驟（steps：medium_test h1a_quick h1b_quick bench_* ...）
+│   ├── r3c_chain.sh             r3c 在一次 GPU lock 內的完整序列：測試、sweep、產生 table、dispatch 檢查、real-weight concurrency A/B、GSM8K smoke
+│   └── conc_sweep.sh            real weights、單一 server session 的 concurrency sweep（random 512/128，可重複；r2 sweep script 的參數化副本）
 ├── nccl/
 │   ├── graph_r4.xml             NCCL graph file（deterministic_different；`env/host.env` 預設使用，見第 5、6 節）
 │   ├── bitwise.py               PyNccl all-reduce 的 bitwise identity 測試（8 ranks，eager + CUDA graph）
@@ -77,7 +80,8 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── h1b_collectives.md       large-message all-reduce / reduce-scatter / all-gather
 │   ├── h1b_latency.md           large-message latency 表
 │   ├── h2_vllm_plugin.md        plugin 的 patch 範圍、環境變數、驗證紀錄、benchmark、review fixes、限制
-│   └── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
+│   ├── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
+│   └── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
 
@@ -90,9 +94,9 @@ AS-5126GS-TNRT2_vllm_plugin/
 
 | 類別 | 檔案 |
 |------|------|
-| correctness（8 processes、GPU lock 下執行） | `tests_h1a.py`、`tests_h1b.py`、`test_epoch.py`、`test_timeout.py`、`test_timeout_large.py`、`test_init_failure.py`、`check_ctx.py`、`smoke.py`、`test_plugin.py`（8 ranks、經 vLLM wrapper）；CPU-only：`test_plugin_unit.py`、`test_topology.py` |
+| correctness（8 processes、GPU lock 下執行） | `tests_h1a.py`、`tests_h1b.py`、`test_epoch.py`、`test_timeout.py`、`test_timeout_large.py`、`test_init_failure.py`、`check_ctx.py`、`smoke.py`、`test_plugin.py`（8 ranks、經 vLLM wrapper）、`test_medium_bx.py`（medium all-reduce 的 bf16 exchange）；CPU-only：`test_plugin_unit.py`、`test_topology.py` |
 | 第二套獨立的 H1a 測試 | `test_h1a.py` + `hlib.py` + `test_topology.py` |
-| benchmark / 表格 | `bench_h1a.py`、`bench_h1b.py`、`make_table*.py`、`summarize_h1a.py`、`summarize_h1b.py`、`summarize_ops.py`、`trace_h1a.py`、`trace_h1b.py`、`build_ext.py` |
+| benchmark / 表格 | `bench_h1a.py`、`bench_h1b.py`、`bench_medium.py`（medium all-reduce sweep）、`make_table*.py`（含 `make_table_medium.py`）、`summarize_h1a.py`、`summarize_h1b.py`、`summarize_ops.py`、`trace_h1a.py`、`trace_h1b.py`、`build_ext.py` |
 | 研究 probe（不屬於 runtime） | `a2a_probe.py`、`ce_cut_probe.py`、`host_relay_probe.py` |
 | end-to-end | `e2e_prompt_lp.py`（teacher-forced logprob）、`e2e_real.py`（real weights、62 層）、`e2e_overlap.py`（real weights、長 prompt / chunked prefill / mixed batch，microbatched prefill 的 A/B）、`chat_check.py`（greedy chat 檢查） |
 | runner | `run_h1b.sh` |
@@ -197,6 +201,7 @@ accuracy class 的定義（對照目前 branch 的輸出）：
 | `MUSE_TOPO_TIMEOUT_S` | 600（plugin） | - | kernel 等不到 peer 時 `__trap()` 的秒數（`TopoComm` 單獨使用預設 10 s；vLLM 啟動時各 rank 可能差數十秒，所以 plugin 用 600） |
 | `MUSE_TOPO_LOG_OPS` | 0 | - | 每個 (op, dim, shape, dtype, stream, capturing, path) 第一次呼叫印一行；0 = debug level、1 = rank 0、2 = 每個 rank |
 | `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` | plugin 預設 OFF；**`env/host.env` 預設 ON**（2026-10-24 決策；`=0` 回到 exact 的 fp32 exchange） | **deterministic_different** | 大訊息 all-reduce / reduce_scatter 的跨 socket partial 先 round 成 bf16（跨 socket bytes 減半）。只對 bf16；fp16 / fp32 維持 exact。確定性、rank 相同，但不是 fp32 加總單次 rounding 的結果；只在 large 演算法內 batch invariant（< 2 MiB 的訊息仍走 exact 演算法，所以跨 2 MiB 門檻時同一 row 的 bits 會隨 padded batch size 改變）。final defaults 的驗證（real weights，2026-10-26，vLLM `muse/integ` 468ea2ed86 + 本資料夾，其中大訊息 all-reduce / reduce_scatter 走 bf16 exchange）：GSM8K 200 x 2 為 96.5 %（192 / 200、194 / 200；對照 NCCL 96.2 %、plugin 95.5 %、+SP+bf16x 96.2 %），兩個 cold process 的 determinism A/B（56 個 requests 加 in-process 重複，token ids / logprobs / prompt logprobs）bitwise 相同。128 MiB all-reduce 7.10 -> 5.84 ms |
+| `MUSE_TOPO_MEDIUM_BX`、`MUSE_TOPO_MEDIUM_BX_MIN_BYTES` | **預設 ON**（1；只在 `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` 時生效）、64 KiB | **deterministic_different** | 同一個 bf16 exchange 用在 medium 的 bf16 all-reduce（64 KiB .. 8 MiB：decode 的 attn-out `[T, 8192]` T >= 9 與 MoE-out `[T, 4096]` T >= 8；演算法 2 的 `BX` 變體，與 large 演算法逐 bit 相同）。跨 socket bytes 減半：1 MiB 62.5 -> 43.1 us、512 KiB 33.3 -> 22.6 us；real weights c16 / c64 / c128 out tok/s +2.2 / +2.9 / +1.9 %；GSM8K 97.5 / 96.5 %（見 `docs/r3c_medium_ar.md`）。`=0` 回到 exact 的 fp32 exchange。T <= 8 的 fused attn-out kernel 維持 exact。`MUSE_TOPO_AR_TUNING_FILE` 是實驗用 hook |
 | `NCCL_GRAPH_FILE=<host folder>/nccl/graph_r4.xml` | **`env/host.env` 預設 ON**（檔案存在時 export；呼叫端已設定 `NCCL_GRAPH_FILE` 時以呼叫端的值為準） | **deterministic_different** | 合法的 4-channel ring，NCCL 在 <= 512 KiB 改用 LL。2026-10-21 實測 decode 51.2 -> 70.2 t/s（prefill 不變），但**不是 bitwise identical**（小而奇數 row 的 shape 有 1 bf16 ulp 差；end-to-end 3/20 mixed-batch requests 在 decode 發散，|dlogprob| <= 3.8e-6）。與 topo plugin 同時開啟時，TP collectives 都已繞過 NCCL，graph file 只影響 fallback（非 TP group 與不在 envelope 的呼叫）；這個組合已隨 final defaults 的 GSM8K 與 determinism A/B 驗證過（見上一列），throughput 列（`r2fin_*`）另行量測 |
 | `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP`（vLLM branch 的 flag，不是 plugin 的；plugin 只負責把 comm stream 上 collective 的結果配置在 compute stream，見 `docs/h2_vllm_plugin.md`「Microbatched prefill」） | ON | deterministic_different | 把 eager batch（>= 2050 tokens）切成兩個 microbatch，一個的 TP collective 在 comm stream 上與另一個的 compute 重疊。real weights prefill（ctx10 / 50 / 90）：replicated stream +33 / +30 / +27 %，sequence-parallel stream +14 / +13 / +11 %；decode 不變。run-to-run bitwise 相同（兩個 process、replicated 與 SP 兩條 stream 都驗證過）；與不切分的輸出有 rounding 等級的差異。只在 V2 runner 能 microbatch 的 launch 生效：需 `--limit-mm-per-prompt '{"image":0,"audio":0,"video":0}'`（所有 modality 都要設 0），且沒有 PIECEWISE CUDA graph / context parallel / spec decode / LoRA / `VLLM_BATCH_INVARIANT`；其他 launch 上 flag 無作用，也不會改變 runner。memory profile 會多跑一次切分後的 batch，KV pool 約少 0.65 GiB / GPU |
 | `MUSE_TOPO_PDL=1`、`MUSE_TOPO_STRICT_STREAM=1`、`MUSE_TOPO_VERBOSE=1`、`MUSE_TOPO_TRACE=1` | OFF | - | 實驗 / 除錯用：PDL（back-to-back -0.3 us，kernel 之後 +0.1 .. 0.2 us，所以關閉）、第二條 stream 直接報錯、JIT build log、in-kernel timeline（需另一份 JIT build，只給 `trace_*.py`） |
@@ -261,6 +266,19 @@ all_gather `[1,512]` 3.86 us（NCCL 24.74 us）。
 
 pp / tg：c1 4989 / 85.5、ctx10 6814 / 88.1、ctx50 6473 / 86.2、ctx90 6186 / 87.1（TTFT 19,069 ms）。對 `c_muse_ep8`：pp +14.6 / +27.6 / +24.3 / +23.2 %；對 exact 的 `topo_h2b_ep8`：
 pp +6.7 / +11.8 / +9.7 / +8.9 %（ctx90 每個 chunk 再省約 120 ms）。decode 不變（decode 的 all-reduce 低於 large 門檻）。accuracy class 為 `deterministic_different`；plugin 本身預設 OFF，`env/host.env` 預設 ON（見第 5 節）。
+
+### 6.4b medium all-reduce 的 bf16 exchange（r3c，`MUSE_TOPO_MEDIUM_BX`，預設 ON；real weights，2026-10-26，`r3c_c1_conc_bx{0,1}`、`r3c_c1_acc`）
+
+同一個 server 設定、每列一個 session、每個 concurrency 兩次重複（random 512/128，out tok/s / TPOT ms；`bx0` = `MUSE_TOPO_MEDIUM_BX=0` = r2fin 行為）：
+
+| concurrency | bx0 | bx1（預設） | 差異 |
+|---|---|---|---|
+| 1 | 96.3 / 9.63 | 96.7 / 9.58 | +0.5 %（noise） |
+| 16 | 481.1 / 27.41 | 491.5 / 26.43 | +2.2 % |
+| 64 | 905.7 / 56.69 | 931.8 / 54.70 | +2.9 %（TPOT -1.99 ms） |
+| 128 | 1156.5 / 91.79 | 1178.9 / 89.66 | +1.9 % |
+
+microbenchmark（CUDA graph b2b，us）：256 KiB 18.9 -> 13.8、512 KiB 33.3 -> 22.5、1 MiB 62.5 -> 43.1、2 MiB 123.7 -> 82.8、8 MiB 480 -> 321；在 8 MiB 以內都比 large 演算法快。GSM8K（real weights、c64、200 題 x 2 pass）97.5 / 96.5 %（沒有 medium exchange 的 `r2integ_acc`：96.0 / 97.0 %）。完整表格、測試與限制見 `docs/r3c_medium_ar.md`。
 
 ### 6.5 NCCL graph file（2026-10-21，dummy weights，`c_muse_gf_ep8`，當時未採用；2026-10-24 起 `env/host.env` 預設使用，只影響 plugin 之外的 NCCL collectives）
 
@@ -363,13 +381,14 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 * 數值：exchange payload 中等於 `0xFFFFFFFF` 的 32-bit word（NaN pattern）會被換成 `0xFFFFFFFE`，所以 NaN payload 可能與 NCCL 不同（仍是 NaN）。LL8 的 tag 約每 2^33 次 launch 重複一次（殘餘風險，沒有實測到）。
 * bf16 exchange 與 NCCL graph file 都是 `deterministic_different`，現為 `env/host.env` 的預設（使用者 2026-10-24 決策）；final defaults 的 GSM8K 與 determinism A/B 已通過（第 5 節）。
   bf16 exchange 在兩個 partial 互相抵銷時最大誤差可到約 32640 ulp，且對 padded batch size 不是 batch invariant；需要 exact 結果或批次不變性的場合設 `MUSE_TOPO_LARGE_BF16_EXCHANGE=0`。
+  medium all-reduce 的 bf16 exchange（r3c）讓 decode 範圍內出現新的 batch size 邊界：attn-out 在 T <= 8（fused kernel，exact）與 T >= 9（bf16 exchange）之間、MoE-out 在 T = 4 與 8 之間；只想關掉這一項設 `MUSE_TOPO_MEDIUM_BX=0`。
 * 研究 probe（`a2a_probe.py`、`ce_cut_probe.py`、`host_relay_probe.py`）顯示：cross-socket 的 copy engine 或 host relay 做 cut transport 沒有實質增益（host relay 約 13 GB/s per GPU，island egress 隨後成為瓶頸，估計最多約 15 %，未實作）。
 * 已知的後續項目：把 LL8 tag 的 64-bit modulo 換成 compare / select 可省約 0.05 us per all-gather（每個 decode step 約 6 us，未出貨，需再做一輪驗證）。
 
 ## 9. 文件索引與資料位置
 
 * 實測拓樸與瓶頸：`docs/topology.md`；演算法與 API：`docs/h1a_collectives.md`、`docs/h1b_collectives.md`；latency 表：`docs/h1a_latency.md`、`docs/h1b_latency.md`；
-  plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`。
+  plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
 * 伺服器上的資料（不在本資料夾）：benchmark 結果 `/raid/vllm-runtime/musetest/results/<tag>/`；測試 / benchmark 的 log 與 jsonl `/raid/vllm-runtime/work/host/`；
   JIT cache `/raid/vllm-runtime/sm120-dev/vllm_cache/muse_topo/`；拓樸量測 script 與原始結果 `/raid/vllm-runtime/musetest/topo/`；NCCL 量測 `/raid/vllm-runtime/musetest/nccl/`。
 * 歷史：H1a（小訊息演算法）、H1b（large-message 演算法）、H2 / H2b（vLLM plugin）、review fixes（64-bit counter / flags、supports() 與 kernel 一致、fp16 的 bf16 exchange 溢位、對齊與 stream 規則，2026-10-24）、H3（本資料夾的定稿）。

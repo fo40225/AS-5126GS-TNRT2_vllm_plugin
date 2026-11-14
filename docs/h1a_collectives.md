@@ -61,6 +61,12 @@ are bitwise identical on every rank (including the sign of zero), across runs, a
 The only deviation from raw IEEE behavior: a 32-bit payload word equal to `0xFFFFFFFF` (a NaN pattern, two bf16/fp16
 NaNs or one fp32 NaN) is replaced by `0xFFFFFFFE` before it is used, so NaN payloads may differ from NCCL's.
 
+Opt-in variant (r3c, `docs/r3c_medium_ar.md`, bf16 inputs only, `MUSE_TOPO_LARGE_BF16_EXCHANGE=1`): algorithm 2 has a `BX` kernel variant
+that rounds both island partials to bf16 before the final add, `out = round_bf16(bf16(P_0) + bf16(P_1))`; class
+`deterministic_different`. It halves the bytes of the partner exchange over the socket cut and is what the dispatch uses for bf16
+messages from 64 KiB on when the flag is set. The statement above ("across sizes and across algorithms") then holds among the bf16
+messages of 64 KiB and more (medium and large algorithm give the same bits), not between those and the exact messages below 64 KiB.
+
 ## Algorithms and protocols
 
 | id | op | scheme | protocol |
