@@ -31,9 +31,13 @@
 # FP8_F1_MAX_BYTES (flag 1); a Marlin boot is checked against the cutlass value of its flag (it leaves 124 MiB more room: safe, not derived); a FP8 boot without the aux projection on the target's rows is checked
 # against R2E_ON_MAX_BYTES. SPEC_EXPECT_FP8=off|1|2 and SPEC_EXPECT_FP8_KERNEL=cutlass|marlin demand the state (default: no expectation unless this shell exports the flag).
 # S1-9 L11 (sequence parallel inside the FULL decode graphs, MUSE_SPEC_GRAPH_SP_MIN_TOKENS / MUSE_SPEC_GRAPH_CAP of env/spec_k7.env, both off / 256 by default): the vLLM branch logs, once per boot and only when the graph floor is on,
-# "sequence parallel inside FULL decode CUDA graphs for batches of at least <g> tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=<env>; eager, mixed and PIECEWISE batches keep the floor of <floor> tokens)". The state is read from that
-# line, never from the env: SPEC_EXPECT_GRAPH_SP=off|<g> demands it (default: this shell's MUSE_SPEC_GRAPH_SP_MIN_TOKENS if it is exported and not 0, raised to 129, else no demand), the floor on the line must be the floor of the first line, and a
+# "sequence parallel inside FULL decode CUDA graphs for batches of at least <g> tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=<env>; decode MoE engines serve up to <E> tokens; eager, mixed and PIECEWISE batches keep the floor of <floor> tokens)".
+# The state is read from that line, never from the env: SPEC_EXPECT_GRAPH_SP=off|<g> demands it (default: this shell's MUSE_SPEC_GRAPH_SP_MIN_TOKENS if it is exported and not 0; an expected value is raised to the engine limit E + 1 of the line, the vLLM
+# rule: 129 in production), else no demand), the floor on the line must be the floor of the first line and max(<env>, E + 1), and a
 # set VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS without the line (a warning of the vLLM branch: no graphs, or a tree without the feature) FAILS. The default expected floor is max(384, cap + 1) (the eager floor is cap + 1 above 383).
+# The line alone does not prove that a graph is sharded (it is printed from the env, also with a PIECEWISE-only or FULL-mixed capture list): the graph manager also logs, once per worker,
+# "CUDA graphs: <N> FULL decode graphs are flagged full_decode_graph (token counts <lo>..<hi>), <M> other FULL graphs, <K> PIECEWISE graphs." and an armed boot FAILS unless every worker logged the same line with N > 0 and <hi> >= the graph floor (a flagged FULL decode
+# graph at or above the floor is what the sharded stream is captured in). The OK line prints "flagged=<N>@<lo>..<hi>".
 # A cap above 256 (A1b: the capture list reaches cap, the graph pool grows) has no derived bytes: it is checked against SPEC_CAP_MAX_BYTES=<bytes> (the S1-7 value of that cap) and FAILS without it; at cap 256 the graph floor changes no bytes (the pool shrinks 0.95 -> 0.89 GiB: the
 # production maximum stays safe, exact bytes with the smaller pool are the gate's job).
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
@@ -63,33 +67,68 @@ if [ "$cap" != 512 ] && [ -r "$cmd" ] && ! grep -q -E -e "$flag_re" "$cmd"; then
   echo "FAIL serve_cmd.txt has no --max-cudagraph-capture-size $cap"; rc=1
 fi
 # sequence parallel inside the FULL decode graphs (S1-9 L11): the state comes from the log line
-graph_re='sequence parallel inside FULL decode CUDA graphs for batches of at least [0-9]+ tokens \(VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=[0-9]+; eager, mixed and PIECEWISE batches keep the floor of [0-9]+ tokens\)'
-gsp_seen=$(grep -a -o -E "$graph_re" "$log" | sed -E 's/.*at least ([0-9]+) tokens.*MIN_TOKENS=([0-9]+);.*floor of ([0-9]+) tokens\)/\1 \2 \3/' | sort | uniq -c)
+graph_re='sequence parallel inside FULL decode CUDA graphs for batches of at least [0-9]+ tokens \(VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=[0-9]+; decode MoE engines serve up to [0-9]+ tokens; eager, mixed and PIECEWISE batches keep the floor of [0-9]+ tokens\)'
+gsp_seen=$(grep -a -o -E "$graph_re" "$log" | sed -E 's/.*at least ([0-9]+) tokens.*MIN_TOKENS=([0-9]+); decode MoE engines serve up to ([0-9]+) tokens;.*floor of ([0-9]+) tokens\)/\1 \2 \3 \4/' | sort | uniq -c)
 gsp=off
 gsp_env=0
+gsp_engine=
 if [ -n "$gsp_seen" ]; then
   if [ "$(echo "$gsp_seen" | wc -l)" != 1 ]; then
-    echo "FAIL the workers disagree on the graph floor (count graph_floor env eager_floor):"; echo "$gsp_seen"; rc=1
+    echo "FAIL the workers disagree on the graph floor (count graph_floor env engine_max eager_floor):"; echo "$gsp_seen"; rc=1
   else
-    gsp=$(echo "$gsp_seen" | awk '{print $2}'); gsp_env=$(echo "$gsp_seen" | awk '{print $3}'); gsp_eager=$(echo "$gsp_seen" | awk '{print $4}')
+    gsp=$(echo "$gsp_seen" | awk '{print $2}'); gsp_env=$(echo "$gsp_seen" | awk '{print $3}'); gsp_engine=$(echo "$gsp_seen" | awk '{print $4}'); gsp_eager=$(echo "$gsp_seen" | awk '{print $5}')
     if [ "$gsp_eager" != "$floor" ]; then
       echo "FAIL the graph floor line names the eager floor $gsp_eager, expected $floor"; rc=1
     fi
-    if [ "$gsp" -le 128 ]; then
-      echo "FAIL graph floor $gsp is not above the muse decode engine's 128 tokens"; rc=1
+    if [ "$gsp" -le "$gsp_engine" ]; then
+      echo "FAIL graph floor $gsp is not above the decode MoE engines' $gsp_engine tokens"; rc=1
+    fi
+    want_floor=$(( gsp_env > gsp_engine + 1 ? gsp_env : gsp_engine + 1 ))
+    if [ "$gsp" != "$want_floor" ]; then
+      echo "FAIL graph floor $gsp on the line is not max(env $gsp_env, engine limit $gsp_engine + 1) = $want_floor"; rc=1
     fi
   fi
 fi
 want_gsp=${SPEC_EXPECT_GRAPH_SP:-}
 if [ -z "$want_gsp" ] && [ "${MUSE_SPEC_GRAPH_SP_MIN_TOKENS:-0}" != 0 ]; then
   want_gsp=$MUSE_SPEC_GRAPH_SP_MIN_TOKENS
-  [ "$want_gsp" -le 128 ] && want_gsp=129
+fi
+if [ -n "$want_gsp" ] && [ "$want_gsp" != off ]; then
+  # an expected value is raised to the engine limit + 1 of the boot, as the vLLM branch does (the limit is on the line)
+  eng=${gsp_engine:-128}
+  [ "$want_gsp" -le "$eng" ] && want_gsp=$((eng + 1))
 fi
 if [ -n "$want_gsp" ] && [ "$want_gsp" != "$gsp" ]; then
   echo "FAIL the graph floor is $gsp in the log, expected $want_gsp (the flag was set but the boot logged no graph-floor line: no CUDA graphs, or a tree without the feature)"; rc=1
 fi
 if [ -z "$gsp_seen" ] && [ "${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-0}" != 0 ]; then
   echo "FAIL VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=$VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS is set in this shell but the boot logged no graph-floor line"; rc=1
+fi
+# the graph manager's line: how many FULL decode graphs run the model with the flag (an armed floor needs one at or above it)
+flagged_re='CUDA graphs: [0-9]+ FULL decode graphs are flagged full_decode_graph \(token counts (none|[0-9]+\.\.[0-9]+)\), [0-9]+ other FULL graphs, [0-9]+ PIECEWISE graphs\.'
+flag_seen=$(grep -a -o -E "$flagged_re" "$log" | sed -E 's/CUDA graphs: ([0-9]+) FULL decode graphs are flagged full_decode_graph \(token counts (none|[0-9]+)(\.\.([0-9]+))?\),.*/\1 \2 \4/' | sort | uniq -c)
+flagged=-
+if [ -n "$flag_seen" ]; then
+  if [ "$(echo "$flag_seen" | wc -l)" != 1 ]; then
+    echo "FAIL the workers disagree on the number of flagged FULL decode graphs (count flagged lo hi):"; echo "$flag_seen"; rc=1
+  else
+    n_flag_lines=$(echo "$flag_seen" | awk '{print $1}')
+    n_flagged=$(echo "$flag_seen" | awk '{print $2}'); flag_lo=$(echo "$flag_seen" | awk '{print $3}'); flag_hi=$(echo "$flag_seen" | awk '{print $4}')
+    [ "$n_flagged" = 0 ] && flagged=0 || flagged="$n_flagged@$flag_lo..$flag_hi"
+    n_workers_log=$(grep -a -c 'Model loading took' "$log")
+    if [ "$n_workers_log" -gt 0 ] && [ "$n_flag_lines" != "$n_workers_log" ]; then
+      echo "FAIL $n_flag_lines of $n_workers_log workers logged the flagged-graph line"; rc=1
+    fi
+  fi
+fi
+if [ "$gsp" != off ]; then
+  if [ -z "$flag_seen" ]; then
+    echo "FAIL the graph floor is armed ($gsp) but the boot logged no flagged-graph line (\"CUDA graphs: <N> FULL decode graphs are flagged ...\"): a tree without it, or the capture did not run"; rc=1
+  elif [ "$flagged" = 0 ]; then
+    echo "FAIL the graph floor is armed ($gsp) but no FULL decode graph is captured (flagged 0): the floor is inert; the cudagraph mode lacks FULL decode graphs"; rc=1
+  elif [ "${flag_hi:-0}" -lt "$gsp" ]; then
+    echo "FAIL the graph floor is armed ($gsp) but the largest flagged FULL decode graph has $flag_hi tokens: no captured graph is sharded"; rc=1
+  fi
 fi
 # a capture list above 256 tokens has no derived bytes
 cap_bytes_note=
@@ -189,5 +228,5 @@ if [ -r "$cmd" ]; then
     echo "FAIL serve_cmd.txt has no --max-num-batched-tokens $mnbt"; rc=1
   fi
 fi
-[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt$cap_bytes_note ($pool)"
+[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt$cap_bytes_note ($pool)"
 exit $rc
