@@ -4,10 +4,10 @@
 > production is now the 0.33.0 line (`sm120-muse-spark-open` `f6a60ab9d7`, host `942acddc48`: spec KV bytes without a tier 11,720,212,480, `--max-num-scheduled-tokens 8192`, fused boundary default on, `NCCL_IB_DISABLE=1`, `VLLM_PLUGINS=muse_topo`).
 > S1-10R phase 3 measured the flag-keyed and bytes values on that line (sections 4 and 5, subsections "0.33.0"): per-rank tier **P* = 51,814,072,320 B** (48.26 GiB), offload-on GPU bytes **spec 11,645,337,600 / ns256 16,854,810,624 / ns128 17,257,267,200**,
 > bytes per block-id unchanged (20,480 / 65,536); `env/offload.env` and the checks carry these. Everything else in the tables of sections 1-5 (the 45 GiB tier, the A_N of the 0.32.0 box, the 90 MiB page tables, the old S_live figures, the reuse and decode numbers) stays a
-> **0.32.0 measurement**, kept as the study record. The 0.33.0 gate chain (phase 4) has not run: the new values are gate inputs, not an adoption. The offload branch is `s110r-offload` (rebased onto host main without changing the design or the frozen gate tools).
+> **0.32.0 measurement**, kept as the study record. **Update 2026-11-12 (S1-10R phase 4 final verdict, section 11): the 0.33.0 gate chain ran and the offload is ADOPTED for the speculative production profile** (`VERDICT ADOPT_SPEC=yes ADOPT_NS256=yes NS128_SHIPPED=yes failed=[]` under POST-HOC amendment 5; the raw chain line stays in section 11). `env/spec_k7.env` sources `env/offload.env`, `MUSE_OFFLOAD=0` opts out; ns256 is the RECOMMENDED launch line and ns128 is shipped as an offload profile (section 7). The offload branch is `s110r-offload` (rebased onto host main without changing the design or the frozen gate tools).
 
 Launch-scoped plus two generic vLLM commits (branch `muse/s110-offload` on `sm120-muse-spark-open` 268c64b0e2): 9388ed1133 "Keep a local KV cache connector from turning on the multimodal embedding path of a text-only launch" (needed) and
-359cdc74aa "Add a NUMA memory policy option (bind | preferred)" (optional, section 8). Host side: `env/offload.env` (sourced after `env/host.env`, before `env/spec_k7.env`), `scripts/check_offload_launch.sh` (the boot check), `bench/s110/` (the tools).
+359cdc74aa "Add a NUMA memory policy option (bind | preferred)" (optional, section 8). Host side: `env/offload.env` (sourced after `env/host.env`; `env/spec_k7.env` sources it itself since the S1-10R adoption, the gate sourced it explicitly before `spec_k7.env` with identical exports), `scripts/check_offload_launch.sh` (the boot check), `bench/s110/` (the tools).
 Measured on `sm120-muse-spark-open` 268c64b0e2 + 9388ed1133 and host 6f47eb1790, real weights, EP8 + TP8, fp8 KV, max-model-len 131072. The pre-registered adoption rule and its amendments are in `bench/s110/rules/`.
 
 **Result in one paragraph.** Offload gives a large benefit on revisited long prefixes and costs nothing measurable without reuse (the reuse numbers below are the BEST CASE of a tier: whole stored prompts re-sent cyclically over a working set 1.6x the GPU pool, 4 clients, no background decode, an upper bound of what mixed
@@ -250,26 +250,54 @@ two recomputes of the same prompt without any connector are text-equal in only 1
 
 ## 7. Launch lines and the check
 
-Speculative production line with the tier (source order matters: `offload.env` sets `MUSE_SPEC_KV_BYTES_OVERRIDE`, which `spec_k7.env` reads when it is sourced):
+**Production speculative line (offload ON by default since the S1-10R adoption, 2026-11-12).** `env/spec_k7.env` sources `env/offload.env` for the speculative profile (`MUSE_OFFLOAD_PROFILE=spec` for that source, whatever the shell had) before it reads
+`MUSE_SPEC_KV_BYTES_OVERRIDE`; `MUSE_OFFLOAD` defaults to 1 (a value other than 0 or 1 is an error). Run `scripts/preflight_offload.sh` before EVERY ON boot (P* = 51,814,072,320 B per rank is valid only while the node 7 reclaimable slab is below ~0.3 GiB; the preflight
+checks the free memory of the four GPU nodes against it and exits 1 when a node is short), and both post-boot checks after it:
 
-    source $HOST_DIR/env/host.env; source $HOST_DIR/env/offload.env; source $HOST_DIR/env/spec_k7.env
+    source $HOST_DIR/env/host.env; source $HOST_DIR/env/spec_k7.env       # offload ON; sourcing offload.env explicitly before spec_k7.env (the gate's order) gives identical exports
+    $HOST_DIR/scripts/preflight_offload.sh                                 # rc 0 required before an ON boot
     vllm serve unsloth/Muse-Spark-Open-816B-A42B-NVFP4 --tensor-parallel-size 8 --max-model-len 131072 --gpu-memory-utilization 0.95 --host 127.0.0.1 --port 8100 --enable-expert-parallel \
       --max-num-seqs 128 --kv-cache-dtype fp8 --quantization modelopt_fp4 --limit-mm-per-prompt '{"image":0,"audio":0,"video":0}' --reasoning-parser muse --tool-call-parser muse --enable-auto-tool-choice \
       --speculative-config '{"draft_sample_method":"probabilistic","method":"dflash","model":"<RadixArk DFlash2 snapshot>","num_speculative_tokens":7,"rejection_sample_method":"block"}' \
       --per-request-spec-decode-metrics detailed $MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS
     # = ... --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 11645337600 --numa-bind \
     #     --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":414512578560,"cpu_bytes_to_use_per_rank":51814072320}}'
-    # (0.33.0 values; the 0.32.0 study line was --kv-cache-memory-bytes 11525693440 with 386547056640 / 48318382080)
+    # (byte for byte the serve_extra.txt of the gated boot s110r_fulltier_spec_a5; the 0.32.0 study line was --kv-cache-memory-bytes 11525693440 with 386547056640 / 48318382080)
+    SPEC_EXPECT_FB=1 $HOST_DIR/scripts/check_spec_launch.sh <serve.log>    # rc 0
+    $HOST_DIR/scripts/check_offload_launch.sh <serve.log>                  # rc 0, with the sourced shell above
 
-Non-speculative (`MUSE_OFFLOAD_PROFILE=ns256 source env/offload.env` after `env/host.env`): `--max-num-seqs 256 --max-cudagraph-capture-size 256 --kv-cache-memory-bytes 16854810624 $MUSE_OFFLOAD_SERVE_ARGS` (ns128: `--max-num-seqs 128`, bytes 17,257,267,200; 0.33.0 values with the P* tier).
 Through the harness: `SERVE_EXTRA="$MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS" SPEC_CONFIG=dflash2_radixark ... serve_sd.sh <tag> ...` (the JSON has no spaces: `SERVE_EXTRA` is split on whitespace).
 
-After every boot: `scripts/check_spec_launch.sh <serve.log>` (speculative) and `scripts/check_offload_launch.sh <serve.log>` (with `env/offload.env` sourced in the checking shell). The second one checks from the log and `serve_cmd.txt`: the eight bindings
+**The bytes and the offload arguments travel together.** `MUSE_SPEC_SERVE_ARGS` stays offload-free and the offload arguments come last through `$MUSE_OFFLOAD_SERVE_ARGS` (the order of the gated string; moving them into `MUSE_SPEC_SERVE_ARGS` would reorder the flags and duplicate the connector in the frozen gate
+drivers, which append `$MUSE_OFFLOAD_SERVE_ARGS` themselves). The pre-adoption line without `$MUSE_OFFLOAD_SERVE_ARGS` now carries the offload-on bytes (11,645,337,600) without the tier, and a line with the connector and the no-tier bytes (11,720,212,480) has too little GPU headroom:
+`check_spec_launch.sh` (from `serve_cmd.txt` and the log, not from the shell) and `check_offload_launch.sh` FAIL both mismatches, and a connector without `--numa-bind`. `SPEC_EXPECT_OFFLOAD=0|1` (default: the shell's `MUSE_OFFLOAD`) demands the state.
+Inputs of `offload.env` (`MUSE_OFFLOAD_KV_BYTES_OVERRIDE`, `MUSE_OFFLOAD_PER_RANK_BYTES`, `MUSE_OFFLOAD_NUMA_BIND`) must be exported before `spec_k7.env`: the nested source re-derives everything, so a one-shot prefix on an earlier `source offload.env` is not carried over.
+The frozen gate driver `bench/s110/master_gate.sh` sources `spec_k7.env` for its CTL arm with `MUSE_OFFLOAD` unset: that arm now gets the offload-on bytes and stops on the driver's own bytes guard (the gate is closed, the driver is not changed).
+
+**Opt-out: `export MUSE_OFFLOAD=0` before `source env/spec_k7.env`** gives exactly the previous production speculative launch (11,720,212,480 B, no connector, no `--numa-bind`, no `MUSE_OFFLOAD_*` variable beyond the switch; the same line above, `$MUSE_OFFLOAD_SERVE_ARGS` is empty; no preflight is needed).
+Static proof (`bench/test_offload_env.sh`, `export -p` of `host.env` + `spec_k7.env`): the default launch equals the gate's `host.env` + `offload.env` + `spec_k7.env` in every exported variable, and `MUSE_OFFLOAD=0` equals main `942acddc48`'s `host.env` + `spec_k7.env`.
+
+**ns256 RECOMMENDED line** (non-speculative, `--max-num-seqs 256`; the tier on, `ns256 no-offload bytes unchanged` at 16,957,243,392 when `MUSE_OFFLOAD=0`):
+
+    source $HOST_DIR/env/host.env; export MUSE_OFFLOAD_PROFILE=ns256; source $HOST_DIR/env/offload.env
+    $HOST_DIR/scripts/preflight_offload.sh
+    vllm serve ... --max-num-seqs 256 --max-cudagraph-capture-size 256 --kv-cache-memory-bytes $MUSE_OFFLOAD_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS     # 16,854,810,624 B = 257,184 blocks = 2,893,281 KV tokens per rank
+    $HOST_DIR/scripts/check_offload_launch.sh <serve.log>
+
+Gate numbers (final verdict, section 11; ON vs OFF unless noted): reuse-pass TTFT p50 mean x0.0481 (limit 0.70), prompt tok/s x26.19 (>= 1.30), TTFT p99 x0.0376 (<= 1.00), 118k re-admission x0.026 (<= 0.70), external hit fraction 0.9995; STEADY ratio OFF/ON gmean 0.9956 (c1 0.9897);
+DEC tok/s ON/OFF gmean 0.992 (c1 0.992, c128 0.9863); G2 cold pass-1 x0.9995; stress X S_live 501.8 MiB against the floor 500. **Named deviation of the 0.32.0 study (section 3b): `--numa-bind` is part of the line, but the bound ns256 arm was 9-12 % slower in the median reuse TTFT than its unbound twin**
+(25-30 ms of a 0.22-0.27 s TTFT; not re-gated, `ADOPTION_RULE_FINAL.txt` judges the shipped configuration); a non-speculative deployment that values those 25 ms over node-local placement can run `MUSE_OFFLOAD_NUMA_BIND=0` (the tier is then not node-local and the per-node arithmetic of section 4 does not hold).
+Not swap-free: 3 of 3 A/B ON boots of this profile swapped (section 11).
+
+**ns128 offload profile** (shipped, X only): `MUSE_OFFLOAD_PROFILE=ns128`, `--max-num-seqs 128`, `--kv-cache-memory-bytes 17257267200` (263,325 blocks = 2,962,366 KV tokens per rank), S_live 501.1 MiB against the floor 500 (margin 1.1), same `preflight_offload.sh` and `check_offload_launch.sh`; no-tier bytes 17,357,799,424 with `MUSE_OFFLOAD=0`.
+Old launches: `MUSE_OFFLOAD=0` (spec: 11,720,212,480 B; ns256 16,957,243,392 B; ns128 17,357,799,424 B), no connector, no `--numa-bind`.
+
+The second post-boot check, `check_offload_launch.sh` (with `env/offload.env` sourced in the checking shell), checks from the log and `serve_cmd.txt`: the eight bindings
 (`Binding worker subprocess ... to NUMA node 3 3 0 0 7 7 4 4`) and the EngineCore line, one scheduler allocation line and eight worker lines with the same block count (= per-rank bytes / bpb), the same tensor count on every worker, `Using LBNHC KV cache layout`, no `Pinned memory not available`,
-no `cudaHostRegister failed`, no `enable_mm_embeds is True` (a vLLM tree without the fix), `--numa-bind` exactly when expected, the tier bytes and `--kv-cache-memory-bytes` not above the offload-on maximum. `bench/test_check_offload_launch.sh` runs 26 synthetic cases of it (no GPU).
+no `cudaHostRegister failed`, no `enable_mm_embeds is True` (a vLLM tree without the fix), `--numa-bind` exactly when expected, the tier bytes and `--kv-cache-memory-bytes` not above the offload-on maximum; with the tier expected off it fails on a connector, `--numa-bind` or the offload-on bytes in `serve_cmd.txt`.
+`bench/test_check_offload_launch.sh` runs its synthetic cases (no GPU); `bench/test_check_spec_launch.sh` and `bench/test_offload_env.sh` cover the pairing checks and the env proofs.
 
 The restart cost of the maximum tier: the tier evicts the weight page cache of the four nodes, the next boot reads part of the weights cold (130 s READY against 80-90 s; the stress boot with its debug logging 140-160 s READY).
-
 
 ## 8. The `preferred` memory policy (option, `--numa-membind-policy preferred`; NOT merged)
 
@@ -326,3 +354,49 @@ The draft KV groups (detected from `kv_cache_spec.is_draft` or `KVCacheGroupSpec
 
 **Gate inputs after phase 3 (2026-11-11).** `env/offload.env` is itself a frozen gate input; its md5 in `ADOPTION_RULE_FINAL_AMENDMENT3.md5` was re-recorded when the 0.33.0-derived values of sections 4a and 5a replaced the 0.32.0 ones (P* 51,814,072,320 B; GPU bytes 11,645,337,600 / 16,854,810,624 / 17,257,267,200), before any 0.33.0 gate boot.
 All other pinned tools (`bench/s110/*`, `env/host.env`, `env/spec_k7.env`) are unchanged. The frozen drivers keep their 0.32.0 byte literals (`master_det.sh` line 46 expects them while its ON arm reads `$MUSE_OFFLOAD_KV_BYTES`; `master_gate.sh` lines 44-46 likewise); no phase 4 driver exists yet: the phase 4 drivers have to be copies that take the offload-on bytes from `env/offload.env`, with their own md5s recorded before the first boot (they also take the swap record of amendment 4). `env/offload.env` was re-recorded a second time (comment text only: swap wording and two unit corrections; the values are unchanged), together with the amendment 4 text, before any gate boot.
+
+## 11. Final verdict and adoption (S1-10R phase 4, 2026-11-12)
+
+Numbers below are copied from `muse_wf/s1-10r/VERDICT_GATE.md` and `phase4/out/` (`verdict_final_a5.json`, md5 7f956e1aefcf67a54fc0ad1c736e808c; `t_a5_verdict.json`; `swap_table.txt`; `tails_table.txt`; `chunk_probe_s110r_fulltier_spec_a5.json`), not recomputed.
+Rule: `bench/s110/rules/ADOPTION_RULE_FINAL.txt` with amendments 1-5 (amendment 5 is POST-HOC, written after the 0.33.0 chain result). Adoption under the rule: spec ADOPT = offload becomes part of the production speculative launch profile (`env/spec_k7.env` sources `env/offload.env`, `MUSE_OFFLOAD=0` opts out);
+ns256 RECOMMENDED = the documented launch line of section 7 (ns256 no-offload bytes unchanged); ns128 shipped as an offload profile.
+
+**Verdict lines.**
+
+    VERDICT ADOPT_SPEC=yes ADOPT_NS256=yes NS128_SHIPPED=yes failed=[]
+    VERDICT ADOPT_SPEC=no ADOPT_NS256=yes NS128_SHIPPED=yes failed=[spec.T.fulltier]
+
+(The chain of 2026-11-11: 9.5 h, 0 artifacts, 0 arm failures, no halt, no retry boot.) The ns256 hold of the chain result was released by the orchestrator: the framing artifact can only turn equal pairs into unequal ones and no ns256 key reads it.
+
+**Gate T: the raw FAIL and the amendment 5 PASS.** The raw `spec.T.fulltier` FAIL of the 0.33.0 chain stays in every table. Amendment 5 re-decided gate T by ONE fresh boot `s110r_fulltier_spec_a5` (same parameters as `s110r_fulltier_spec_1`, frozen `reuse_driver.py` unchanged) through the new `t_compare.py`
+(md5 4111b78463d868ad68fbf7236ba90e30); pair equality = tokens + logprob values + text, SSE chunk framing excluded.
+
+| Reading | Boot | Failed requests | Health | Comparable | Equal | Result |
+|---|---|---|---|---|---|---|
+| RAW (0.33.0 chain, frozen `lp_sha` reading, stays in every table) | `s110r_fulltier_spec_1` | 0 of 1038 | n/a (key does not read it; DONE, rc 0) | 17 | 15 | **FAIL** (`spec.T.fulltier`) |
+| Amendment 5 (tokens + logprob values + text), decides | `s110r_fulltier_spec_a5` | 0 of 1038 | 200 (`health_after_gate_job.txt`; 200 after the probe too) | 17 | 17 | **PASS** |
+| Frozen `lp_sha` result printed beside it (not deciding) | `s110r_fulltier_spec_a5` | 0 | 200 | 17 | 12 (unequal 212, 53, 224, 246, 190; framing only) | informational |
+
+Every other key keeps its 0.33.0 chain value (asserted equal in `verdict_final_a5.json`).
+
+**The five findings of VERDICT_GATE.md, in the order of the verdict** (nothing below is described as swap-free; the ADOPT / RECOMMENDED / SHIPPED outcomes stand with these findings attached).
+
+1. **Swap (amendment 4, informational, no criterion reads it).** Gate boots reached up to 7.4 GiB of the 8 GiB swapfile (peak 7444.8 MiB of 8192, 90.9 percent, at READY of `s110r_spec_ON_1`). 14 of 18 ON-like boots/processes swapped (growth 3.8-7.4 GiB launch->READY); 0 of 16 CTL/OFF-like boots swapped (max growth 0.5 MiB). Correction against the task wording "every large-tier ON boot swapped": the files do not support "every". Four ON-like boots did not swap (`s110r_spec_ON_3`, `s110r_x_ns128_1`, `s110r_d4_ns256_a1`, `s110r_d_ns256_ONb`), and the Amendment 5 boot `s110r_fulltier_spec_a5` (same parameters as `s110r_fulltier_spec_1`, which grew by 7228.0 MiB) did not swap either (new record: peak swap used 45.6 MiB, pswpout 2 launch->READY and 0 after; `phase4/out/swap_s110r_fulltier_spec_a5.json`, `swap_table.txt/json` untouched). So swapping of the ON boots is not deterministic for identical parameters. Per Amendment 4 (3), no ADOPT / RECOMMENDED / SHIPPED below is described as swap-free.
+
+2. **Thin margins (all PASS).** spec X S_live 1,256.4 MiB vs floor 1,256 (margin 0.4 MiB); spec G1 STEADY c1 0.9859 vs 0.985 (margin 0.0009). Others: ns256 X 501.8 vs 500, ns128 X 501.1 vs 500 (see F5).
+
+3. **Tail (amendment 4, informational).** dec c128 p99 TTFT is 3.5-7.7 percent higher ON than OFF in all six groups: spec x1.035 x1.077 x1.045 (mean 1.052), ns256 x1.055 x1.052 x1.046 (mean 1.051); ON/CTL the same (1.045, 1.049). Below the 1.10 display flag; systematic (see F2).
+
+4. **SSE chunk layouts (informational probe, AFTER the tiercheck of the Amendment 5 boot; cannot affect the gate T result).** 4 documents (33, 308, 292, 103), each re-sent as a tier hit (external hit 32,816 tokens) then as a GPU hit (local hit 32,816). Tokens, logprob values and text are equal in 4/4, and the chunk layout of the tier send equals the layout of the GPU send in 4/4 (verbatim, tokens per SSE chunk):
+   - doc 33: `[1,1,1,1,1,1,1,1,1,1,1,1,1,2,1]` (both sends)
+   - doc 308: `[1,1,1,1,1,1,2,2,2,2,2]` (both sends)
+   - doc 292: `[1,1,1,1,1,1,2,1,1,2,4]` (both sends)
+   - doc 103: `[1,1,1,1,1,1,1,1,1,1,2,4]` (both sends)
+
+   So the probe did not reproduce a tier-only coalescing: multi-token chunks (2-4 tokens) occur in tier and GPU sends alike, and no mechanism is attributed here. Separately, the tiercheck itself: the frozen `lp_sha` (which hashes the per-chunk framing) is equal in 12 of 17 comparable pairs on the Amendment 5 boot (unequal docs 212, 53, 224, 246, 190), against 15 of 17 on the first boot (unequal docs 33, 308); the differing documents differ between the boots, and in all of them there is 0 token difference and 0 logprob-value difference. The first boot's tier sends of docs 33 and 308 had the 2nd and 3rd token in one chunk (layout `[1,2,1x13]` vs `[1x16]`, recovered earlier by brute force from the stored hash); the stored sends of the Amendment 5 boot keep only the hash, so the layouts of the 5 framing-only pairs are not known.
+
+5. **Scope of gate T (Amendment 5 SCOPE NOTE, verbatim).** "gate T checks that blocks restored from a full tier serve the same output as the GPU copy of the same blocks right after the restore (load-before-use); it does not compare tier bytes with the originally computed KV under eviction. D4' covers byte equality in the non-full regime only."
+
+README (section 4.6) carries the same notes in short form: offload ON by default for the speculative profile, the opt-out, the swap note and the preflight requirement.
+
+**Files that changed after the gate.** `env/spec_k7.env` and `env/offload.env` (comments) differ from the md5s pinned for the gate (`ADOPTION_RULE_FINAL_AMENDMENT3.md5`); the pin files are not touched (they describe the gated state). The exports of the gated order are unchanged (proof in section 7).
