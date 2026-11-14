@@ -59,6 +59,11 @@ def make_input(rank, shape, seed, dev, dtype=torch.bfloat16, kind="randn"):
         # signed zeros and zeros mixed with values; exercises sign of zero in the fp32 chain
         s = torch.rand(shape, device=dev, generator=g)
         x = torch.where(s < 0.5, torch.zeros_like(x), torch.where(s < 0.75, -torch.zeros_like(x), x))
+    elif kind == "negzeros":
+        # about 90 % -0.0 between a few values: a result is -0 only if both island partials are -0 (all four inputs of an
+        # island -0), which happens for ~43 % of the elements here, so every message size sees thousands of -0 results
+        s = torch.rand(shape, device=dev, generator=g)
+        x = torch.where(s < 0.9, -torch.zeros_like(x), x)
     return x.to(dtype)
 
 
