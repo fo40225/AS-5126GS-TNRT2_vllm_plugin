@@ -4,6 +4,9 @@ Launch-scoped, no vLLM code change: `env/spec_k7.env` (sourced after `env/host.e
 `scripts/check_spec_launch.sh` (the boot check). Measured on `sm120-muse-spark-open` 0ffa57b714 + host b207e54; production pair after the merge: vLLM
 5b827b215a (0ffa57b714 plus the SP test file, the runtime code is identical) + this folder.
 
+**S1-9 lever 2 (the microbatched prefill beside the drafter, "r2e") is part of this profile since 2026-11-01**: `env/spec_k7.env` also sets
+`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1` and the KV bytes are now **10,373,877,760** (1,460,755 tokens per rank). See the section "S1-9 lever 2" at the end of this file.
+
 ## What it changes
 
 Speculative decoding with RadixArk DFlash2, K = 7, `--max-num-seqs 128` verifies 8 tokens per request, so a batch of c requests is
@@ -39,13 +42,14 @@ requests), graph pool 2.11 -> 1.22 GiB per rank. Non-speculative launches, `envs
 
 The stage C line (`/tmp/muse_wf/s1-8/stageC/RESULTS.md` Part 5.3) plus the two settings and the KV bytes re-derived for this graph set:
 
-    source $HOST_DIR/env/host.env; source $HOST_DIR/env/spec_k7.env     # MIN_TOKENS=384, MUSE_SPEC_SERVE_ARGS, MUSE_SPEC_KV_BYTES=10526351360
+    source $HOST_DIR/env/host.env; source $HOST_DIR/env/spec_k7.env     # MIN_TOKENS=384, r2e opt-in, MUSE_SPEC_SERVE_ARGS, MUSE_SPEC_KV_BYTES=10373877760
     vllm serve unsloth/Muse-Spark-Open-816B-A42B-NVFP4 --tensor-parallel-size 8 --max-model-len 131072 --gpu-memory-utilization 0.95 \
       --enable-expert-parallel --max-num-seqs 128 --kv-cache-dtype fp8 --quantization modelopt_fp4 ... --speculative-config '<RadixArk K=7, block, probabilistic>' \
       --per-request-spec-decode-metrics detailed $MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES
 
-i.e. `--max-cudagraph-capture-size 256 --kv-cache-memory-bytes 10526351360` (513,982 blocks = 1,482,225 KV tokens per rank, 11.31x "maximum concurrency for
-131,072 tokens per request") and the env `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`. The bytes are valid without `prompt_logprobs` / `echo` (S1-7 section 4: a
+i.e. `--max-cudagraph-capture-size 256 --kv-cache-memory-bytes 10373877760` (506,537 blocks = 1,460,755 KV tokens per rank, 11.14x "maximum concurrency for
+131,072 tokens per request") and the env `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384` + `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1` (lever 2; with the
+lever-1-only profile the bytes were 10,526,351,360 = 513,982 blocks = 1,482,225 tokens, the value of every launch that does NOT set the opt-in). The bytes are valid without `prompt_logprobs` / `echo` (S1-7 section 4: a
 chunked prompt_logprobs request can kill the engine at the gate tier); a deployment that must accept them drops `--kv-cache-memory-bytes` (util-0.95 default pool, not PLL-tested for
 this profile). Without this profile (default capture list) the S1-7 value stays 9,676,390,400.
 
@@ -110,3 +114,72 @@ Accuracy class: rounding-level (row-sharded GEMM, reduce-scatter + all-gather in
    the GSM8K run above (batch AL 4.553 against 4.594 in production, serial 4.501 against 4.527).
 
 Open follow-up (not part of this profile): c33..c47 stays eager and replicated; `MIN_TOKENS=264` / `320` (floor 264 / 320 with the same cap) would put it on SP too. It equals floor 384 on every concurrency measured above except c40 and was not run.
+
+## S1-9 lever 2: the microbatched prefill (r2e) beside the drafter (opt-in, part of the production profile)
+
+Merged: vLLM `sm120-muse-spark-open` fast-forwarded from 5b827b215a to the head of `muse/s19-r2e` (10e09221d3; the gates ran on the identical tree of 7555260c06, a commit-message amend apart); this folder as of the merge.
+
+**What.** The prefill overlap of S1-6 (`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP`, default on) splits every eager batch of at least 2050 tokens into two microbatches whose tensor-parallel
+collectives overlap each other's compute. It was switched off under speculative decoding. The branch now runs it beside the DFlash drafter (method `dflash`): the drafter builds its own attention
+metadata and takes the merged auxiliary hidden states (5 taps, merged tap by tap in row order), a verify batch (8 tokens per request) is never split off its step, and CUDA graphs are untouched
+(decode and verify batches are never microbatched: the decode threshold is unreachable). Effective threshold under the profile: 2050 tokens (2 x (max(SP floor 384, 1024) + 1); the capture ceiling 256 does not raise it), so prefill-only chunks
+and mixed chunk + verify steps of at least 2050 tokens are split; below that nothing changes (TTFT of 2048-token prompts +0.1 %, flat).
+
+**Why it is an opt-in under speculation.** The overlap adds a persistent footprint (a second set of FlashInfer metadata builders and the activations of two halves, 145 MiB per rank here) and so
+moves the exact `--kv-cache-memory-bytes` of a launch line: the S1-7 bytes of every other speculative row (nvidia DFlash2, DSpark, the mns 64 rows, the default capture list 9,676,390,400) were derived with
+it off and would be left under the S1-7 slack by a silent switch-on. The accuracy policy would make it default-on (rounding-level, deterministic, faster); the memory coupling is the reason it is not: the flag and the
+bytes are ONE property of a launch line and travel together in `env/spec_k7.env`. `check_spec_launch.sh` fails a boot whose log shows the overlap (line "prefill batches of at least N tokens run as 2 microbatches")
+with bytes above 10,373,877,760, or without it with bytes above 10,526,351,360 (`SPEC_EXPECT_R2E=on|off` demands the state). DSpark (no memory / speed run beside microbatches) and adaptive verification stay excluded.
+
+**Memory (exact bytes, S1-7 procedure on the probe tree, REPS = 2, stress A1 B C1 C2 D H I X).** Phases H and I are new: H = 128 decoders in verify plus requests admitted on a prefix-cache hit (a cached 8192-token
+prompt, 1k..6k tokens shared, no salt) with a 2k..7k-token remainder, I = split / unsplit interleave in one process (two prefix-sharing prompts admitted together run whole, a lone fresh 8k prompt runs split), 7,104 and 10,128
+prefix-hit tokens per repetition (spec), 0 client errors. At **10,373,877,760** (506,537 blocks = 1,460,755 KV tokens, **-21,470 tokens = -1.45 %** against 10,526,351,360 / 1,482,225): clean, 0 errors / mismatches / preemptions / OOM,
+idle free 3,623.4 MiB, exact live growth 2,269.0 MiB (the verify-step transient sets the global peak, identical with r2e off), **S_live 1,354.4 MiB** (floor 1,256), 7 allocator retries, NVML min free serving 169 MiB.
+The reclaim that made this possible (vs the first version: -4.6 % tokens at the default pool, S_live 35 at the production bytes): one workspace slot for both microbatches (their scratch is never live across a hand-off, -768 MiB),
+and the output merge frees the microbatch pieces tap by tap (the merged 114 MiB tensors had pinned the 790 MiB verify-logits segments: fragmentation, not live bytes). The default pool (util 0.95) loses 0.17 % (1,376,421 vs 1,378,783 tokens).
+The 10,526,351,360 of lever 1 with r2e on left S_live 1,210 MiB (< 1,256): do not combine them.
+
+**A/B (one lock hold, boots OFF ON OFF ON OFF ON, 3 sessions per arm, same code tree, OFF = lever-1 profile at 10,526,351,360, ON = this profile at 10,373,877,760, every boot passes cfgcheck and the boot check, 0 preemptions).**
+Primary rows use natural-text 8192-token prompts (windows of the E2E corpus, the first token id differs per request so no prefix hit exists), 512 output tokens, closed loop, ignore_eos, greedy; random-token prompts are not used
+(their acceptance length is chaotic). out tok/s, mean of the three session means (sd), ON vs OFF, **bold** = beyond noise (Welch, 2.78 x se):
+
+| row | OFF | ON | ON vs OFF | TTFT p50 OFF -> ON | TPOT OFF -> ON |
+|---|---|---|---|---|---|
+| 8k prompt / 512 out, c1 | 153.3 (1.24) | 155.4 (0.07) | **+1.3 %** | 894 -> 784 ms (**-12.3 %**) | 4.79 -> 4.91 ms (AL 3.742 -> 3.654 at c1) |
+| 8k prompt / 512 out, c16 | 372.0 (2.76) | 400.8 (0.88) | **+7.7 %** | 1,563 -> 1,069 ms (**-31.6 %**) | 35.77 -> 33.31 ms (**-6.9 %**) |
+| 8k prompt / 512 out, c64 | 470.8 (1.04) | 522.2 (0.20) | **+10.9 %** | 3,142 -> 2,873 ms (**-8.6 %**) | 109.97 -> 99.18 ms (**-9.8 %**) |
+| mixed churn c64 (288 requests, cold prefill, staggered) | 1,446.0 | 1,439.6 | -0.4 % (noise) | | |
+| real 512-token outputs (r512) c64 | 1,840.1 | 1,839.6 | -0.0 % | | |
+| mix greedy c16 / c64 | 753.4 / 1,152.2 | 747.0 / 1,153.2 | -0.9 % (noise) / +0.1 % | | |
+| mix t1k64 c16 / c64 | 733.6 / 1,117.0 | 737.9 / 1,117.1 | +0.6 % / +0.0 % | | |
+
+The gain is smaller than the profile-based estimate (+13 % / +16 % at c16 / c64) because natural text accepts 3.6 tokens per step and decode takes the larger share of the closed loop; it comes from the prefill chunk
+(forward time of an 8185-token chunk -14.6 % in the round-4 style profile; 8185-token TTFT 0.903 -> 0.783 s, -13.2 %; 16k / 32k -13.2 %) and, in a loaded server, from shorter decode stalls (TPOT -7 % / -10 %).
+Prompts below 2050 tokens are unaffected (guard rows flat). Acceptance length is unchanged at c16 / c64 (3.617 -> 3.614, 3.621 -> 3.656) and in every guard row (the aux taps behind a microbatched prefill are intact);
+the c1 acceptance of the 12 distinct prompts is -2.3 % (3.742 -> 3.654, the earlier c1 checks on 32 + 8 natural prompts gave -2.8 / +2.2 %: prompt-specific rounding noise).
+
+**Prefix-sharing traffic.** The first version counted every verify row (8 tokens) as a prefill "writer" in the guard that keeps a prefix-cache reader from being split off its writer, so any step that admitted a request on a prefix hit
+beside a single verify row ran whole (the gain lost on exactly the mixed steps it is for, for traffic with a shared system prompt / RAG context). Fixed: a row is a prefill only if its tokens minus its draft tokens exceed one; the split point is kept
+beyond all decode-like rows (`max_num_seqs * (1 + K)` tokens, the threshold floor: 2050 here). The stress phases H and I above exercise it; the A/B itself used no prefix hits (natural prompts with distinct first tokens, cold-salted churn).
+
+**Accuracy gates** (ON profile at the adopted bytes). GSM8K 200x2 at c64 (pure tree, `s19l2g_gsm64`): A 193/200 + B 193/200 = **386/400 = 96.5 %** (band 95.5-98.0 %), 0 errors, 4 + 4 answers at the 16384-token cap, same final answer A vs B 189/200.
+Determinism (offline TP8 + EP8 engine, profile env + cap 256, default pool, 72 prompts = the 64 of lever 1 + 8 natural prompts of 4,458 .. 20,158 tokens, 128 tokens, batch and serial passes):
+two cold processes of the ON profile **STRICT PASS 144/144 rows, 0 differing fields** (token ids, top-5 logprobs, text; AL 4.354 batch / 4.331 serial in both); diagnostic OFF vs ON: serial pass 65/72 identical (the 7 that differ are 7 of the 8
+prompts of at least 4.3k tokens, where the microbatched prefill engages; the 64 short prompts and the 8,158-token prompt are bit-identical), batch pass 2/72 identical (batch-composition rounding, as in lever 1: median first divergence at token 26).
+Accuracy class: rounding-level (two half batches change GEMM tilings and the attention split), run-to-run deterministic, identical across ranks.
+
+**Non-speculative production (the shared workspace slot changes it too).** Candidate tree vs production tree (same prompts, non-speculative, r2e on in both): two cold candidate processes STRICT PASS 144/144 and the production
+tree's outputs are IDENTICAL to the candidate's (144/144 rows): the shared slot does not change a bit. Exact bytes of the candidate tree, S1-7 stress with H and I, REPS = 2: ns128 at 16,688,807,936 clean, S_live **1,238.1 MiB** (S1-7: 696; the shared slot frees 768 MiB of
+persistent memory; floor 500 MiB), 0 retries; ns256 + `--max-cudagraph-capture-size 256` at 16,363,749,376 clean, S_live **1,165.9 MiB** (S1-7: 512), 2 retries (the stress phases H and I hit the prefix cache as in the speculative run). Guard A/B (production tree vs candidate tree, ns128, 2 sessions per arm): mix greedy c1 117.4 vs 117.1, c64 954.0 vs 954.9; mix t1k64 c1 116.8 vs 116.5, c64 950.6 vs 951.2; natural 8k prompts c16 364.5 vs 364.7 tok/s (all within -0.25 .. +0.10 %, noise; 0 preemptions;
+both trees log the 2050-token overlap line). The non-speculative exact bytes of S1-7 stay valid and now carry about 540 MiB more headroom (S_live 1,238 / 1,166 against 696 / 512 for ns128 / ns256); a re-derived larger value is a follow-up, not part of this change.
+
+**1M x 1.** Boot-only probe of this profile with `--max-model-len 1048576` (`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, RadixArk DFlash2 drafter, r2e on, bytes 10,373,877,760): the log reads "GPU KV cache size: 1,932,643 tokens, Maximum concurrency
+for 1,048,576 tokens per request: **1.84x**", so a 1M-token request still fits at fp8 KV with the drafter (SG2 needs 1M x 1). It is a boot and KV-sizing measurement only: no 1M-token request was served and the S1-7 stress was not run at that
+max-model-len. The 1,460,755 tokens of the 131072 profile are not the 1M budget (the hybrid allocator bounds the sliding-window groups, not the global layers). The cost of the overlap, 1.45 % of the KV tokens, is paid by every workload,
+also those without a prompt of 2050 tokens or more (none of whose rows move).
+
+**Notes.** (1) The F.pad staging copies of `sp_reduce_scatter` (T % 8 != 0) are not removed work: the "16.4 -> 5.5 ms" in the profile is overlap-aware attribution; the copy bytes (about 25 GB read + write per 8185-token chunk, 16.2 ms at the measured
+1.537 TB/s) remain and contend with the overlapped GEMMs. Aligning the chunk (`--max-num-batched-tokens 8199` under K = 7, 8192-row chunks, no tail step) measured a further -2.7 .. -3.9 % at 16k / 32k and -20 % at exactly 8192 tokens, one session each; it is a separate decision
+that needs its own S1-7 derivation. (2) The drafter's attention groups build one metadata builder set instead of two (no visible change of the idle footprint: 93,629 against 93,627 MiB). (3) The microbatches share the experts' scratch because, under expert parallelism, no collective reads scratch rows and the prepare/finalize does not yield inside the expert op; both are asserted.
+(4) Launch lines of the other speculative rows are unchanged: do not source `env/spec_k7.env` for them.
+

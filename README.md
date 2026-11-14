@@ -54,7 +54,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 ├── muse_topo-0.1.dist-info/     entry_points.txt：[vllm.general_plugins] muse_topo = muse_topo.vllm_plugin:register
 │                                （放在 PYTHONPATH 上就會被 vLLM 找到，不需要 pip install）
 ├── env/host.env                 主機環境變數：NCCL_P2P_LEVEL=SYS、MUSE_TOPO_ENABLE=1、bf16 exchange 與 NCCL graph file（2026-10-24 起預設 ON），其他選項以註解列出
-├── env/spec_k7.env              speculative decoding（RadixArk DFlash2 K=7）專用的 launch profile：`--max-cudagraph-capture-size 256` 搭配 `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`，並提供該設定的 exact KV bytes `MUSE_SPEC_KV_BYTES=10526351360`（1,482,225 tokens；只在 host.env 之後 source，見 `docs/s19_spec_launch.md`）
+├── env/spec_k7.env              speculative decoding（RadixArk DFlash2 K=7）專用的 launch profile：`--max-cudagraph-capture-size 256` 搭配 `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`，另設 `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1`（S1-9 lever 2：speculative 下的 prefill microbatch overlap，opt-in），並提供該組合的 exact KV bytes `MUSE_SPEC_KV_BYTES=10373877760`（1,460,755 tokens；旗標與 bytes 必須成對，未設旗標的 speculative launch 維持 10526351360；只在 host.env 之後 source，見 `docs/s19_spec_launch.md`）
 ├── scripts/
 │   ├── deploy_host.sh           本機 -> 伺服器 mirror 的 rsync（只同步本資料夾）
 │   ├── run_src_topo.sh          /raid/vllm-runtime/musetest/run_src.sh 的副本：把本資料夾加進 PYTHONPATH、source env/host.env，
@@ -423,7 +423,7 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 
 * 實測拓樸與瓶頸：`docs/topology.md`；演算法與 API：`docs/h1a_collectives.md`、`docs/h1b_collectives.md`；latency 表：`docs/h1a_latency.md`、`docs/h1b_latency.md`；
   plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；pooler / unpooler GEMV 與 all-gather 融合：`docs/r3b_gemv_push.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
-  speculative launch 的 graph 上限 / sequence-parallel floor 組合（S1-9）：`docs/s19_spec_launch.md`。
+  speculative launch 的 graph 上限 / sequence-parallel floor 組合與 prefill overlap（S1-9 lever 1、lever 2）：`docs/s19_spec_launch.md`。
 * 伺服器上的資料（不在本資料夾）：benchmark 結果 `/raid/vllm-runtime/musetest/results/<tag>/`；測試 / benchmark 的 log 與 jsonl `/raid/vllm-runtime/work/host/`；
   JIT cache `/raid/vllm-runtime/sm120-dev/vllm_cache/muse_topo/`；拓樸量測 script 與原始結果 `/raid/vllm-runtime/musetest/topo/`；NCCL 量測 `/raid/vllm-runtime/musetest/nccl/`。
 * 歷史：H1a（小訊息演算法）、H1b（large-message 演算法）、H2 / H2b（vLLM plugin）、review fixes（64-bit counter / flags、supports() 與 kernel 一致、fp16 的 bf16 exchange 溢位、對齊與 stream 規則，2026-10-24）、H3（本資料夾的定稿）。
