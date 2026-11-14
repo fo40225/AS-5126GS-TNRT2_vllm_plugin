@@ -115,6 +115,13 @@ def run(rank, port, quick, ck):
     dc.topo_comm = None
     ck.check(dc.reduce_scatter_all_gather_matches_all_reduce is False, "capability off without a TopoComm")
     dc.topo_comm = saved
+    # the capability is about the three collectives; the fused boundary op has no part in it
+    saved_ops = dc.topo_ops
+    dc.topo_ops = frozenset(saved_ops) - {"boundary"}
+    ck.check(dc.reduce_scatter_all_gather_matches_all_reduce is True, "capability stays on without the boundary op")
+    dc.topo_ops = frozenset(saved_ops) - {"reduce_scatter"}
+    ck.check(dc.reduce_scatter_all_gather_matches_all_reduce is False, "capability off without reduce_scatter routed")
+    dc.topo_ops = saved_ops
     log(rank, "TP group", tp.unique_name, "topo_comm", type(comm).__name__, "workspace MiB",
         f"{comm.workspace_bytes / 2**20:.1f}", comm.info.summary)
     members = comm.info.members

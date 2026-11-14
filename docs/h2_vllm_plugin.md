@@ -34,7 +34,7 @@ script to `PYTHONPATH` and source `env/host.env`; `scripts/runsrc_topo.sh` does 
 | `all_gather(x, dim)` | `supports("all_gather", x, dim)` -> topo kernel producing the requested layout directly (dim 0: rank-major, last dim: column concatenation; shards above 1 MiB take the chunked large engine), else original |
 | `reduce_scatter(x, dim)` | dim 0 and `supports("reduce_scatter", x, 0)` (T % 8 == 0, bf16/fp16/fp32, message >= 128 KiB) -> topo large reduce-scatter, else original (dim != 0 stays on NCCL) |
 | `destroy` | logs the per-key call counters, closes the topo communicator |
-| `reduce_scatter_all_gather_matches_all_reduce` (property, added by r2c) | `True` when the communicator owns a `TopoComm`, `MUSE_TOPO_OPS` routes all three ops, the large algorithms are on and the bf16 exchange is off; vLLM's base class says `False` (NCCL's reduce-scatter + all-gather rounds differently from its ring all-reduce) |
+| `reduce_scatter_all_gather_matches_all_reduce` (property, added by r2c) | `True` when the communicator owns a `TopoComm`, `MUSE_TOPO_OPS` routes all three collectives (`all_reduce`, `all_gather`, `reduce_scatter`; the fused `boundary` op does not matter), the large algorithms are on and the bf16 exchange is off; vLLM's base class says `False` (NCCL's reduce-scatter + all-gather rounds differently from its ring all-reduce) |
 
 The property is the plugin's side of one contract: every topo reduction is one fp32 sum in a fixed order with a single final
 rounding, whatever the algorithm and the message size, so `all_gather(reduce_scatter(x, dim 0), dim 0) == all_reduce(x)` bit
@@ -42,7 +42,8 @@ for bit (`bench/tests_h1b.py`, and `bench/test_plugin.py` on the shapes of the M
 topo path takes: bf16 / fp16 / fp32, a row count that is a multiple of 8, a size that is a multiple of 128 B between 128 KiB and
 2 GiB. Callers that shard a reduction along the rows read the property to know that sharding leaves the reduced values
 unchanged; the Muse model's `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=auto` is the first user. The three switches that turn the
-property off are exactly the ones under which that equality does not hold: an op that is not routed (it falls back to NCCL),
+property off are exactly the ones under which that equality does not hold: one of the three collectives that is not routed (it falls back to NCCL; the `boundary` op is not one of them, so
+`MUSE_TOPO_OPS=all_reduce,all_gather,reduce_scatter` keeps the property on),
 `MUSE_TOPO_LARGE=0` (reduce_scatter and the large all-reduce go to NCCL) and `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` (the large
 algorithms round the island partials to bf16, the all-reduce below 2 MiB does not). `env/host.env` turns that last one ON since
 2026-10-24 (throughput decision), so under the host launch environment the property is False and `SEQUENCE_PARALLEL=auto` never

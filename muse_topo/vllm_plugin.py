@@ -30,15 +30,16 @@ group, so putting the host folder on ``PYTHONPATH`` is enough (no pip install). 
 * ``destroy``: dumps the call counters and closes the topo communicator.
 
 Capability ``reduce_scatter_all_gather_matches_all_reduce`` (property of the patched ``CudaCommunicator``, a plain
-``False`` on vLLM's base class): ``True`` when this communicator owns a ``TopoComm`` that takes all three ops and runs the
+``False`` on vLLM's base class): ``True`` when this communicator owns a ``TopoComm`` that takes all three collectives
+(``all_reduce``, ``all_gather``, ``reduce_scatter``; the fused ``boundary`` op is not part of the requirement) and runs the
 large algorithms with the exact fp32 exchange. Every topo reduction is one fp32 sum in a fixed order with a single final
 rounding, so ``all_gather(reduce_scatter(x, dim 0), dim 0) == all_reduce(x)`` bit for bit (``bench/tests_h1b.py``,
 ``bench/test_plugin.py``) for the tensors the topo path takes: bf16 / fp16 / fp32, a row count that is a multiple of 8,
 a size that is a multiple of 128 B between 128 KiB and 2 GiB. Callers that shard a reduction along the rows (the Muse
 sequence-parallel stream) read it to know that sharding leaves the result unchanged. ``MUSE_TOPO_OPS`` without one of
-the three ops, ``MUSE_TOPO_LARGE=0`` (reduce_scatter and the large all-reduce go to NCCL) and
-``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (the large algorithms round the island partials, the small all-reduce does not) turn
-it off.
+the three collectives turns it off (``boundary`` is irrelevant: ``all_reduce,all_gather,reduce_scatter``, the default before
+the fused kernels, keeps it on), and so do ``MUSE_TOPO_LARGE=0`` (reduce_scatter and the large all-reduce go to NCCL) and
+``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (the large algorithms round the island partials, the small all-reduce does not).
 
 Microbatched prefill (vLLM ``VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP``): the microbatch threads run their TP collectives on a
 comm stream, all of them on the one stream in a rank-uniform order, so the single TopoComm needs no second workspace (its
@@ -92,6 +93,9 @@ logger = logging.getLogger("vllm.muse_topo.plugin")
 
 _PATCH_MARK = "_muse_topo_patched"
 _ALL_OPS = ("all_reduce", "all_gather", "reduce_scatter", "boundary")
+# The ops of the reduce_scatter + all_gather == all_reduce capability: the three collectives that share the arithmetic
+# contract. ``boundary`` (the fused collective + epilogue kernels) has no part in it.
+_RS_AG_OPS = ("all_reduce", "all_gather", "reduce_scatter")
 _DEFAULT_TIMEOUT_S = 600.0
 
 
@@ -390,7 +394,7 @@ def _wrap_destroy(orig):
 def _rs_ag_matches_ar(self) -> bool:
     """``reduce_scatter`` + ``all_gather`` == ``all_reduce`` bitwise for the tensors the topo path takes (see the module doc)."""
     comm = getattr(self, "topo_comm", None)
-    return bool(comm is not None and self.topo_ops >= frozenset(_ALL_OPS) and getattr(comm, "large", False)
+    return bool(comm is not None and self.topo_ops >= frozenset(_RS_AG_OPS) and getattr(comm, "large", False)
                 and not getattr(comm, "bf16_exchange", False))
 
 

@@ -159,8 +159,8 @@ def main():
         assert dc.topo_comm is None  # not the TP group
     finally:
         muse_topo.TopoComm = real
-    # capability reduce_scatter_all_gather_matches_all_reduce: needs a TopoComm, all three ops routed, the large
-    # algorithms and the exact fp32 exchange
+    # capability reduce_scatter_all_gather_matches_all_reduce: needs a TopoComm, the three collectives routed (the fused
+    # 'boundary' op is not part of it), the large algorithms and the exact fp32 exchange
     Cap = type("Cap", (), {"reduce_scatter_all_gather_matches_all_reduce": property(vp._rs_ag_matches_ar)})
     full = frozenset(vp._ALL_OPS)
 
@@ -173,8 +173,16 @@ def main():
     c.large, c.bf16_exchange = True, False
     assert cap(c) is True
     assert cap(None, frozenset()) is False  # no TopoComm (not the TP group, host mismatch, MUSE_TOPO_ENABLE=0)
-    for missing in vp._ALL_OPS:
+    assert vp._RS_AG_OPS == ("all_reduce", "all_gather", "reduce_scatter")
+    assert set(vp._RS_AG_OPS) < set(vp._ALL_OPS) and "boundary" not in vp._RS_AG_OPS
+    for missing in vp._RS_AG_OPS:
         assert cap(c, full - {missing}) is False, missing
+    # the fused boundary kernels have nothing to do with it: the three collectives alone (the MUSE_TOPO_OPS default before
+    # r2d, and the way to switch the fused kernels off) keep the capability on, with or without 'boundary'
+    assert cap(c, full - {"boundary"}) is True
+    assert cap(c, frozenset(vp._RS_AG_OPS)) is True
+    assert cap(c, frozenset({"boundary"})) is False
+    assert cap(c, frozenset({"all_reduce", "boundary"})) is False
     c.large = False
     assert cap(c) is False  # reduce_scatter and the large all-reduce would go to NCCL
     c.large, c.bf16_exchange = True, True
