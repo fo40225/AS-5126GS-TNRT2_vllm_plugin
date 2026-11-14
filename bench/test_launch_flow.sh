@@ -8,7 +8,9 @@ fx=$here/bench/fixtures
 stub=$fx/launch_stub
 d=$(mktemp -d)
 fails=0
-port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+# a fresh free port for every case that starts a stub (review p2 r2 F2): cases share no port, so a stub that is still shutting down or a busy port cannot fail a later case
+freeport() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+port=
 cleanup() {
   local f
   for f in "$d"/*/serve.pid; do [ -r "$f" ] && bash "$here/launch/stop_server.sh" "$(dirname "$f")" > /dev/null 2>&1; done
@@ -26,6 +28,7 @@ run() {
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -rf "${d:?}/$name"
   out=$d/$name
+  port=$(freeport)
   env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none \
     MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_MARK="$d/$name.mark" "${envs[@]}" \
     bash "$here/launch/$script" "$@" --out "$out" > "$d/$name.stdout" 2>&1
@@ -116,16 +119,18 @@ expect_fail hang "the server never becomes healthy: timeout, exit 3, stopped" 3 
 # a signal (TERM, INT, HUP) while waiting for READY stops the server (own session) and exits 3 (review r2 m3: HUP like TERM / INT)
 for sig in TERM INT HUP; do
   rm -rf "${d:?}/sig_$sig"
-  (env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
-    MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/sig_$sig" > "$d/sig_$sig.stdout" 2>&1; echo $? > "$d/sig_$sig.rc") &
-  bgpid=$!
-  for _ in $(seq 1 50); do [ -s "$d/sig_$sig/serve.pid" ] && break; sleep 0.2; done
+  port=$(freeport)
+  # exec: the subshell becomes env and then the launcher itself, so $! is the launcher's pid and wait returns its exit status (no ps / awk lookup)
+  (exec env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
+    MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/sig_$sig" > "$d/sig_$sig.stdout" 2>&1) &
+  launcher=$!
+  # the launcher is signalled only once it has accepted the server's session (the signal trap is armed before the start; the LAUNCHED line proves the wait loop is running)
+  for _ in $(seq 1 100); do grep -q -a 'LAUNCHED pid=.* sid=' "$d/sig_$sig/status.txt" 2> /dev/null && break; sleep 0.1; done
   sigpid=$(cat "$d/sig_$sig/serve.pid" 2> /dev/null)
-  launcher=$(ps -eo pid,args | awk -v o="$d/sig_$sig" 'index($0, "serve_spec.sh") && index($0, o) && !index($0, "awk") {print $1; exit}')
-  [ -n "$launcher" ] && kill -$sig "$launcher"
-  wait $bgpid
-  if [ "$(cat "$d/sig_$sig.rc" 2> /dev/null)" = 3 ] && ! kill -0 "$sigpid" 2> /dev/null && grep -q 'SIGNAL received' "$d/sig_$sig/status.txt"; then pass "SIG$sig to the launcher while waiting: server stopped, exit 3"
-  else bad "SIG$sig to the launcher while waiting" "rc=$(cat "$d/sig_$sig.rc" 2> /dev/null) launcher=$launcher server alive=$(kill -0 "$sigpid" 2> /dev/null && echo yes || echo no)"; fi
+  kill -$sig "$launcher"
+  wait "$launcher"; sigrc=$?
+  if [ "$sigrc" = 3 ] && ! kill -0 "$sigpid" 2> /dev/null && grep -q 'SIGNAL received' "$d/sig_$sig/status.txt"; then pass "SIG$sig to the launcher while waiting: server stopped, exit 3"
+  else bad "SIG$sig to the launcher while waiting" "rc=$sigrc launcher=$launcher server alive=$(kill -0 "$sigpid" 2> /dev/null && echo yes || echo no)"; fi
 done
 
 # ---- every post-boot check fails on its own (a mutated real log): the server is stopped and the exit is 1
@@ -187,6 +192,7 @@ grep -q -E 'live command line differs' "$d/ln_ns/check_line.txt" && pass "  ... 
 cp_root=$d/hostcopy; mkdir -p "$cp_root"; cp -r "$here/launch" "$here/env" "$here/scripts" "$cp_root/"
 sed -i 's/^LAUNCH_PORT=8100$/LAUNCH_PORT=${LAUNCH_PORT:-8100}/' "$cp_root/env/launch.env"
 rm -rf "${d:?}/pre_refuse"
+port=$(freeport)
 env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
   STUB_PORT=$port STUB_STATE=spec_1 STUB_MARK="$d/pre_refuse.mark" LAUNCH_PORT=9999 bash "$cp_root/launch/serve_spec.sh" --out "$d/pre_refuse" > "$d/pre_refuse.stdout" 2>&1; rc=$?
 if [ $rc = 2 ] && grep -q 'REFUSED the serve line built in this shell differs from the clean-shell derivation' "$d/pre_refuse.stdout" && [ ! -s "$d/pre_refuse.mark" ]; then pass "m1: a serve line that differs from the clean-shell derivation is refused before the start (exit 2, nothing started)"
@@ -196,14 +202,16 @@ else bad "m1: pre-start serve-line refusal" "rc=$rc $(tail -n 2 "$d/pre_refuse.s
 sentinel_run() { # <name> <seconds to wait before a TERM or 0> <env assignments...>: the launcher runs in its own session next to a sentinel process of that session
   local name=$1 term_after=$2; shift 2
   rm -rf "${d:?}/$name" "${d:?}/$name.rc"; mkdir -p "$d/$name"
-  (setsid bash -c 'sleep 300 & echo $! > "$1/sentinel"; shift; exec "$@"' _ "$d/$name" env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" \
+  port=$(freeport)
+  # the inner bash records its own pid before the exec chain (env, then the launcher keep it): that is the launcher's pid, no ps / awk lookup
+  (setsid bash -c 'sleep 300 & echo $! > "$1/sentinel"; echo $$ > "$1/launcher"; shift; exec "$@"' _ "$d/$name" env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" \
     MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port \
     STUB_MARK="$d/$name.mark" "$@" bash "$here/launch/serve_spec.sh" --out "$d/$name/out" > "$d/$name.stdout" 2>&1; echo $? > "$d/$name.rc") &
   local bg=$!
   if [ "$term_after" != 0 ]; then
     for _ in $(seq 1 50); do [ -s "$d/$name/out/serve.pid" ] && break; sleep 0.1; done
     sleep "$term_after"
-    local l; l=$(ps -eo pid,args | awk -v o="$d/$name/out" 'index($0, "serve_spec.sh") && index($0, o) && !index($0, "awk") {print $1; exit}')
+    local l; l=$(cat "$d/$name/launcher" 2> /dev/null)
     [ -n "$l" ] && kill -TERM "$l"
   fi
   wait $bg
@@ -339,6 +347,7 @@ else bad "P1: zombie handling" "rc=$zrc"; fi
 
 # review p2 r1 P2: a launcher that runs with job control (bash -m) still records the real server (setsid must not fork away from $!)
 rm -rf "${d:?}/jobctl"
+port=$(freeport)
 env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none \
   MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MARK="$d/jobctl.mark" SHELLOPTS=monitor \
   bash -m "$here/launch/serve_spec.sh" --out "$d/jobctl" > "$d/jobctl.stdout" 2>&1; rc=$?
@@ -356,6 +365,7 @@ else bad "--dry-run" "rc=$rc mark=$([ -s "$d/dry.mark" ] && echo yes || echo no)
 mkdir -p "$d/relcwd"
 for mode in launch dry; do
   rm -rf "${d:?}/relcwd/relout_$mode"
+  port=$(freeport)
   rargs=(); [ $mode = dry ] && rargs=(--dry-run)
   (cd "$d/relcwd" && env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none \
     MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 \
@@ -378,12 +388,11 @@ kill "$spid" 2> /dev/null
 
 # ---- review p2 r2 F1: the stop path with a missing or tampered session record. The launcher keeps the tuple it accepted: when server.sess is gone it signals that session (the same
 # guards apply); when the record disagrees with the leader the stop is refused and the log must not say STOPPED.
-freeport() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 f1_launch() { # <name>: starts a hanging stub launch in the background; sets f1pid (the launcher, from this subshell's exec) and waits for the LAUNCHED line with the session
-  local name=$1 p; p=$(freeport)
+  local name=$1; port=$(freeport)
   rm -rf "${d:?}/$name" "${d:?}/$name.rc"
-  (exec env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$p \
-    MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$p STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/$name" > "$d/$name.stdout" 2>&1) &
+  (exec env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
+    MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/$name" > "$d/$name.stdout" 2>&1) &
   f1pid=$!
   for _ in $(seq 1 100); do grep -q -a 'LAUNCHED pid=.* sid=' "$d/$name/status.txt" 2> /dev/null && break; sleep 0.1; done
   grep -q -a 'LAUNCHED pid=.* sid=' "$d/$name/status.txt" 2> /dev/null
