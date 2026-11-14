@@ -1,6 +1,6 @@
 """Real-weight end-to-end dump of the FULL Muse Spark model (TP8 + EP8) for the prefill-overlap A/B.
 
-The microbatched prefill (VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP=1) splits every eager batch of at least 4096 tokens in two,
+The microbatched prefill (VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP=1) splits every eager batch of at least 2050 tokens in two,
 so the prompts here are long: several of them need more than one 8192-token chunk, a few are short (they share batches
 with the long ones, and with the decodes of earlier requests, which makes mixed batches), and the longest ends in a chunk
 of a different size than the others. Prefix caching is off. Greedy decoding; the dump holds the token ids, the top-5

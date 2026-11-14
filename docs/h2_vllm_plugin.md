@@ -208,6 +208,22 @@ per microbatch, attention metadata per microbatch, the second one starts mid-req
 the collective of one microbatch runs on a high-priority comm stream while the other one computes. The flag is ON by
 default (accuracy class `deterministic_different`: the halves change M of the cuBLAS GEMMs); decode and CUDA-graph batches are untouched.
 
+When it applies (review round, 2026-10-26): the branch's config hook turns it on only for a launch whose V2 runner can microbatch:
+SM120, TP > 1 with expert parallelism, PP = DP = 1, no speculative decoding, LoRA, PIECEWISE CUDA graph mode, context parallelism or
+`VLLM_BATCH_INVARIANT`, and no multimodal inputs, i.e. `--limit-mm-per-prompt '{"image":0,"audio":0,"video":0}'` (every modality of
+the model capped at zero: `{"image":0}` alone leaves audio and video enabled and keeps the flag off). On any other launch the flag
+does nothing, and it never changes the model runner the launch gets (before the fix a multimodal launch without the limits fell
+back from the V2 to the V1 runner because of it; `config probe` over 12 launches now shows the same runner with the flag on and
+off). Around the microbatches the runner (a) sizes the workspace slot of every microbatch with one dummy step of the largest batch
+before the CUDA graphs are captured (the workspace is locked afterwards; a launch with `--no-enable-flashinfer-autotune` used to die
+on the first long prompt), (b) profiles the split batch as well as the whole one, so the KV cache is sized for it (see the memory
+note below), and (c) lets a microbatch run on alone when its sibling issues fewer collectives (the halves of a batch can take
+different model paths); the model also raises the split threshold to twice its sequence-parallel minimum, which depends on the CUDA
+graph sizes (`--compilation-config '{"max_cudagraph_capture_size":2048}'` with `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=1`: 4098 tokens
+instead of 2050; a 4097-token request used to hang there). With that threshold switched off by a scratch plugin, so that the halves
+(2048 / 2049 tokens) really straddle the sequence-parallel minimum, the real model completes 4097 and 4099-token requests in 0.5 s:
+the hand-off alone is enough, the threshold only keeps the halves on the path of the whole batch.
+
 What the plugin has to know about it:
 
 * One `TopoComm` serves both streams. A spec idea was a second workspace for the comm stream; it is not needed: every collective
@@ -237,6 +253,10 @@ Measured, real weights (SEED 9000 protocol of `scripts/locked_run_topo.sh`, pp t
 c1 512/128 stays 4057 (4072 without; 4452 vs 4470 with SP: below the threshold) and the decode TPOT stays 10.5-10.7 ms: a decode or
 CUDA-graph batch is never split.
 
+After the review fixes (branch commit f0e6b1299a, rows `r2e_g_r_ov` / `r2e_g_r_ov_sp`, same protocol, pp t/s c1 / ctx10 / ctx50 / ctx90):
+replicated 4027 / 8232 / 7737 / 7151 (before the fixes 4057 / 8240 / 7735 / 7155), SP 4433 / 8823 / 8421 / 7784 (4452 / 8803 / 8406 / 7778),
+TPOT 10.5 .. 10.7 ms, the five-request chat check 5/5 on both: the same within +-0.2 % (c1 -0.7 %, inside its noise).
+
 Single-request prefill latency (`bench/prefill_probe.py`, `scripts/prefill_chain.sh`, 1-token completions of random ids, mean of
 3 (2 at 64k), one server per row, dummy weights, replicated stream / sequence-parallel stream):
 
@@ -247,8 +267,8 @@ Single-request prefill latency (`bench/prefill_probe.py`, `scripts/prefill_chain
 | SP, off | 0.281 | 0.558 | 1.029 | 2.044 | 8.619 |
 | SP, microbatched | 0.253 | 0.467 | 0.877 | 1.729 | 7.333 |
 
-(`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS` below the floor of 2050 is raised to it: both halves must stay above the
-sequence-parallel minimum of the model so that the two threads issue the same number of collectives.)
+(`VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS` below the floor of 2050 is raised to it: both halves stay above the
+sequence-parallel minimum of the launch, so that they take the same model path as the whole batch.)
 
 Without the plugin (`MUSE_TOPO_ENABLE=0`, plain NCCL, same probe, 2100 / 8192 / 16384 tokens): replicated 0.393 / 1.473 / 2.952 s off,
 0.269 / 0.955 / 1.900 s microbatched; SP 0.333 / 1.203 / 2.418 s off, 0.291 / 1.003 / 2.003 s microbatched. The overlap is a branch feature
@@ -282,12 +302,20 @@ Accuracy (real weights, `bench/e2e_overlap.py`: 21 prompts of 9..23000 tokens, m
 `VLLM_ENABLE_V1_MULTIPROCESSING=0`; two passes per process, `nccl/compare.py`):
 
 * Run-to-run: with the flag on, pass 1 and pass 2 of one process are bitwise identical (21/21 requests, tokens, logprobs, prompt
-  logprobs) on both streams, and two processes with the flag on are bitwise identical on the replicated stream.
+  logprobs) on both streams, and two processes with the flag on are bitwise identical on the replicated stream. After the review
+  fixes (`gfe2e_*`, tree f0e6b1299a) two separate processes are bitwise identical on BOTH streams (21/21, all logprobs; the
+  sequence-parallel pair had not been compared before), and the fixed tree reproduces the reviewed tree bit for bit with the flag on
+  and with it off on both streams (21/21, all logprobs): the fixes changed no serving-path arithmetic.
 * Against the unsplit batch (`deterministic_different`, rounding level): replicated 16/21 greedy continuations identical, the
   sampled-token logprob differs by a median of 1.1e-4 (p90 0.048, p99 0.31) and the prompt-token logprobs by a median of 4e-6 (p99 0.28;
   mean 0.0031 on tokens with logprob > -1); sequence parallel 16/21 identical, sampled-token median 5e-6 (p99 0.13). The same
-  comparison between the two unsplit streams (replicated against SP) gives 17/21. No rank differs: every TP rank sees the same
-  split (the batch is rank-uniform) and the plugin's collectives are rank-identical.
+  comparison between the two unsplit streams (replicated against SP) gives 17/21. The replicated split deviates about three times
+  more than that (mean |dlogprob| 0.021 against 0.007; the signed mean is 7e-6, so no bias): bf16-rounding scale, but not "the same
+  kind and size of difference as the sequence-parallel stream", and the replicated stream is the one with the larger change.
+  Rank identity is measured now: a passive check (a scratch vLLM plugin that is not shipped) compared a checksum of the final hidden
+  states of every model step (the sum of the bf16 values viewed as int16 and an index-weighted sum) over the eight TP ranks with the
+  flag on, replicated and SP, during the 21-prompt run (88 steps per process, the microbatched prefill steps among them): 0
+  mismatches, and the outputs of those runs are bitwise identical to the runs without the check.
 * GSM8K smoke (`/raid/vllm-runtime/work/final/acc` harness, 200 items, two passes A / B, effort high, real weights): replicated 97.5 / 96.5 %
   with the flag against 96.5 / 94.5 % without; sequence parallel 96.0 / 98.0 % with against 96.5 / 98.0 % without. No degradation.
 
@@ -297,14 +325,19 @@ Reproduce: `flock -w 43200 /raid/vllm-runtime/sm120-dev/gpu.lock bash scripts/pr
 
 ## Limits and notes
 
-* Memory of the microbatched prefill: two microbatches in flight keep the activations of both halves alive and the collectives allocate on
-  the compute stream's pool; at 8192 tokens the peak reserved memory of a rank rises by about 1.4 GiB (replicated stream: 84.9 -> 86.4 GiB,
-  measured on dummy weights with the allocator statistics of the V2 runner) and a ready server with real weights holds 90.7 GiB/GPU
-  against 89.2 (SP 91.6 against 90.2) of the 94.97 GiB. The memory profile of the worker runs the whole batch (a dummy run has no attention
-  metadata to split), so the KV cache is not sized for it. At `--gpu-memory-utilization 0.95` this is enough: all real-weight rows, the
-  sweeps above and the two GSM8K runs completed, with one benign allocator retry ("memory allocation failed ... retrying", 256 MiB with 150 MiB
-  free) in the 2048/256 concurrency-128 run of the replicated stream. A launch that runs closer to the limit can turn the retry into an
-  OOM: lower `--gpu-memory-utilization` by 0.01 or set `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP=0`.
+* Memory of the microbatched prefill: two microbatches in flight keep the activations of both halves alive, hold a second workspace
+  slot (768 MB at 8192 tokens) and allocate their collective results on the compute stream's pool. The branch's memory profile runs
+  the batch split as well as whole (a second pass after the whole one, without attention metadata, with a throw-away microbatch
+  runner), so the KV cache is sized for the extra footprint instead of taking it from the headroom. Dummy weights, TP8 EP8,
+  `--gpu-memory-utilization 0.90`, 8192-token chunks: KV pool 4.15 -> 3.48 GiB per GPU with the flag (replicated stream; 5.13 -> 4.49
+  GiB with SP), `nvidia-smi` used after six prefills of 8192 .. 16384 tokens 85421 MiB without and 85377 MiB with it, i.e. the flag
+  costs about 0.65 GiB of KV cache per GPU and no headroom. (The version before this profile pass measured +1.4 GiB reserved at
+  8192 tokens on a ready server, 90.7 against 89.2 GiB/GPU with real weights at 0.95, and one benign allocator retry in the 2048/256
+  concurrency-128 run, because only the whole batch was profiled.)
+  Real weights, `--gpu-memory-utilization 0.95` (fixed tree, `r2e_g_r_ov` / `r2e_g_r_ov_sp`): KV pool 8.23 GiB per GPU (1,517,064
+  tokens; SP 9.24 GiB, 1,703,396) against 8.90 GiB (1,640,273; SP 9.88) of the tree before the profile pass, and a ready server holds
+  88,179 MiB per GPU (SP 89,209) against 88,923 (89,893): the extra footprint of the split is in the budget, no allocator retry
+  in the benchmark rows.
 
 * KV sizing and the workspace (review correction): the 61 MiB workspace is allocated in `CudaCommunicator.__init__`, which runs inside
   `init_worker_distributed_environment` (`gpu_worker.py` line 509), BEFORE the worker takes `init_snapshot` (line 534). The
