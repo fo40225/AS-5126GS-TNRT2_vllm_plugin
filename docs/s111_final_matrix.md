@@ -534,25 +534,24 @@ included in the totals above.
 - **DRAM read ceiling.** The measured cold DRAM read ceiling is 1.537 TB/s = 96 % of ncu's 1.596 TB/s peak at the only supported memory clock (12481 MHz), not the 1.79 TB/s nominal figure; S1-6 L3 was closed on
   this ceiling. L2-resident data can exceed it.
 - **Link-bound PCIe collectives and the IB-lane PARK.** There is no NVLink. With the bf16 exchange every large collective is bound by each GPU's own x16 link, not by the cross-socket cut:
-  all-reduce and reduce-scatter measure 0.91-1.04 x their link floor (S1-12), so a NIC lane (ConnectX-7) would move the same bytes over the same link: the IB-lane lever is PARKED FINAL
+  isolated all-reduce and reduce-scatter kernels measure 0.91-1.04 x their link floor (S1-12; the in-prefill reduce-scatter runs at 1.12-1.19 x T_link, skew / contention), so a NIC lane (ConnectX-7) would move the same bytes over the same link: the IB-lane lever is PARKED FINAL
   (S1-12, S1-16: redirecting the cut stores to same-socket peers makes the large AG / RS slower at every size). The large all-gather runs at 1.17-1.21 x its link floor; the excess is internal to the
   AG kernel (two-hop relay, per-range flags, chunk pipelining), the reduce-scatter with the same cut share runs at 0.96-0.98 x. That AG relay is parked below.
 - **EP straggler.** The expert-parallel straggler levers (R5 / R11) were ranked below 1.6 % ("not worth it or no mechanism") and are not worked on; the EP8 layout replicates tokens and has no all2all.
 - **Swap with the tier ON.** At P* the pinned-tier allocation can swap unpinned worker / EngineCore / API-server anonymous memory to the 8 GiB swap file while the server starts. ns256 ON swapped at READY
-  in 2 of 3 S1-11 boots (4,095.3 and 4,570.6 MiB used; peaks 5,429.6 and 6,677.8 MiB), spec ON in 0 of 1. In the S1-10R gate 14 of 18 ON-like boots / processes swapped (growth 3.8-7.4 GiB from launch
+  in 2 of 3 S1-11 boots (4,095.3 and 4,570.6 MiB used; peaks 5,429.6 and 6,677.8 MiB), spec ON in 0 of 1 (boots only: of the 6 offline G-det / D4' processes one, G-det spec ON process b, swapped up to 2,997 MiB and released it at exit, the other five stayed at 64-71 MiB; PHASE2_RESULTS does not list the offline processes' swap). In the S1-10R gate 14 of 18 ON-like boots / processes swapped (growth 3.8-7.4 GiB from launch
   to READY; peak 7,444.8 of 8,192 MiB in `s110r_spec_ON_1`), none of the 16 OFF / CTL-like boots did. Over all 22 large-tier ON boots of 2026-11-11 / 12 (gate chain, det / D4' boots and the adoption series)
   14 swapped, 8 did not; none of 17 no-tier boots swapped. **No predictor was found** (`muse_wf/s1-11/swap_predictor.json`, no GPU, 39 boots; the 4 ON boots of the S1-11 matrix are not among the 39 and the predictor was not re-run with them; together 16 of 26 large-tier ON boots swapped): the preflight margins A_N / LEFT, the node memory before
-  the launch (free, file, slab), the tier profile and the previous boot do not separate swappers from non-swappers; the only recurring feature of the non-swappers is a pause of 50 minutes or more before the
-  launch (3 of 3), not significant after correction (Bonferroni 0.23), and 5 of the 8 non-swappers followed a boot by 3-41 s. Treat swap at READY as likely, check it per boot (`status.txt` has the swap
+  the launch (free, file, slab), the tier profile and the previous boot do not separate swappers from non-swappers; all 3 boots that started 50 minutes or more after the previous teardown did not swap (3 of the 8 non-swappers), not significant after correction (Bonferroni 0.23), and 5 of the 8 non-swappers followed a boot by 3-41 s. Treat swap at READY as likely, check it per boot (`status.txt` has the swap
   record); the cells are not voided. Swap onset is 56-79 s after the launch, when the tier is allocated.
 - **c128 p99 TTFT tail with the tier.** S1-10R gate: dec c128 p99 TTFT is 3.5-7.7 % higher ON than OFF in all six groups (spec mean x1.052, ns256 mean x1.051; systematic, informational). This matrix, single
   runs: spec ON vs OFF c128 p99 TTFT +0.8 % (greedy) / +6.8 % (default) / +2.4 % (top_p), nat8k 0.0 %, mixed churn c128 -27 %.
   The tier-cost statement elsewhere covers throughput only. Same-chain single-run TTFT deltas of spec ON vs OFF that are not attributed (a single run cannot separate the tier from run-to-run noise):
-  dec_default p50 up to +8.6 % (c64; c32 +6.1 %), p99 up to +5.4 % (c4); top_p c64 p50 +4.2 %.
+  dec_default p50 up to +8.6 % (c64; c32 +6.1 %), p99 +5.4 % (c4) and +6.8 % (c128); top_p c64 p50 +4.2 %.
 - **ns256 bound-TTFT deviation, never re-gated.** The 0.32.0 study measured a 9-12 % slower median reuse TTFT for the NUMA-bound ns256 against the unbound one; it was not re-gated. In this matrix the
   median TTFT of ns256 ON against ns128 OFF is within -4.3..+7.9 % (cross-profile, single runs, a different quantity). `MUSE_OFFLOAD_NUMA_BIND=0` switches the binding off.
 - **Batched tier-hit outputs are not bitwise equal to GPU-hit outputs for every request.** Inside one process the H (GPU hit) and X (tier hit after a GPU-only reset) passes have the same hit length in all
-  85 requests and still differ for part of the batched passes (spec greedy H = X in 72 / 85, ns256 81 / 85; the cause was not found, batched scheduling / chunk shapes are the candidate). The evidence that
+  85 requests of the workloads checked (spec greedy / t1k64) and still differ for part of the batched passes (requests with H = X: spec greedy 72 / 85, spec t1k64 37 / 85, spec mixed 68 / 85; ns256 greedy 81 / 85, mixed 80 / 85, t1k64 81 / 85; the cause was not found, batched scheduling / chunk shapes are the candidate). The evidence that
   holds: the single-stream tier restore is bitwise (D4' KV block bit-exactness, tokens and logprob values of the server leg) and two cold processes are identical (G-det). A recompute (C) differs from
   a hit (H) by design (the output depends on the cached length and the chunk shapes).
 - **Per-configuration offset floor of about 1.5-2.5 %.** Each configuration (serve line, environment, layout) carries a deterministic offset of 0.4-0.6 % SD (max 1.3 %) at dispatch-identical cells; a
@@ -560,7 +559,7 @@ included in the totals above.
   measured constant. The S1-10R STEADY c1 pass (0.9859 against the 0.985 threshold, margin 0.0009) sits inside it.
 - **GSM8K counts 16,384-token truncations as wrong** (section 6.4), so a long-generation run scores lower than its answers alone.
 - **Reproducibility of the cells.** Three protocol-matched secondary rows are more than 3 % below a 0.33.0 value (spec dec.c1 3.44 %, twice, and the spec_off acceptance length at c1 3.81 %); the AL of the
-  16 replayed prompts explains them (4.671 against 4.856 at validation; 232.5 x 4.671 / 4.856 = 223.6 against 224.5 measured). 29 primary protocol-matched baseline rows exist; rand512, nat8k,
+  16 replayed prompts explains them (4.671 against 4.856 at validation; 232.5 x 4.671 / 4.856 = 223.6 against 224.5 measured; which of 224.3 / 232.5 is the primary spec c1 baseline stays an open orchestrator reading, with 232.5 the spec c1 DEC rows are 3.44 % worse). 29 primary protocol-matched baseline rows exist; rand512, nat8k,
   churn, default sampling, top_p, c4 / c32 / c256 DEC, the 65k / 118k walls and every TTFT / TPOT metric have NO 0.33.0 baseline, so "0 primary flags" does not mean every cell is within 3 %.
   13 non-speculative STEADY cells were unparsed by the chain (`TypeError` in `parse_result`) and recomputed from the raw per-window values.
 
