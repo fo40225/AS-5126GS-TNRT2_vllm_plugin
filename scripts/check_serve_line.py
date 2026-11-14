@@ -6,8 +6,8 @@ Three legs, all must hold (exit 0), any difference is a FAIL (exit 1):
      interpreter and the vllm script) equals serve_cmd.txt, argument by argument;
   2. with --derived: serve_cmd.txt equals, byte for byte, the serve line a clean `env -i` dry run of the same script derives from the env files at check time;
   3. the "non-default args" line(s) of the startup log, vLLM's own parse of the arguments, carry exactly the options of that command line with the same values
-     (scalars, the JSON of --speculative-config / --limit-mm-per-prompt and the three fields of --kv-transfer-config, and no kv_connector / kv_role in the
-     log's KVTransferConfig that the command line lacks), and no option that is not on it.
+     (scalars, the JSON of --speculative-config / --limit-mm-per-prompt and the three fields of --kv-transfer-config, and no kv_connector / kv_role / non-empty
+     kv_connector_extra_config in the log's KVTransferConfig that the command line lacks), and no option that is not on it.
 usage: check_serve_line.py --serve-cmd FILE (--pid PID | --cmdline-file FILE) --log FILE [--derived FILE]
 """
 import argparse
@@ -132,6 +132,15 @@ def kv_transfer_fields(text, want):
         got = ast.literal_eval(m.group(1)) if m else None
         if got is not None:
             bad.append("%s: line %r, but the command line has no %s" % (k, got, k))
+    # the tier size lives in kv_connector_extra_config (dict-valued, default {}): a non-empty dict in the log that the line lacks is the same kind of edit
+    if "kv_connector_extra_config" not in want:
+        m = re.search(r"\bkv_connector_extra_config=(\{)", text)
+        try:
+            got = ast.literal_eval(balanced(text, m.start(1))) if m else None
+        except (ValueError, SyntaxError):
+            got = "unparseable"
+        if got:
+            bad.append("kv_connector_extra_config: line %s, but the command line has no kv_connector_extra_config" % (got,))
     return bad
 
 

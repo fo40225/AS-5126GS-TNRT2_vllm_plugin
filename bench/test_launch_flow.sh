@@ -420,6 +420,15 @@ if f1_launch f1_forged; then
   bash "$here/launch/stop_server.sh" "$d/f1_forged" > /dev/null 2>&1
   kill -0 "$f1srv" 2> /dev/null && kill "$f1srv" 2> /dev/null
 else bad "F1 setup (forged record)" "no LAUNCHED line"; kill "$f1pid" 2> /dev/null; fi
+# 3. (review docs r1 m5) the record file is garbage (unparseable): the accepted tuple takes its place, as for a removed file
+if f1_launch f1_garbage; then
+  f1srv=$(cat "$d/f1_garbage/serve.pid")
+  echo "not a session record at all" > "$d/f1_garbage/server.sess"
+  kill -TERM "$f1pid"; wait "$f1pid"; rc=$?
+  if [ $rc = 3 ] && ! kill -0 "$f1srv" 2> /dev/null && grep -q -a 'using the tuple the launcher accepted' "$d/f1_garbage/status.txt" && grep -q -a 'STOPPED gpu_used_mib' "$d/f1_garbage/status.txt" \
+     && ! grep -q -a 'NOT_STOPPED' "$d/f1_garbage/status.txt"; then pass "F1: server.sess unparseable: a TERM still stops the server from the accepted tuple (exit 3, STOPPED)"
+  else bad "F1: garbage record, TERM to the launcher" "rc=$rc server alive=$(kill -0 "$f1srv" 2> /dev/null && echo yes || echo no) $(grep -a -E 'SIGNAL|STOP|RESULT' "$d/f1_garbage/status.txt" | tr '\n' '|' | cut -c1-400)"; kill "$f1srv" 2> /dev/null; fi
+else bad "F1 setup (garbage record)" "no LAUNCHED line"; kill "$f1pid" 2> /dev/null; fi
 
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))

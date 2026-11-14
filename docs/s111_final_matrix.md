@@ -9,9 +9,9 @@ Section numbers that appear inside copied paragraphs (for example "section 4" or
 
 - Matrix and gates ran on the production trees host main `f540ce1b37` (205 files, git-cross-checked against the deployed `host_topo`) and vLLM `sm120-muse-spark-open` `f6a60ab9d7`
   (`sm120-dev/src`, 10,757 files), pins re-verified in every hold. Chain 2026-11-13 02:36:49 -> 07:11:47 (4 h 35 min, 13 holds, all rc 0), 7 boots, 216 cells.
-- Every boot went through the launch scripts and passed every post-boot check (live environment, live command line = `serve_cmd.txt` = clean-shell derivation, KV, offload, spec).
+- Every boot went through the launch scripts and passed every post-boot check of `f540ce1b37` (without the F1 stop-path fallback and the F3 / `kv_connector_extra_config` line-check additions of this branch; live environment, live command line = `serve_cmd.txt` = clean-shell derivation, KV, offload, spec).
 - The commits made after the run (branch `s111-docs`, cut from `f540ce1b37`) change only the stop path of the launcher (`launch/lib.sh`, `launch/session.sh`: the accepted session tuple is the
-  fallback when `server.sess` is gone; `NOT_STOPPED` instead of a false `STOPPED`), the serve-line check (`scripts/check_serve_line.py`: the log's `kv_connector` / `kv_role` must
+  fallback when `server.sess` is gone; `NOT_STOPPED` instead of a false `STOPPED`), the serve-line check (`scripts/check_serve_line.py`: the log's `kv_connector` / `kv_role` / non-empty `kv_connector_extra_config` must
   also be on the line), tests and documentation. No exported variable, serve line or default changes; the measured configurations are the ones of `f540ce1b37`.
 - A measurement, not an adoption decision. The gate criteria were fixed before the run (S1-11 Amendment 3 and the phase 2 rulings); the 9 gates are 9 / 9 PASS.
 
@@ -541,12 +541,14 @@ included in the totals above.
 - **Swap with the tier ON.** At P* the pinned-tier allocation can swap unpinned worker / EngineCore / API-server anonymous memory to the 8 GiB swap file while the server starts. ns256 ON swapped at READY
   in 2 of 3 S1-11 boots (4,095.3 and 4,570.6 MiB used; peaks 5,429.6 and 6,677.8 MiB), spec ON in 0 of 1. In the S1-10R gate 14 of 18 ON-like boots / processes swapped (growth 3.8-7.4 GiB from launch
   to READY; peak 7,444.8 of 8,192 MiB in `s110r_spec_ON_1`), none of the 16 OFF / CTL-like boots did. Over all 22 large-tier ON boots of 2026-11-11 / 12 (gate chain, det / D4' boots and the adoption series)
-  14 swapped, 8 did not; none of 17 no-tier boots swapped. **No predictor was found** (`muse_wf/s1-11/swap_predictor.json`, no GPU, 39 boots): the preflight margins A_N / LEFT, the node memory before
+  14 swapped, 8 did not; none of 17 no-tier boots swapped. **No predictor was found** (`muse_wf/s1-11/swap_predictor.json`, no GPU, 39 boots; the 4 ON boots of the S1-11 matrix are not among the 39 and the predictor was not re-run with them; together 16 of 26 large-tier ON boots swapped): the preflight margins A_N / LEFT, the node memory before
   the launch (free, file, slab), the tier profile and the previous boot do not separate swappers from non-swappers; the only recurring feature of the non-swappers is a pause of 50 minutes or more before the
   launch (3 of 3), not significant after correction (Bonferroni 0.23), and 5 of the 8 non-swappers followed a boot by 3-41 s. Treat swap at READY as likely, check it per boot (`status.txt` has the swap
   record); the cells are not voided. Swap onset is 56-79 s after the launch, when the tier is allocated.
 - **c128 p99 TTFT tail with the tier.** S1-10R gate: dec c128 p99 TTFT is 3.5-7.7 % higher ON than OFF in all six groups (spec mean x1.052, ns256 mean x1.051; systematic, informational). This matrix, single
   runs: spec ON vs OFF c128 p99 TTFT +0.8 % (greedy) / +6.8 % (default) / +2.4 % (top_p), nat8k 0.0 %, mixed churn c128 -27 %.
+  The tier-cost statement elsewhere covers throughput only. Same-chain single-run TTFT deltas of spec ON vs OFF that are not attributed (a single run cannot separate the tier from run-to-run noise):
+  dec_default p50 up to +8.6 % (c64; c32 +6.1 %), p99 up to +5.4 % (c4); top_p c64 p50 +4.2 %.
 - **ns256 bound-TTFT deviation, never re-gated.** The 0.32.0 study measured a 9-12 % slower median reuse TTFT for the NUMA-bound ns256 against the unbound one; it was not re-gated. In this matrix the
   median TTFT of ns256 ON against ns128 OFF is within -4.3..+7.9 % (cross-profile, single runs, a different quantity). `MUSE_OFFLOAD_NUMA_BIND=0` switches the binding off.
 - **Batched tier-hit outputs are not bitwise equal to GPU-hit outputs for every request.** Inside one process the H (GPU hit) and X (tier hit after a GPU-only reset) passes have the same hit length in all

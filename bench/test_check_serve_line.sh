@@ -107,6 +107,12 @@ for state in ("spec_1", "spec_0", "ns256_1", "ns256_0", "ns128_1", "ns128_0"):
             assert frag in sc, frag
             ed = sc.replace(frag, "")
             check("%s: %s deleted from the line (all copies), log unchanged: FAIL" % (state, field), 1, run(live(ed), ed, log, ed), r"kv_transfer_config differs: %s: line .*no %s" % (field, field))
+        # review docs r1 m4: kv_connector_extra_config (the tier size) deleted from the kv-transfer JSON in all copies while the log keeps it
+        KVE = r'\,\"kv_connector_extra_config\":'
+        k = sc.index(KVE)
+        ed = sc[:k] + r'\}' + sc[sc.index(r'\}\}', k) + 4:]
+        assert ed != sc and "extra_config" not in ed, ed
+        check("%s: kv_connector_extra_config deleted from the line (all copies), log unchanged: FAIL" % state, 1, run(live(ed), ed, log, ed), r"kv_transfer_config differs: kv_connector_extra_config: line .*no kv_connector_extra_config")
         # the same edit on the line AND the log (a boot that really ran without them) is consistent for this leg
         ed = sc.replace(KVC, "").replace(KVR, "")
         elog = log.replace("kv_connector='SimpleCPUOffloadConnector'", "kv_connector=None").replace("kv_role='kv_both'", "kv_role=None")
