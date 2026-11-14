@@ -13,7 +13,7 @@ export TORCH_EXTENSIONS_DIR=$W/torch_ext
 export TRITON_CACHE_DIR=$W/triton_cache
 export HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
 export NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-SYS}
-# NCCL >= 2.30 connects the cross-socket hops over the RoCE NIC and fails to init unless IB is off (see env/host.env).
+# NCCL >= 2.30 connects the cross-socket hops over the NIC (observed in RoCE mode; IB mode since 2026-11-10, NCCL_IB_DISABLE=1 still required) and fails to init unless IB is off (see env/host.env).
 export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
 export MUSE_TOPO_ENABLE=${MUSE_TOPO_ENABLE:-1}
 mkdir -p "$W/logs"

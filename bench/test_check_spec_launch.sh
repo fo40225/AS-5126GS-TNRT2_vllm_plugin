@@ -84,6 +84,21 @@ mk eng8 384 256 "9 1 384 8"
 run eng8 0 "engine limit 8 (b12x only): floor 9" MUSE_SPEC_GRAPH_SP_MIN_TOKENS=1 -- "$d/eng8/serve.log"
 mk wrongraise 384 256 "200 136 384"
 run wrongraise 1 "graph floor 200 is not max(env 136, engine 128 + 1)" -- "$d/wrongraise/serve.log"
+# S1-13 review: the flag-2 pairing (r2e on + aux projection on the target's rows + FP8 draft flag 2 / cutlass) against FP8_F2_MAX_BYTES: 11,720,212,480 is
+# accepted, one byte more is rejected (the a1a_big case above only fails through the r2e-off maximum, so a wrong flag-2 constant would not be noticed)
+mk_f2() {
+  mk "$1" 384 256 "" "$2"
+  { cat "$d/$1/serve.log"; echo "INFO MuseSpark SM120: prefill batches of at least 512 tokens run as 2 microbatches (r2e)."
+    echo "INFO MuseSpark SM120: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2)."
+    for _ in 1 2 3 4 5 6 7 8; do
+      echo "INFO DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized"
+      echo "INFO DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2)"
+    done; } > "$d/$1/serve.log.new" && mv "$d/$1/serve.log.new" "$d/$1/serve.log"
+}
+mk_f2 f2_at 11720212480
+run f2_at 0 "flag-2 pairing (r2e, aux projection, FP8 2 cutlass) at 11,720,212,480" -- "$d/f2_at/serve.log"
+mk_f2 f2_over 11720212481
+run f2_over 1 "flag-2 pairing, one byte above FP8_F2_MAX_BYTES (11,720,212,481)" -- "$d/f2_over/serve.log"
 # env/spec_k7.env: off is a property of sourcing the profile
 got=$(env -i PATH="$PATH" bash -c "MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136; source $here/env/spec_k7.env; a=\${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}; MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0; source $here/env/spec_k7.env; echo \$a \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}" 2>&1)
 if [ "$got" = "136 unset" ]; then echo "ok   spec_k7.env: a re-source with the flag at 0 unsets the vLLM variable"; else echo "FAIL spec_k7.env re-source: got '$got' wanted '136 unset'"; fails=$((fails+1)); fi
