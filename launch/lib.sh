@@ -251,7 +251,7 @@ lc_await_session() {
 lc_kill_pid() {
   local i
   kill -TERM "$1" 2> /dev/null
-  for i in $(seq 1 "$LC_STOP_ITERS"); do kill -0 "$1" 2> /dev/null || return 0; sleep "$LC_STOP_POLL_S"; done
+  for i in $(seq 1 "$LC_STOP_ITERS"); do sx_alive "$1" || return 0; sleep "$LC_STOP_POLL_S"; done
   kill -KILL "$1" 2> /dev/null
 }
 
@@ -292,6 +292,8 @@ lc_check() {
 
 # lc_main: the whole flow after lc_init + lc_source_env
 lc_main() {
+  # no job control: with it the server subshell would be a process-group leader and util-linux setsid would fork, so $! would not be the server
+  set +m
   lc_pairing
   lc_build_serve
   local name=$LC_PROFILE

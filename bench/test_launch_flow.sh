@@ -269,9 +269,9 @@ bash "$here/launch/stop_server.sh" "$d/ss2" > "$d/ss2.out" 2>&1; rc=$?
 if [ $rc = 3 ] && kill -0 "$spid2" 2> /dev/null && grep -q 'contains this script' "$d/ss2.out"; then pass "stop_server.sh: a session that contains the caller (or its parent) is never signalled (exit 3)"
 else bad "stop_server.sh with the caller's session" "rc=$rc $(cat "$d/ss2.out")"; fi
 kill "$spid2" 2> /dev/null
-# a session whose leader is gone but whose workers live on (a crashed API server): the orphans are cleaned one by one
+# a session whose leader is gone but whose workers live on (a crashed API server): the orphans of this launch (same boot, cwd = out dir, started after the leader) are cleaned one by one
 mkdir -p "$d/ss3"
-setsid bash "$here/launch/lc_child.sh" "$d/ss3/server.sess" bash -c '(exec -a vllm_orphan sleep 120 > /dev/null 2>&1 &) ; sleep 0.3; exit 0' < /dev/null > /dev/null 2>&1 &
+(cd "$d/ss3" && setsid bash "$here/launch/lc_child.sh" "$d/ss3/server.sess" bash -c '(exec -a vllm_orphan sleep 120 > /dev/null 2>&1 &) ; sleep 0.3; exit 0' < /dev/null > /dev/null 2>&1) &
 for _ in $(seq 1 30); do [ -s "$d/ss3/server.sess" ] && break; sleep 0.1; done
 wait $! 2> /dev/null
 sleep 0.2
@@ -280,9 +280,73 @@ opid=$(ps -eo pid,args | awk '$2 == "vllm_orphan" {print $1; exit}')
 if [ -n "$opid" ] && ! kill -0 "$lp" 2> /dev/null; then
   bash "$here/launch/stop_server.sh" "$d/ss3" > "$d/ss3.out" 2>&1; rc=$?
   sleep 0.3
-  if [ $rc = 0 ] && ! kill -0 "$opid" 2> /dev/null; then pass "stop_server.sh: leader gone, the orphaned member of the recorded session is stopped"
+  if [ $rc = 0 ] && ! kill -0 "$opid" 2> /dev/null; then pass "stop_server.sh: leader gone, the orphaned member of the recorded session that belongs to this launch is stopped"
   else bad "stop_server.sh orphan cleanup" "rc=$rc $(cat "$d/ss3.out")"; kill "$opid" 2> /dev/null; fi
 else bad "stop_server.sh orphan setup" "orphan=$opid leader alive=$(kill -0 "$lp" 2> /dev/null && echo yes || echo no)"; [ -n "$opid" ] && kill "$opid" 2> /dev/null; fi
+
+# review p2 r1 B1: a leaderless session is swept only when its members provably belong to the launch. A stale or forged record whose session number is carried by
+# an unrelated leaderless session (members with another cwd), a record from another boot, or a record without a boot id must not signal anything (exit 3, members alive).
+bootid=$(cat /proc/sys/kernel/random/boot_id)
+leaderless() { # <name> <cwd of the member> -> sets lp (the gone leader), mp (the member): a session whose leader exited and whose member keeps running
+  local n=$1 cwd=$2; mkdir -p "$d/$n"
+  (cd "$cwd" && setsid bash -c '(exec -a vllm_member sleep 120 > /dev/null 2>&1 &) ; sleep 0.3; echo $$ > "$1/leader"; exit 0' _ "$d/$n" < /dev/null > /dev/null 2>&1) &
+  for _ in $(seq 1 30); do [ -s "$d/$n/leader" ] && break; sleep 0.1; done
+  sleep 0.5
+  lp=$(cat "$d/$n/leader"); mp=$(ps -eo pid,sid,args | awk -v s="$lp" '$2 == s && $3 == "vllm_member" {print $1; exit}')
+  lst=$(ps -p "$lp" > /dev/null 2>&1 && sed -E 's/^.*\) //' "/proc/$lp/stat" | awk '{print $20}')
+  [ -n "$mp" ] && [ -n "$lp" ] && ! kill -0 "$lp" 2> /dev/null
+}
+mkdir -p "$d/elsewhere"
+for variant in foreign_cwd other_boot no_boot; do
+  case $variant in foreign_cwd) cwd=$d/elsewhere ;; *) cwd=$d/lg_$variant ;; esac
+  mkdir -p "$d/lg_$variant"
+  if leaderless "lg_$variant" "$cwd"; then
+    # a start time earlier than the member's (a leader that started before it)
+    mst=$(sed -E 's/^.*\) //' "/proc/$mp/stat" | awk '{print $20}'); lstart=$((mst - 5))
+    echo "$lp" > "$d/lg_$variant/serve.pid"
+    case $variant in
+      foreign_cwd) echo "$lp $lp $lp $lstart $bootid" > "$d/lg_$variant/server.sess" ;;
+      other_boot) echo "$lp $lp $lp $lstart 00000000-0000-0000-0000-000000000000" > "$d/lg_$variant/server.sess" ;;
+      no_boot) echo "$lp $lp $lp $lstart" > "$d/lg_$variant/server.sess" ;;
+    esac
+    bash "$here/launch/stop_server.sh" "$d/lg_$variant" > "$d/lg_$variant.out" 2>&1; rc=$?
+    if [ $rc = 3 ] && kill -0 "$mp" 2> /dev/null && grep -q 'NOT SIGNALLED' "$d/lg_$variant.out"; then pass "B1: leaderless session, stale record ($variant): the member is not signalled (exit 3), it is reported"
+    else bad "B1: leaderless session, stale record ($variant)" "rc=$rc member alive=$(kill -0 "$mp" 2> /dev/null && echo yes || echo no) $(cat "$d/lg_$variant.out")"; fi
+    # and with a correct record (same boot, cwd = out dir) the same member is the launch's own and is stopped
+    if [ $variant = other_boot ]; then
+      echo "$lp $lp $lp $lstart $bootid" > "$d/lg_$variant/server.sess"
+      bash "$here/launch/stop_server.sh" "$d/lg_$variant" > "$d/lg_$variant.out2" 2>&1; rc=$?
+      sleep 0.3
+      if [ $rc = 0 ] && ! kill -0 "$mp" 2> /dev/null; then pass "B1: the same session with a matching record (boot, cwd = out dir, start time) is swept (exit 0)"
+      else bad "B1: matching record sweep" "rc=$rc $(cat "$d/lg_$variant.out2")"; fi
+    fi
+    kill "$mp" 2> /dev/null
+  else bad "B1 setup ($variant)" "leader=$lp member=$mp"; [ -n "$mp" ] && kill "$mp" 2> /dev/null; fi
+done
+
+# review p2 r1 P1: a zombie (an unreaped, exited child) is neither alive nor a member to signal
+bash -c '
+  source "$1/launch/session.sh"
+  setsid bash -c "sleep 0.1 & echo \$! > $2/zpid; exec -a vllm_zparent sleep 3" < /dev/null > /dev/null 2>&1 &
+  sleep 0.8; zp=$(cat $2/zpid)
+  st=$(ps -o stat= -p "$zp" | tr -d " ")
+  case "$st" in Z*) ;; *) echo "setup: not a zombie ($st)"; exit 9 ;; esac
+  if sx_alive "$zp"; then echo "zombie reported alive"; exit 1; fi
+  sid=$(ps -o sid= -p "$zp" | tr -d " "); if sx_members "$sid" | grep -qx "$zp"; then echo "zombie listed as a member"; exit 1; fi
+  exit 0' _ "$here" "$d"; zrc=$?
+if [ $zrc = 0 ]; then pass "P1: a zombie child is not alive and not a session member (the TERM wait of an INT-aborted launch does not stall)"
+else bad "P1: zombie handling" "rc=$zrc"; fi
+
+# review p2 r1 P2: a launcher that runs with job control (bash -m) still records the real server (setsid must not fork away from $!)
+rm -rf "${d:?}/jobctl"
+env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none \
+  MUSE_LAUNCH_PORT=$port MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MARK="$d/jobctl.mark" SHELLOPTS=monitor \
+  bash -m "$here/launch/serve_spec.sh" --out "$d/jobctl" > "$d/jobctl.stdout" 2>&1; rc=$?
+read -r jp js jg jt jb < "$d/jobctl/server.sess" 2> /dev/null
+if [ $rc = 0 ] && [ "$jp" = "$(cat "$d/jobctl/serve.pid" 2> /dev/null)" ] && [ "$js" = "$jp" ] && [ "$jg" = "$jp" ] && [ "$jb" = "$bootid" ] && kill -0 "$jp" 2> /dev/null; then
+  pass "P2: a launcher with job control on (bash -m): server.sess names the running server (pid = sid = pgrp = serve.pid), boot id recorded"
+else bad "P2: job control" "rc=$rc record='$jp $js $jg $jt $jb' serve.pid=$(cat "$d/jobctl/serve.pid" 2> /dev/null) $(grep -a -E 'LAUNCHED|SESSION|RESULT' "$d/jobctl/status.txt" | tr '\n' '|')"; fi
+bash "$here/launch/stop_server.sh" "$d/jobctl" > /dev/null 2>&1
 
 # ---- --dry-run: the records only, no server
 run dry serve_spec.sh STUB_STATE=spec_1 -- --dry-run
