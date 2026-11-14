@@ -52,6 +52,9 @@ requests), graph pool 2.11 -> 1.22 GiB per rank. Non-speculative launches, `envs
 
 ## Launch line (the production speculative launch line since the S1-9 lever 1 merge)
 
+> **Since the S1-10R adoption (2026-11-12) the offload is part of this profile and the launch line below is incomplete as a stand-alone form.** `env/spec_k7.env` sources `env/offload.env` (`MUSE_OFFLOAD` defaults to 1; `export MUSE_OFFLOAD=0` is the line below), so the KV bytes are `$MUSE_SPEC_KV_BYTES` = 11,645,337,600 and the line ends with `$MUSE_OFFLOAD_SERVE_ARGS`
+> (`--numa-bind --kv-transfer-config ...`) after `--kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES`; the form without it, as shown below and in the harness form, is refused by `check_spec_launch.sh` / `check_offload_launch.sh` when the bytes are the offload-on ones. The current line, the preflight and the checks: `docs/s110_numa_offload.md` section 7. The text below is the history of the S1-9 levers.
+
 The stage C line (`/tmp/muse_wf/s1-8/stageC/RESULTS.md` Part 5.3) plus the two settings and the KV bytes re-derived for this graph set:
 
     source $HOST_DIR/env/host.env; source $HOST_DIR/env/spec_k7.env     # MIN_TOKENS=384, r2e opt-in, FC_SHARD=2, MUSE_SPEC_SERVE_ARGS, MUSE_SPEC_KV_BYTES=11134914560 (10373877760 before S1-9 L4)
