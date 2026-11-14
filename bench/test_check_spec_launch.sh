@@ -26,7 +26,9 @@ run() {
   local name=$1 want=$2 desc=$3; shift 3
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   out=$(env -i PATH="$PATH" "${envs[@]}" bash "$check" "$@" 2>&1); rc=$?
-  if [ "$rc" != "$want" ]; then echo "FAIL case '$desc': rc=$rc wanted $want"; echo "$out" | sed 's/^/    /'; fails=$((fails+1)); else echo "ok   $desc"; fi
+  if [ "$rc" != "$want" ]; then echo "FAIL case '$desc': rc=$rc wanted $want"; echo "$out" | sed 's/^/    /'; fails=$((fails+1))
+  elif [ -n "${MSG:-}" ] && ! echo "$out" | grep -q -- "$MSG"; then echo "FAIL case '$desc': rc ok but the message lacks '$MSG'"; echo "$out" | sed 's/^/    /'; fails=$((fails+1))
+  else echo "ok   $desc"; fi
 }
 mk prod 384 256 ""
 run prod 0 "production boot, no graph floor, no expectation" -- "$d/prod/serve.log"
@@ -165,6 +167,63 @@ for v in 8k -5 9000; do
 done
 got=$(env -i PATH="$PATH" MUSE_OFFLOAD=0 MUSE_SPEC_MNST=4096 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
 if [ "$got" = "11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 4096" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=4096 overrides the cap, profile bytes are not coupled to MUSE_SPEC_MNST"; else echo "FAIL spec_k7.env MNST=4096: got '$got'"; fails=$((fails+1)); fi
+# S1-10R adoption (A2): the KV bytes and the offload state are ONE launch property, checked from serve_cmd.txt and the log in both directions
+ON=11645337600; OFFB=11720212480
+CONN='\{\"kv_connector\":\"SimpleCPUOffloadConnector\"\,\"kv_role\":\"kv_both\"\}'
+# mkoff <name> <bytes> <connector 1|0 in serve_cmd.txt> <bind 1|0 in serve_cmd.txt> <connector lines in the log 1|0> [bind lines in the log 1|0, default = bind]
+mkoff() {
+  mkdir -p "$d/$1"; cp "$d/prod/serve.log" "$d/$1/serve.log"
+  # the production state of the draft (r2e, the aux projection on the target's rows, FP8 flag 2): the bytes ceiling of the older checks is then the flag-2 maximum
+  { echo "INFO MuseSpark SM120: prefill batches of at least 512 tokens run as 2 microbatches (speculative)."
+    echo "INFO MuseSpark SM120: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2)."
+    for _ in 1 2 3 4 5 6 7 8; do echo "INFO DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized"; echo "INFO DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2)"; done; } >> "$d/$1/serve.log"
+  { echo "vllm serve m --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes $2$([ "$4" = 1 ] && echo ' --numa-bind')$([ "$3" = 1 ] && echo " --kv-transfer-config $CONN")"; } > "$d/$1/serve_cmd.txt"
+  if [ "$5" = 1 ]; then echo "(EngineCore pid=1) INFO [manager.py:196] SimpleCPUOffloadScheduler: Allocating 2529984 offload blocks (48.26 GB, mode=eager, backend=cpu)" >> "$d/$1/serve.log"; fi
+  if [ "${6:-$4}" = 1 ]; then for i in 0 1 2 3 4 5 6 7; do echo "(EngineCore pid=1) INFO [numa_utils.py:363] Binding worker subprocess (local_rank=$i, gpu_index=$i) to NUMA node 3" >> "$d/$1/serve.log"; done; fi
+}
+mkoff on_ok $ON 1 1 1
+run on_ok 0 "A2: offload ON bytes with the connector and --numa-bind (cmd and log), no expectation" -- "$d/on_ok/serve.log"
+run on_ok 0 "A2: the same, ON demanded (SPEC_EXPECT_OFFLOAD=1)" SPEC_EXPECT_OFFLOAD=1 -- "$d/on_ok/serve.log"
+run on_ok 0 "A2: the same, the sourcing shell exports MUSE_OFFLOAD=1" MUSE_OFFLOAD=1 -- "$d/on_ok/serve.log"
+run on_ok 1 "A2: the same, OFF demanded (SPEC_EXPECT_OFFLOAD=0)" SPEC_EXPECT_OFFLOAD=0 -- "$d/on_ok/serve.log"
+run on_ok 1 "A2: the same, the sourcing shell exports MUSE_OFFLOAD=0" MUSE_OFFLOAD=0 -- "$d/on_ok/serve.log"
+mkoff off_ok $OFFB 0 0 0
+run off_ok 0 "A2: no-tier bytes without connector and bind, no expectation" -- "$d/off_ok/serve.log"
+run off_ok 0 "A2: the same, OFF demanded" SPEC_EXPECT_OFFLOAD=0 -- "$d/off_ok/serve.log"
+run off_ok 0 "A2: the same, the sourcing shell exports MUSE_OFFLOAD=0" MUSE_OFFLOAD=0 -- "$d/off_ok/serve.log"
+run off_ok 1 "A2: the same, ON demanded (SPEC_EXPECT_OFFLOAD=1)" SPEC_EXPECT_OFFLOAD=1 -- "$d/off_ok/serve.log"
+run off_ok 1 "A2: the same, the sourcing shell exports MUSE_OFFLOAD=1" MUSE_OFFLOAD=1 -- "$d/off_ok/serve.log"
+mkoff on_noconn $ON 0 1 0 0
+MSG='no SimpleCPUOffloadConnector' run on_noconn 1 "A2: offload-on bytes WITHOUT the connector (the pre-adoption line with the new default bytes) FAILS, no expectation" -- "$d/on_noconn/serve.log"
+MSG='no SimpleCPUOffloadConnector' run on_noconn 1 "A2: the same with MUSE_OFFLOAD=1 exported" MUSE_OFFLOAD=1 -- "$d/on_noconn/serve.log"
+mkoff on_noconn2 $ON 0 0 0
+MSG='no SimpleCPUOffloadConnector' run on_noconn2 1 "A2: offload-on bytes without connector and without --numa-bind FAILS" -- "$d/on_noconn2/serve.log"
+mkoff conn_offb $OFFB 1 1 1
+MSG='offload-on bytes: the tier' run conn_offb 1 "A2: connector with the no-tier bytes (offload state ON, bytes OFF) FAILS, no expectation" -- "$d/conn_offb/serve.log"
+MSG='offload-on bytes: the tier' run conn_offb 1 "A2: the same with MUSE_OFFLOAD=1 exported" MUSE_OFFLOAD=1 -- "$d/conn_offb/serve.log"
+mkoff nobind $ON 1 0 1 0
+MSG='but no --numa-bind' run nobind 1 "A2: connector with the offload-on bytes but no --numa-bind FAILS" -- "$d/nobind/serve.log"
+run nobind 0 "A2: the same with the bind expected off (SPEC_EXPECT_BIND=0)" SPEC_EXPECT_BIND=0 -- "$d/nobind/serve.log"
+run nobind 0 "A2: the same with the bind expected off (MUSE_OFFLOAD_NUMA_BIND=0)" MUSE_OFFLOAD_NUMA_BIND=0 -- "$d/nobind/serve.log"
+mkoff cmdonly $ON 1 1 0
+MSG='disagree about the offload connector' run cmdonly 1 "A2: serve_cmd.txt carries the connector but the log has no SimpleCPUOffload line FAILS" -- "$d/cmdonly/serve.log"
+mkoff logonly $ON 0 0 1 0
+MSG='disagree about the offload connector' run logonly 1 "A2: the log has the connector but serve_cmd.txt has none FAILS" -- "$d/logonly/serve.log"
+mkoff want1 9000000000 0 0 0
+MSG='offload ON expected' run want1 1 "A2: ON demanded for an old arm (9.0 GB, no connector) FAILS" SPEC_EXPECT_OFFLOAD=1 -- "$d/want1/serve.log"
+run want1 0 "A2: an old arm (9.0 GB, no connector) passes without an expectation" -- "$d/want1/serve.log"
+mkoff want0 $ON 1 1 1
+sed -i "s/--kv-cache-memory-bytes $ON/--kv-cache-memory-bytes 11000000000/" "$d/want0/serve_cmd.txt"
+MSG='offload OFF expected' run want0 1 "A2: OFF demanded for a launch with the connector and bind FAILS" SPEC_EXPECT_OFFLOAD=0 -- "$d/want0/serve.log"
+run want0 2 "A2: SPEC_EXPECT_OFFLOAD=2 is a usage error" SPEC_EXPECT_OFFLOAD=2 -- "$d/want0/serve.log"
+# without serve_cmd.txt the bytes come from the non-default args line of the log
+mkoff nocmd_on $ON 1 1 1; rm "$d/nocmd_on/serve_cmd.txt"; sed -i "s/'kv_cache_memory_bytes': 11720212480/'kv_cache_memory_bytes': $ON/" "$d/nocmd_on/serve.log"
+run nocmd_on 0 "A2: no serve_cmd.txt, connector and binding lines in the log, offload-on bytes in the args line" -- "$d/nocmd_on/serve.log"
+mkoff nocmd_nc $ON 0 0 0; rm "$d/nocmd_nc/serve_cmd.txt"; sed -i "s/'kv_cache_memory_bytes': 11720212480/'kv_cache_memory_bytes': $ON/" "$d/nocmd_nc/serve.log"
+MSG='no SimpleCPUOffloadConnector' run nocmd_nc 1 "A2: no serve_cmd.txt, offload-on bytes in the args line, no connector in the log FAILS" -- "$d/nocmd_nc/serve.log"
+# the constants of the check equal the values of env/offload.env (spec profile)
+got=$(env -i PATH="$PATH" bash -c "source $here/env/offload.env; echo \$MUSE_OFFLOAD_KV_BYTES"); want=$(grep -o -E 'SPEC_OFFLOAD_ON_BYTES:-[0-9]+' "$check" | head -1 | grep -o -E '[0-9]+$')
+if [ "$got" = "$want" ] && [ "$got" = "$ON" ]; then echo "ok   A2: the offload-on bytes constant of the check equals MUSE_OFFLOAD_KV_BYTES of env/offload.env ($got)"; else echo "FAIL A2: check constant '$want' vs env/offload.env '$got' vs test $ON"; fails=$((fails+1)); fi
 # S1-10R Phase 0: the fused boundary state comes from an env.txt snapshot next to the log (the model logs nothing about it)
 fbenv() { mkdir -p "$d/$1"; cp "$d/prod/serve.log" "$d/prod/serve_cmd.txt" "$d/$1/"; printf '%s\n' "${@:2}" > "$d/$1/env.txt"; }
 fbenv fb0 'MUSE_SPEC_KV_BYTES=11720212480' 'VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2' 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0'

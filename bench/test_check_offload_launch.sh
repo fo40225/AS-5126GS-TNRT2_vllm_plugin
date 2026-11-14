@@ -100,5 +100,37 @@ run off 0 "offload off without MUSE_OFFLOAD_NUMA_BIND: the off launch expects no
 MSG='bind expected off' run good 1 "off launch whose log carries the binding lines" MUSE_OFFLOAD=0 -- "$d/good/serve.log"
 run off 0 "offload off (explicit expectation)" MUSE_OFFLOAD_EXPECT=off MUSE_OFFLOAD_EXPECT_BIND=0 -- "$d/off/serve.log"
 MSG='SimpleCPUOffloadScheduler allocation line' run off 1 "connector expected but the log has none" $X MUSE_OFFLOAD_EXPECT=simple MUSE_OFFLOAD_EXPECT_BIND=0 -- "$d/off/serve.log"
+# S1-10R adoption (A2): the offload-on bytes and the tier travel together, in both directions (real spec numbers: offload-on 11,645,337,600, no-tier 11,720,212,480)
+ONB=11645337600; OFFB=11720212480
+XS="MUSE_OFFLOAD_EXPECT_BYTES=51814072320 MUSE_OFFLOAD_EXPECT_BPB=20480 MUSE_OFFLOAD_EXPECT_KV_MAX=$ONB"
+NS=$(( 51814072320 / 20480 ))
+mk specon 1 $NS $NS
+sed -i "s/--kv-cache-memory-bytes 11500000000/--kv-cache-memory-bytes $ONB/; s/25769799680/51814072320/; s/206158397440/414512578560/" "$d/specon/serve_cmd.txt"
+run specon 0 "A2: ON, the offload-on bytes with the connector and --numa-bind" $XS -- "$d/specon/serve.log"
+mk specon_offb 1 $NS $NS
+sed -i "s/--kv-cache-memory-bytes 11500000000/--kv-cache-memory-bytes $OFFB/; s/25769799680/51814072320/; s/206158397440/414512578560/" "$d/specon_offb/serve_cmd.txt"
+MSG='above the offload-on maximum' run specon_offb 1 "A2: the connector with the no-tier bytes (ON state, OFF bytes) FAILS" $XS -- "$d/specon_offb/serve.log"
+mk specon_nb 1 $NS $NS
+sed -i "s/--kv-cache-memory-bytes 11500000000/--kv-cache-memory-bytes $ONB/; s/25769799680/51814072320/; s/206158397440/414512578560/; s/ --numa-bind / /" "$d/specon_nb/serve_cmd.txt"
+MSG='no --numa-bind' run specon_nb 1 "A2: the connector and the offload-on bytes but a missing --numa-bind in serve_cmd.txt FAILS" $XS -- "$d/specon_nb/serve.log"
+mkdir -p "$d/specoff"; echo "(Worker_TP0 pid=2) INFO nothing about offload" > "$d/specoff/serve.log"
+echo "vllm serve m --max-cudagraph-capture-size 256 --kv-cache-memory-bytes $OFFB" > "$d/specoff/serve_cmd.txt"
+run specoff 0 "A2: OFF, the no-tier bytes without connector and bind" MUSE_OFFLOAD=0 -- "$d/specoff/serve.log"
+mkdir -p "$d/specoff_on"; echo "(Worker_TP0 pid=2) INFO nothing about offload" > "$d/specoff_on/serve.log"
+echo "vllm serve m --max-cudagraph-capture-size 256 --kv-cache-memory-bytes $ONB" > "$d/specoff_on/serve_cmd.txt"
+MSG='offload-on bytes' run specoff_on 1 "A2: OFF expected but the offload-on bytes without the connector (shell exports MUSE_OFFLOAD=0 only) FAILS" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
+MSG='offload-on bytes' run specoff_on 1 "A2: the same through MUSE_OFFLOAD_KV_BYTES of an ns256 shell: the ns256 ON bytes are also refused" MUSE_OFFLOAD=0 MUSE_OFFLOAD_KV_BYTES=16854810624 -- "$d/specoff_on/serve.log"
+echo "vllm serve m --kv-cache-memory-bytes 16854810624" > "$d/specoff_on/serve_cmd.txt"
+MSG='offload-on bytes' run specoff_on 1 "A2: the ns256 ON bytes without the connector FAIL" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
+echo "vllm serve m --kv-cache-memory-bytes 16957243392" > "$d/specoff_on/serve_cmd.txt"
+run specoff_on 0 "A2: the ns256 OFF bytes without the connector pass" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
+echo 'vllm serve m --kv-cache-memory-bytes 11720212480 --kv-transfer-config \{\"kv_connector\":\"SimpleCPUOffloadConnector\"\}' > "$d/specoff_on/serve_cmd.txt"
+MSG='serve_cmd.txt has a SimpleCPUOffloadConnector' run specoff_on 1 "A2: OFF expected but serve_cmd.txt carries the connector FAILS" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
+echo 'vllm serve m --kv-cache-memory-bytes 11720212480 --numa-bind' > "$d/specoff_on/serve_cmd.txt"
+MSG='serve_cmd.txt has --numa-bind' run specoff_on 1 "A2: OFF expected but serve_cmd.txt carries --numa-bind FAILS" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
+# the offload-on bytes hard-coded as the fallback list equal the three profiles of env/offload.env
+got=$(for pr in spec ns256 ns128; do env -i PATH="$PATH" bash -c "MUSE_OFFLOAD_PROFILE=$pr source $here/env/offload.env; echo \$MUSE_OFFLOAD_KV_BYTES"; done | tr '\n' ' ')
+want=$(grep -o -E '11645337600 16854810624 17257267200' "$check" | head -1)
+if [ "$got" = "$want " ]; then echo "ok   A2: the fallback list of offload-on bytes equals spec / ns256 / ns128 of env/offload.env"; else echo "FAIL A2: list '$want' vs env/offload.env '$got'"; fails=$((fails+1)); fi
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))

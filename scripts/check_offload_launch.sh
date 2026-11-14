@@ -24,6 +24,9 @@
 # block-id (spec 20,480 / ns 65,536: the blocks = floor(bytes / bpb) comparison below gives 2,529,984 / 790,620) and the offload-on KV maximum (MUSE_OFFLOAD_KV_BYTES: spec 11,645,337,600,
 # ns256 16,854,810,624, ns128 17,257,267,200; a boot with the no-tier bytes 11,720,212,480 fails the maximum check by design). The log-line formats ("Binding worker subprocess",
 # "SimpleCPUOffloadScheduler: Allocating", "SimpleCPUOffloadWorker [CPU]", "Using LBNHC KV cache layout") were confirmed on vLLM 0.33.0 (this check passed on every ON boot of phase 3).
+# S1-10R adoption (offload is part of the speculative profile): the bytes and the tier travel together in both directions. With the tier expected, --kv-cache-memory-bytes above the offload-on maximum (the no-tier
+# bytes with a connector) and a missing --numa-bind FAIL; with the tier expected OFF, a serve_cmd.txt that carries the connector, --numa-bind, or the offload-on bytes of any profile FAILS (a line that left
+# $MUSE_OFFLOAD_SERVE_ARGS out). scripts/check_spec_launch.sh makes the same pairing check from serve_cmd.txt and the log without this shell's variables.
 # Exit 0 = in effect; 1 = a line with other values, no line, a mismatch or an unknown expectation; 2 = usage or unreadable log.
 if [ $# -ne 1 ]; then echo "usage: check_offload_launch.sh <serve.log>" >&2; exit 2; fi
 log=$1
@@ -62,6 +65,18 @@ if [ "$want" = simple ]; then
 fi
 if [ "$want" = off ]; then
   grep -a -q "SimpleCPUOffload" "$log" && fail "offload expected off but the log has SimpleCPUOffload lines"
+  # S1-10R adoption: the offload-on bytes are an offload property. A launch without the tier must not carry them (a line that left $MUSE_OFFLOAD_SERVE_ARGS out after the default switched to ON),
+  # nor the connector or --numa-bind in serve_cmd.txt. The offload-on bytes: this shell's (MUSE_OFFLOAD_EXPECT_KV_MAX / MUSE_OFFLOAD_KV_BYTES) and those of the three profiles of env/offload.env.
+  if [ -r "$cmd" ]; then
+    grep -q "SimpleCPUOffloadConnector" "$cmd" && fail "offload expected off but serve_cmd.txt has a SimpleCPUOffloadConnector"
+    if [ "$bind" = 0 ] && grep -q -E -e '(^|[[:space:]])--numa-bind([[:space:]]|$)' "$cmd"; then fail "offload expected off but serve_cmd.txt has --numa-bind"; fi
+    kvb=$(grep -o -E -e "--kv-cache-memory-bytes[ =][0-9]+" "$cmd" | head -1 | grep -o -E "[0-9]+$")
+    if [ -n "$kvb" ]; then
+      for onb in ${MUSE_OFFLOAD_EXPECT_KV_MAX:-} ${MUSE_OFFLOAD_KV_BYTES:-} 11645337600 16854810624 17257267200; do
+        [ "$kvb" = "$onb" ] && fail "offload expected off but --kv-cache-memory-bytes $kvb are the offload-on bytes of a profile (the bytes and the tier travel together: put \$MUSE_OFFLOAD_SERVE_ARGS on the line, or use the no-tier bytes)"
+      done
+    fi
+  fi
   echo "OK offload=off bind=$bind"; exit 0
 fi
 sched=$(grep -a -o -E "SimpleCPUOffloadScheduler: Allocating [0-9]+ offload blocks" "$log" | grep -o -E "[0-9]+" | sort -u)

@@ -229,6 +229,45 @@ if [ -r "$cmd" ]; then
     fi
   fi
 fi
+# S1-10R adoption (offload is part of the speculative launch profile): the exact KV bytes and the offload state are ONE launch property (env/offload.env). The state is read from serve_cmd.txt
+# (the connector, --numa-bind, --kv-cache-memory-bytes) and from the boot log (SimpleCPUOffload lines, "Binding worker subprocess" lines, the "kv_cache_memory_bytes" of the non-default args line when there is no
+# serve_cmd.txt), never from this shell's variables alone. FAIL: the offload-on bytes (SPEC_OFFLOAD_ON_BYTES, default 11,645,337,600) without the connector; the connector with more bytes than the offload-on
+# bytes (the no-tier bytes 11,720,212,480 leave the S_live of the stress below its floor); the connector without --numa-bind (unless the bind is expected off: SPEC_EXPECT_BIND=0 or MUSE_OFFLOAD_NUMA_BIND=0 /
+# MUSE_OFFLOAD_EXPECT_BIND=0); serve_cmd.txt and the log disagreeing about the connector. SPEC_EXPECT_OFFLOAD=0|1 (default: this shell's MUSE_OFFLOAD if set) demands the state, so MUSE_OFFLOAD=1 FAILS a
+# boot without the tier and MUSE_OFFLOAD=0 FAILS a boot with the connector or --numa-bind. Without an expectation a launch with fewer bytes than the offload-on bytes and no connector (the older A/B arms) still passes.
+ON_BYTES=${SPEC_OFFLOAD_ON_BYTES:-11645337600}
+want_off=${SPEC_EXPECT_OFFLOAD:-${MUSE_OFFLOAD:-}}
+case "$want_off" in ""|0|1) ;; *) echo "check_spec_launch: SPEC_EXPECT_OFFLOAD / MUSE_OFFLOAD must be 0 or 1, got '$want_off'" >&2; exit 2 ;; esac
+want_bind=${SPEC_EXPECT_BIND:-${MUSE_OFFLOAD_EXPECT_BIND:-${MUSE_OFFLOAD_NUMA_BIND:-1}}}
+pair_bytes=""; conn_cmd=0; bind_cmd=0
+if [ -r "$cmd" ]; then
+  pair_bytes=$(grep -a -o -E -e '--kv-cache-memory-bytes[ =][0-9]+' "$cmd" | head -1 | grep -o -E '[0-9]+$')
+  grep -q "SimpleCPUOffloadConnector" "$cmd" && conn_cmd=1
+  grep -q -E -e '(^|[[:space:]])--numa-bind([[:space:]]|$)' "$cmd" && bind_cmd=1
+fi
+[ -n "$pair_bytes" ] || pair_bytes=$(grep -a -o -E "'kv_cache_memory_bytes': [0-9]+" "$log" | tail -1 | grep -o -E '[0-9]+$')
+conn_log=0; grep -a -q "SimpleCPUOffload" "$log" && conn_log=1
+bind_log=$(grep -a -c "Binding worker subprocess" "$log")
+has_conn=$(( conn_cmd || conn_log ))
+if [ -r "$cmd" ]; then has_bind=$bind_cmd; else has_bind=$(( bind_log > 0 )); fi
+if [ -r "$cmd" ] && [ "$conn_cmd" != "$conn_log" ]; then
+  echo "FAIL serve_cmd.txt and the log disagree about the offload connector (serve_cmd.txt: $conn_cmd, SimpleCPUOffload lines in the log: $conn_log)"; rc=1
+fi
+if [ "$has_conn" = 0 ] && [ -n "$pair_bytes" ] && [ "$pair_bytes" = "$ON_BYTES" ]; then
+  echo "FAIL --kv-cache-memory-bytes $pair_bytes are the offload-on bytes but the launch has no SimpleCPUOffloadConnector (the bytes and the offload state travel together: source env/spec_k7.env and put \$MUSE_OFFLOAD_SERVE_ARGS on the line, or export MUSE_OFFLOAD=0)"; rc=1
+fi
+if [ "$has_conn" = 1 ] && [ -n "$pair_bytes" ] && [ "$pair_bytes" -gt "$ON_BYTES" ]; then
+  echo "FAIL the launch has the offload connector with --kv-cache-memory-bytes $pair_bytes > $ON_BYTES (the offload-on bytes: the tier's page tables take GPU memory, the no-tier bytes leave S_live below the floor)"; rc=1
+fi
+if [ "$has_conn" = 1 ] && [ "$want_bind" = 1 ] && [ "$has_bind" = 0 ]; then
+  echo "FAIL the launch has the offload connector but no --numa-bind (the tier would not be node-local)"; rc=1
+fi
+if [ "$want_off" = 1 ] && [ "$has_conn" = 0 ]; then
+  echo "FAIL offload ON expected (SPEC_EXPECT_OFFLOAD / MUSE_OFFLOAD=1) but the launch has no SimpleCPUOffloadConnector"; rc=1
+fi
+if [ "$want_off" = 0 ] && { [ "$has_conn" = 1 ] || [ "$has_bind" = 1 ]; }; then
+  echo "FAIL offload OFF expected (SPEC_EXPECT_OFFLOAD / MUSE_OFFLOAD=0) but the launch has the connector or --numa-bind"; rc=1
+fi
 # prefill chunk (S1-9 L5, B3)
 mnbt=${SPEC_EXPECT_MNBT:-8199}
 seen_mnbt=$(grep -a -o -E 'Chunked prefill is enabled with max_num_batched_tokens=[0-9]+' "$log" | sed -E 's/.*=//' | sort | uniq -c)
