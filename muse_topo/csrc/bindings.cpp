@@ -151,6 +151,12 @@ struct Comm {
       for (int i = 0; i < 16; ++i) v[i] = ((volatile unsigned long long*)host_trace)[i];
     return v;
   }
+  // placement of the operand loads of the fused collectives (BndParams::ld_mode in topo_types.h)
+  int ld_mode = 1;
+  void set_ld_mode(int m) {
+    TORCH_CHECK(m >= 0 && m <= 3, "bad ld_mode ", m);
+    ld_mode = m;
+  }
   void set_pdl(bool on) { c.pdl = on ? 1 : 0; }
   // Test hooks (bench/test_epoch.py), not used by TopoComm: read / force the 64-bit per-GPU call counter. Only valid while no
   // collective is in flight, with the same value on all ranks, and only moving FORWARD: the flag words and LL8 slots keep
@@ -336,6 +342,133 @@ struct Comm {
     CK(cudaGetLastError());
   }
 
+  // all-reduce of bf16 [T, 8192] fused with the Muse Spark residual boundary (boundary.cuh); T <= 64, one CTA per row
+  void all_reduce_boundary(const at::Tensor& x, const at::Tensor& stream, at::Tensor new_stream, at::Tensor out,
+                           c10::optional<at::Tensor> out_fp32, const at::Tensor& alpha, const at::Tensor& beta,
+                           c10::optional<at::Tensor> post_w, const at::Tensor& pre_w, double post_eps, double pre_eps,
+                           double post_gain, double pre_gain) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(1) == 8192,
+                "ar boundary: x must be a contiguous bf16 [T, 8192] CUDA tensor");
+    const int rows = static_cast<int>(x.size(0));
+    TORCH_CHECK(rows >= 1 && rows <= 64, "ar boundary: 1 <= T <= 64 rows, got ", rows);
+    TORCH_CHECK(static_cast<int64_t>(rows) * 256 * 16 <= c.L.a2_slot && static_cast<int64_t>(rows) * 256 * 32 <= c.L.b2_par,
+                "ar boundary: workspace too small");
+    c10::cuda::CUDAGuard g(x.device());
+    auto chk32 = [&](const at::Tensor& t, int64_t n, const char* what) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kFloat && t.numel() == n, "ar boundary: bad ", what);
+      TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, "ar boundary: ", what, " not 16-byte aligned");
+    };
+    auto chk16 = [&](const at::Tensor& t, int64_t n, const char* what) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kBFloat16 && t.numel() == n, "ar boundary: bad ", what);
+      TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, "ar boundary: ", what, " not 16-byte aligned");
+    };
+    chk32(stream, x.numel(), "stream");
+    chk32(new_stream, x.numel(), "new_stream");
+    chk16(out, x.numel(), "out");
+    chk32(alpha, 8192, "alpha");
+    chk32(beta, 8192, "beta");
+    chk16(pre_w, 8192, "pre_w");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "ar boundary: x not 16-byte aligned");
+    BndParams a{};
+    a.stream = stream.data_ptr<float>();
+    a.new_stream = new_stream.data_ptr<float>();
+    a.out = out.data_ptr();
+    if (out_fp32.has_value()) {
+      chk32(*out_fp32, x.numel(), "out_fp32");
+      a.out_fp32 = out_fp32->data_ptr<float>();
+    }
+    a.alpha = alpha.data_ptr<float>();
+    a.beta = beta.data_ptr<float>();
+    if (post_w.has_value()) {
+      chk16(*post_w, 8192, "post_w");
+      a.post_w = post_w->data_ptr();
+    }
+    a.pre_w = pre_w.data_ptr();
+    a.post_eps = static_cast<float>(post_eps);
+    a.pre_eps = static_cast<float>(pre_eps);
+    a.post_gain = static_cast<float>(post_gain);
+    a.pre_gain = static_cast<float>(pre_gain);
+    a.ld_mode = ld_mode;
+    launch_ar2_bnd(c, x.data_ptr(), a, rows, at::cuda::getCurrentCUDAStream());
+    CK(cudaGetLastError());
+  }
+
+  // all-gather (column concatenation) of the bf16 unpooler shards [T, 1024] fused with the Muse Spark residual boundary
+  // (boundary.cuh, epi 0); T <= 32 (LL8 slots)
+  void all_gather_boundary(const at::Tensor& shard, const at::Tensor& stream, at::Tensor new_stream, at::Tensor out,
+                           c10::optional<at::Tensor> out_fp32, const at::Tensor& alpha, const at::Tensor& beta,
+                           c10::optional<at::Tensor> post_w, const at::Tensor& pre_w, double post_eps, double pre_eps,
+                           double post_gain, double pre_gain) {
+    TORCH_CHECK(shard.is_cuda() && shard.is_contiguous() && shard.scalar_type() == at::kBFloat16 && shard.dim() == 2 &&
+                    shard.size(1) == 1024,
+                "ag boundary: shard must be a contiguous bf16 [T, 1024] CUDA tensor");
+    const int rows = static_cast<int>(shard.size(0));
+    TORCH_CHECK(rows >= 1 && rows <= 32 && 2 * shard.numel() * 2 <= c.L.g_slot, "ag boundary: 1 <= T <= 32 rows, got ", rows);
+    c10::cuda::CUDAGuard g(shard.device());
+    const int64_t n = static_cast<int64_t>(rows) * 8192;
+    auto chk32 = [&](const at::Tensor& t, int64_t k, const char* what) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kFloat && t.numel() == k, "ag boundary: bad ", what);
+      TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, "ag boundary: ", what, " not 16-byte aligned");
+    };
+    auto chk16 = [&](const at::Tensor& t, int64_t k, const char* what) {
+      TORCH_CHECK(t.is_cuda() && t.is_contiguous() && t.scalar_type() == at::kBFloat16 && t.numel() == k, "ag boundary: bad ", what);
+      TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, "ag boundary: ", what, " not 16-byte aligned");
+    };
+    chk32(stream, n, "stream");
+    chk32(new_stream, n, "new_stream");
+    chk16(out, n, "out");
+    chk32(alpha, 8192, "alpha");
+    chk32(beta, 8192, "beta");
+    chk16(pre_w, 8192, "pre_w");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(shard.data_ptr()) % 4 == 0, "ag boundary: shard not 4-byte aligned");
+    BndParams a{};
+    a.stream = stream.data_ptr<float>();
+    a.new_stream = new_stream.data_ptr<float>();
+    a.out = out.data_ptr();
+    if (out_fp32.has_value()) {
+      chk32(*out_fp32, n, "out_fp32");
+      a.out_fp32 = out_fp32->data_ptr<float>();
+    }
+    a.alpha = alpha.data_ptr<float>();
+    a.beta = beta.data_ptr<float>();
+    if (post_w.has_value()) {
+      chk16(*post_w, 8192, "post_w");
+      a.post_w = post_w->data_ptr();
+    }
+    a.pre_w = pre_w.data_ptr();
+    a.post_eps = static_cast<float>(post_eps);
+    a.pre_eps = static_cast<float>(pre_eps);
+    a.post_gain = static_cast<float>(post_gain);
+    a.pre_gain = static_cast<float>(pre_gain);
+    a.ld_mode = ld_mode;
+    launch_ag_bnd(c, shard.data_ptr(), a, rows, at::cuda::getCurrentCUDAStream());
+    CK(cudaGetLastError());
+  }
+
+  // all-gather (column concatenation) of the bf16 pooler shards [T, 512] fused with the pre_expert_norm RMSNorm (epi 1);
+  // T <= 64; returns into `out` [T, 4096]
+  void all_gather_rmsnorm(const at::Tensor& shard, at::Tensor out, const at::Tensor& w, double eps, double gain) {
+    TORCH_CHECK(shard.is_cuda() && shard.is_contiguous() && shard.scalar_type() == at::kBFloat16 && shard.dim() == 2 &&
+                    shard.size(1) == 512,
+                "ag rmsnorm: shard must be a contiguous bf16 [T, 512] CUDA tensor");
+    const int rows = static_cast<int>(shard.size(0));
+    TORCH_CHECK(rows >= 1 && rows <= 64 && 2 * shard.numel() * 2 <= c.L.g_slot, "ag rmsnorm: 1 <= T <= 64 rows, got ", rows);
+    c10::cuda::CUDAGuard g(shard.device());
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kBFloat16 && out.numel() == shard.numel() * 8,
+                "ag rmsnorm: bad out");
+    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kBFloat16 && w.numel() == 4096, "ag rmsnorm: bad w");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(shard.data_ptr()) % 4 == 0,
+                "ag rmsnorm: misaligned operand");
+    RmsParams a{};
+    a.out = out.data_ptr();
+    a.w = w.data_ptr();
+    a.eps = static_cast<float>(eps);
+    a.gain = static_cast<float>(gain);
+    launch_ag_rms(c, shard.data_ptr(), a, rows, at::cuda::getCurrentCUDAStream());
+    CK(cudaGetLastError());
+  }
+
   // x: [T, w] shard (any dtype, bit exact); out: [8T, w] (layout 1) or [T, 8w] (layout 0)
   void all_gather(const at::Tensor& x, at::Tensor out, int layout, int algo, int grid, int block, int unroll) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous() && out.is_contiguous(), "bad tensors");
@@ -371,6 +504,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(py::init<int, int, int, int, int, std::vector<std::vector<int>>, std::vector<int>, std::vector<int>,
                     std::vector<int64_t>, int64_t, int64_t, int64_t, int64_t, double, int>())
       .def("all_reduce", &Comm::all_reduce)
+      .def("all_reduce_boundary", &Comm::all_reduce_boundary)
+      .def("all_gather_boundary", &Comm::all_gather_boundary)
+      .def("all_gather_rmsnorm", &Comm::all_gather_rmsnorm)
       .def("all_gather", &Comm::all_gather)
       .def("reduce_scatter", &Comm::reduce_scatter)
       .def("all_reduce_large", &Comm::all_reduce_large)
@@ -378,6 +514,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("error", &Comm::error)
       .def("set_timeout", &Comm::set_timeout)
       .def("set_pdl", &Comm::set_pdl)
+      .def("set_ld_mode", &Comm::set_ld_mode)
       .def("get_epoch", &Comm::get_epoch)
       .def("set_epoch", &Comm::set_epoch)
       .def("trace_enable", &Comm::trace_enable)

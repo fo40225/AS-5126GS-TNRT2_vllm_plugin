@@ -32,6 +32,31 @@ struct WsLayout {
   int64_t total;
 };
 
+// Residual boundary fused into a collective (boundary.cuh): the tensors of the D = 8192 Muse Spark boundary
+// (post-norm + gated residual + next pre-norm). Rows are 8192 wide, T rows; bf16 tensors are plain pointers.
+struct BndParams {
+  const float* stream;  // [T, 8192] fp32 residual stream (input)
+  float* new_stream;    // [T, 8192] fp32 (output)
+  void* out;            // [T, 8192] bf16 pre-norm result (output)
+  float* out_fp32;      // [T, 8192] fp32 widened copy of out, or nullptr
+  const float* alpha;   // [8192] gate coefficients
+  const float* beta;    // [8192]
+  const void* post_w;   // [8192] bf16 post-norm weight (weight-first norm), or nullptr
+  const void* pre_w;    // [8192] bf16 pre-norm weight
+  float post_eps, pre_eps, post_gain, pre_gain;
+  // Where the operands that do not depend on the collective (stream, alpha, beta, weights) are loaded, see ar_bnd.cu:
+  // 0: into registers behind the first push stage; 1: L2 prefetch at the start, registers after the collective;
+  // 2: registers after the collective; 3: L2 prefetch at the start, registers behind the first push stage.
+  int ld_mode;
+};
+
+// All-gather fused with the pre_expert_norm RMSNorm (D = 4096, weight applied after the normalization, bf16 in and out).
+struct RmsParams {
+  void* out;          // [T, 4096] bf16 (output)
+  const void* w;      // [4096] bf16
+  float eps, gain;
+};
+
 struct Ctx {
   int rank, island, ipos, opos, partner;
   int pdl;  // 1: launch with programmatic stream serialization (kernels then start with griddepcontrol.wait)
@@ -91,6 +116,12 @@ void launch_ar2(const Ctx& c, int dtype, const void* in, void* out, int64_t nbyt
                 int unroll, cudaStream_t s);
 void launch_ag_ll(const Ctx& c, const void* in, void* out, int64_t shard_bytes, int64_t row_bytes, int layout,
                   int grid, int block, int unroll, cudaStream_t s);
+// All-reduce of bf16 [T, 8192] fused with the residual boundary of boundary.cuh (T <= 64, one CTA per row).
+void launch_ar2_bnd(const Ctx& c, const void* in, const BndParams& a, int rows, cudaStream_t s);
+// All-gather (column concatenation, LL8 protocol) of bf16 shards [T, 1024] (epi = 0, residual boundary, T <= 32) or
+// [T, 512] (epi = 1, RMSNorm, T <= 64) fused with the epilogue of boundary.cuh; `branch_shard` rows are the rank's columns.
+void launch_ag_bnd(const Ctx& c, const void* shard, const BndParams& a, int rows, cudaStream_t s);
+void launch_ag_rms(const Ctx& c, const void* shard, const RmsParams& a, int rows, cudaStream_t s);
 void launch_ar2_flag(const Ctx& c, int dtype, const void* in, void* out, int64_t nbytes, int grid, int block,
                      cudaStream_t s);
 void launch_ag_flag(const Ctx& c, const void* in, void* out, int64_t shard_bytes, int64_t row_bytes, int layout,
