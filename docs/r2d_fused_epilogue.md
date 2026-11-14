@@ -84,6 +84,7 @@ crossover; larger batches keep the two-step path (they are bandwidth bound, and 
 | `bench/test_ar_boundary.py` (8 ranks, fused collective vs `TopoComm` collective + Triton kernel) | 416 checks per rank, 0 failures: T = 1 .. 64, both boundary variants, fp32 copy, eager and CUDA graph next to other collectives, random mixes of collectives, operands misaligned on odd ranks only; also with `MUSE_TOPO_PDL=1` and every `MUSE_TOPO_BND_LOADS` placement |
 | regression of the existing suites | `tests_h1a --quick` 119 checks, `test_plugin --quick` 159 checks, `test_plugin_unit` PASSED |
 | 6-layer dummy e2e (`nccl/e2e_bitwise.py`, fused on vs off, plugin on in both) | 20/20 requests, every logprob and prompt logprob bitwise equal |
+| real weights, 62 layers, **base trees** (vLLM `aef9851844` + host `37b2d96`, no `boundary` op, none of the new code) vs the committed trees (fused on, 2026-10-26, same 270-request script) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal (chosen-token and prompt |dlogprob| max 0, mean NLL delta 0); 118 fused-op log lines in the run with the fusion, none in the base run. This is the check that the whole change (model refactor included) leaves the outputs of the current default untouched |
 | real weights, 62 layers (`e2e_ab.py` of the final-measure track + decode batches T = 1, 2, 3, 4, 5, 9, 12, 16, 17, 33, 48, 64) | 270/270 requests: token ids, top-5 logprobs and prompt logprobs bitwise equal fused on vs off; a second fused process equals the first; in-process repeats equal; the log shows `all_reduce_boundary` / `all_gather_boundary` (T = 1, 2, 4, 8) and `all_gather_rmsnorm` (T <= 16) inside the 62-layer CUDA graphs |
 
 NaN payloads: a NaN stays a NaN everywhere; the all-reduce replaces words equal to `0xFFFFFFFF` (as before), so a NaN payload may differ
@@ -135,7 +136,7 @@ Mean TPOT in ms; every row is a separate server start; "on" = default (`VLLM_MUS
 |-----------------------|----------|---------|-----------|----------|----------|
 | 1 | 10.49 10.44 10.45 10.43 | 10.45 | 10.57 10.59 10.60 | 10.59 | -0.14 (-1.3 %) |
 | 2 | 13.33 13.33 13.33 13.33 | 13.33 | 13.48 13.48 13.47 | 13.48 | -0.15 (-1.1 %) |
-| 4 | 17.04 16.88 16.96 16.92 | 16.95 | 16.91 16.60 16.55 | 16.69 | +0.26 (not understood; the spread between runs of one configuration is 0.1 .. 0.5 ms at this size) |
+| 4 | 17.04 16.88 16.96 16.92 | 16.95 | 16.91 16.60 16.55 | 16.69 | +0.26 (scheduler mode of the benchmark, not the kernels: see the note under the final rows) |
 | 8 | 21.25 20.96 21.08 21.27 | 21.14 | 21.42 21.53 21.44 | 21.46 | -0.32 (-1.5 %) |
 | 16 | 32.08 31.25 | 31.7 | 31.75 | 31.75 | within noise (the all-reduce / unpooler kernels do not run at 16 rows, the pooler norm does) |
 | 32 | 44.94 45.20 | 45.07 | 45.02 | 45.02 | 0 (no fused kernel runs) |
@@ -143,6 +144,29 @@ Mean TPOT in ms; every row is a separate server start; "on" = default (`VLLM_MUS
 Reference row `fin_r_topo` c1: 10.56 ms. So at the headline concurrency the gain is about 0.14 ms (1.3 %), well below the 0.4 .. 0.5 ms
 that the cold microbenchmark suggests (3 fused ops per layer, 1.6 .. 2.2 us each at T = 1): in the real graph the Triton boundary kernel
 is a programmatic dependent that already hides its launch and its parameter loads behind the tail of the collective.
+
+### Final rows (standard protocol: `locked_run_topo.sh`, real weights, seed 9000, mean TPOT in ms)
+
+Same serve arguments as `fin_r_topo` (EP8, fp8 KV, ctx 131072, max-num-seqs 128), c1 = random 512/128 x 16, ctx10 / 50 / 90 = 13 107 / 65 536 /
+117 964 input tokens x 3, 256 output tokens, `MUSE_TOPO_ENABLE=1`. "on" = committed trees, defaults; "off" = same trees with
+`VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0`; "base" = vLLM `aef9851844` + host `37b2d96` (the trees of `fin_r_topo`), run in the same session as on / off.
+Order of the server starts: on, off (round 1), off, on (round 2), base, on (round 3).
+
+| row | on (3 runs) | on mean | off / base (3 runs: off, off, base) | off / base mean | on - off | `fin_r_topo` (2026-10-24) |
+|-----|-------------|---------|--------------------------------------|-----------------|----------|---------------------------|
+| c1 512/128 | 10.593 10.571 10.585 | 10.583 (94.5 t/s) | 10.715 10.687 10.696 | 10.699 (93.5 t/s) | -0.116 (-1.1 %) | 10.557 |
+| ctx10 | 10.445 10.388 10.377 | 10.403 (96.1 t/s) | 10.553 10.533 10.524 | 10.537 (94.9 t/s) | -0.133 (-1.3 %) | 10.495 |
+| ctx50 | 10.417 10.422 10.430 | 10.423 (95.9 t/s) | 10.571 10.577 10.573 | 10.574 (94.6 t/s) | -0.151 (-1.4 %) | 10.537 |
+| ctx90 | 10.550 10.595 10.557 | 10.567 (94.6 t/s) | 10.683 10.695 10.687 | 10.688 (93.6 t/s) | -0.121 (-1.1 %) | 10.594 |
+
+The fusion saves 0.12 .. 0.15 ms per decode step (1.1 .. 1.4 %) at every context length, consistently in all three pairs. Prefill is untouched
+(prompt throughput 3991 .. 4061 / 6127 .. 6167 / 5935 .. 5942 / 5652 .. 5659 t/s for c1 / ctx10 / ctx50 / ctx90 in all eight runs; prefill batches are far above 8 rows and take the old path). The flag-off path costs nothing: "off" and "base"
+agree to 0.01 ms. The sessions differ among each other: the session of 2026-10-26 is ~0.1 ms slower than the one of `fin_r_topo` for the same trees
+(c1 base 10.696 vs 10.557), so compare on / off / base inside this table, not against the `fin_r_topo` column.
+
+c4 in the concurrency table: the 512/128 sweep at c4 shows two modes of the scheduler, independent of the flag (mean TTFT 317 ms with TPOT 16.9 .. 17.0,
+or 337 ms with TPOT 16.4 .. 16.6; 317-mode: fused on 17.04 / 16.88 / 16.96 / 16.92, off 16.91; 337-mode: off 16.60 / 16.55, fused with the bulk-copy variant
+16.41). All default-on runs of the table landed in the 317 mode, so the +0.26 ms in the c4 row is the batch composition of the benchmark, not the kernels.
 
 In-situ profile of a decode step at c1 (torch profiler, rank 0 windows, same tree, fused off / on): step wall 10.79 -> 10.63 ms, per layer
 (layers 2..59) 162.2 -> 159.3 us. `_norm_residual_norm_fwd_kernel` (124 launches) and `_rmsnorm_fwd_kernel` (62) disappear (0.69 ms of
