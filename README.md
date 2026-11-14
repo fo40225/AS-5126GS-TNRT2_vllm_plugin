@@ -49,7 +49,8 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── ops.py                   extension 的 JIT build（digest 目錄、flock 保護）與 IPC workspace
 │   ├── vllm_plugin.py           register()：patch CudaCommunicator 的 all_reduce / all_gather / reduce_scatter
 │   └── csrc/                    CUDA / C++ 原始碼（ar_sll.cu、flag.cu、ag.cu、large.cu、bindings.cpp ...；
-│                                boundary.cuh、ar_bnd.cu、ag_bnd.cu：collective + residual boundary / RMSNorm epilogue 的 fused kernel）
+│                                boundary.cuh、ar_bnd.cu、ag_bnd.cu：collective + residual boundary / RMSNorm epilogue 的 fused kernel；
+│                                gemv.cuh、gemv_push.cu：pooler / unpooler 的 GEMV 與其後的 all-gather 融合（r3b））
 ├── muse_topo-0.1.dist-info/     entry_points.txt：[vllm.general_plugins] muse_topo = muse_topo.vllm_plugin:register
 │                                （放在 PYTHONPATH 上就會被 vLLM 找到，不需要 pip install）
 ├── env/host.env                 主機環境變數：NCCL_P2P_LEVEL=SYS、MUSE_TOPO_ENABLE=1、bf16 exchange 與 NCCL graph file（2026-10-24 起預設 ON），其他選項以註解列出
@@ -81,6 +82,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── h1b_latency.md           large-message latency 表
 │   ├── h2_vllm_plugin.md        plugin 的 patch 範圍、環境變數、驗證紀錄、benchmark、review fixes、限制
 │   ├── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
+│   ├── r3b_gemv_push.md         decode 的 pooler / unpooler GEMV 與 all-gather 融合（r3b）：算術與精度、protocol、環境變數、S1-4a 量測
 │   └── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
@@ -94,9 +96,9 @@ AS-5126GS-TNRT2_vllm_plugin/
 
 | 類別 | 檔案 |
 |------|------|
-| correctness（8 processes、GPU lock 下執行） | `tests_h1a.py`、`tests_h1b.py`、`test_epoch.py`、`test_timeout.py`、`test_timeout_large.py`、`test_init_failure.py`、`check_ctx.py`、`smoke.py`、`test_plugin.py`（8 ranks、經 vLLM wrapper）、`test_medium_bx.py`（medium all-reduce 的 bf16 exchange）；CPU-only：`test_plugin_unit.py`、`test_topology.py` |
+| correctness（8 processes、GPU lock 下執行） | `tests_h1a.py`、`tests_h1b.py`、`test_epoch.py`、`test_timeout.py`、`test_timeout_large.py`、`test_init_failure.py`、`check_ctx.py`、`smoke.py`、`test_plugin.py`（8 ranks、經 vLLM wrapper）、`test_medium_bx.py`（medium all-reduce 的 bf16 exchange）、`test_gemv_push.py`（GEMV + all-gather 融合，8 ranks）；CPU-only：`test_plugin_unit.py`、`test_topology.py` |
 | 第二套獨立的 H1a 測試 | `test_h1a.py` + `hlib.py` + `test_topology.py` |
-| benchmark / 表格 | `bench_h1a.py`、`bench_h1b.py`、`bench_medium.py`（medium all-reduce sweep）、`make_table*.py`（含 `make_table_medium.py`）、`summarize_h1a.py`、`summarize_h1b.py`、`summarize_ops.py`、`trace_h1a.py`、`trace_h1b.py`、`build_ext.py` |
+| benchmark / 表格 | `bench_h1a.py`、`bench_h1b.py`、`bench_medium.py`（medium all-reduce sweep）、`bench_gemv_push.py`（GEMV + all-gather 融合的 layer chain，`--variants` / `--triggers` / `--cold`）、`acc_gemv_sweep.py`（GEMV 加總順序對 cuBLAS 與 fp64 的精度，單 GPU）、`make_table*.py`（含 `make_table_medium.py`）、`summarize_h1a.py`、`summarize_h1b.py`、`summarize_ops.py`、`trace_h1a.py`、`trace_h1b.py`、`build_ext.py` |
 | 研究 probe（不屬於 runtime） | `a2a_probe.py`、`ce_cut_probe.py`、`host_relay_probe.py` |
 | end-to-end | `e2e_prompt_lp.py`（teacher-forced logprob）、`e2e_real.py`（real weights、62 層）、`e2e_overlap.py`（real weights、長 prompt / chunked prefill / mixed batch，microbatched prefill 的 A/B）、`chat_check.py`（greedy chat 檢查） |
 | runner | `run_h1b.sh` |
@@ -202,6 +204,11 @@ accuracy class 的定義（對照目前 branch 的輸出）：
 | `MUSE_TOPO_LOG_OPS` | 0 | - | 每個 (op, dim, shape, dtype, stream, capturing, path) 第一次呼叫印一行；0 = debug level、1 = rank 0、2 = 每個 rank |
 | `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` | plugin 預設 OFF；**`env/host.env` 預設 ON**（2026-10-24 決策；`=0` 回到 exact 的 fp32 exchange） | **deterministic_different** | 大訊息 all-reduce / reduce_scatter 的跨 socket partial 先 round 成 bf16（跨 socket bytes 減半）。只對 bf16；fp16 / fp32 維持 exact。確定性、rank 相同，但不是 fp32 加總單次 rounding 的結果；batch invariant 只在 bf16 exchange 的範圍內：每個 >= `ar_bx_min`（64 KiB，`MUSE_TOPO_MEDIUM_BX=1` 時；`=0` 則是 2 MiB 的 large 門檻）的 bf16 all-reduce，以及所有 reduce_scatter（>= 128 KiB，flag 開啟時一律走 large 演算法加 bf16 exchange），同一 row 在任何 size 下 bits 相同，reduce_scatter 與 all-reduce 從 128 KiB 起 bitwise 相同；較小的 all-reduce 與 T <= 8 的 fused kernel 維持 exact，所以 bits 會在 64 KiB 門檻改變：embedding all-reduce `[T, 8192]`（從不 fused）eager 在 T 3 -> 4、graph 的 padded T 2 -> 4；MoE-out `[T, 4096]` eager 在 T 7 -> 8、padded T 4 -> 8；fused 開啟時 attn-out 在 T <= 8 一律 exact（`all_reduce_boundary` 在 T = 3 與 4 都 exact），T >= 9 起才走 bf16 exchange。final defaults 的驗證（real weights，2026-10-26，vLLM `muse/integ` 468ea2ed86 + 本資料夾，其中大訊息 all-reduce / reduce_scatter 走 bf16 exchange）：GSM8K 200 x 2 為 96.5 %（192 / 200、194 / 200；對照 NCCL 96.2 %、plugin 95.5 %、+SP+bf16x 96.2 %），兩個 cold process 的 determinism A/B（56 個 requests 加 in-process 重複，token ids / logprobs / prompt logprobs）bitwise 相同。128 MiB all-reduce 7.10 -> 5.84 ms |
 | `MUSE_TOPO_MEDIUM_BX`、`MUSE_TOPO_MEDIUM_BX_MIN_BYTES` | **預設 ON**（1；只在 `MUSE_TOPO_LARGE_BF16_EXCHANGE=1` 時生效）、64 KiB | **deterministic_different** | 同一個 bf16 exchange 用在 medium 的 bf16 all-reduce（64 KiB .. 8 MiB：decode 的 embedding `[T, 8192]`（從不 fused）在 T >= 4（graph 的 padded T >= 4）、attn-out `[T, 8192]` 在 T >= 9（CUDA graph 的 padded T = 16 起；T <= 8 是 exact 的 fused kernel）與 MoE-out `[T, 4096]` 在 T >= 8（padded T >= 8）；演算法 2 的 `BX` 變體，與 large 演算法逐 bit 相同）。跨 socket bytes 減半：1 MiB 62.5 -> 43.1 us、512 KiB 33.3 -> 22.6 us；real weights c16 / c64 / c128 out tok/s +2.2 / +2.9 / +1.9 %；GSM8K 97.5 / 96.5 %（見 `docs/r3c_medium_ar.md`）。`=0` 回到 exact 的 fp32 exchange（2 MiB 以下）。T <= 8 的 fused attn-out kernel 維持 exact，但只在 fused 開啟時；fused 關閉時 T = 4..8 的 attn-out 會走 BX（見 `MUSE_TOPO_FUSED` 一列，fused A/B 要兩次都設 `MUSE_TOPO_MEDIUM_BX=0`）。`MUSE_TOPO_AR_TUNING_FILE` 是實驗用 hook（這幾個設定在所有 rank 必須相同） |
+| `MUSE_TOPO_GEMV`（vLLM 端的對應開關：`VLLM_MUSE_SPARK_SM120_FUSED_GEMV`） | **預設 ON**（1；需要 `MUSE_TOPO_FUSED` != 0 與 vLLM 端 `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=1`；兩邊都要是 1 才會啟用） | **deterministic_different**（對 cuBLAS GEMV）；pooler 在 T >= 2 是 `more_accurate`、T = 1 與 unpooler 相當 | decode（padded T <= 8）時，pooler（`[T, 8192]` -> 512 columns）與 unpooler（`[T, 4096]` -> 1024 columns）的 sharded GEMV 和其後的 all-gather + epilogue 由兩個 kernel 組成一次 collective 呼叫（`csrc/gemv_push.cu`、`ag_bnd.cu` 的 `pushed` 版本，細節見 `docs/r3b_gemv_push.md`）：GEMV kernel 在前一個 all-reduce 還在跑時就把 8 MB 權重載入 register，每個 CTA 算完就把 columns push 給 partner 與 island peers。算術：fp32 固定順序加總、單次 bf16 rounding（`csrc/gemv.cuh`），與 T、rank、run 無關（同一個 token row 在任何 batch size 下 bits 相同），但不是 cuBLAS 的順序。對 fp64 精確值（mixed data）：此順序 pooler 為 99.97 .. 100 % correctly rounded、mean 0.25 ulp、max 0.5 .. 1.2 ulp；cuBLAS 在 T = 2..8（bf16 split-K workspace）只有 58 .. 61 %、mean 1.3 .. 3.5 ulp、max 260 .. 16800 ulp，T = 1 與 unpooler 兩者相當（`bench/test_gemv_push.py` 第 3 段、`docs/r3b_gemv_push.md`）。與 router GEMV 一起量測見第 6.4c 節。關閉（回到 cuBLAS GEMV + r2d gather）：`MUSE_TOPO_GEMV=0` 與 `VLLM_MUSE_SPARK_SM120_FUSED_GEMV=0` 一起設（只設 vLLM 端只是不提供給 plugin） |
+| `MUSE_TOPO_GEMV_TRIGGER` | 3（暫定） | 不影響數值 | 前面的 all-reduce kernel 何時讓 GEMV kernel 開始：0 = 不觸發（all-reduce 完成才開始）、1 = all-reduce 一開始（8 MB 權重載入與 all-reduce 第一個 phase 搶頻寬，all-reduce 慢 4 .. 5 us，e2e 沒有增益）、2 = 最後一個 phase 開始、3 = 結束。3 是 S1-4a 實測 arm 的設定；單用 GEMV 時 2 與 3 在雜訊內相同（c1 -2.2 % 兩者相同；c4 -1.1 % 與 -0.1 %，在 repeat 的 1.6 % spread 內），2 加 router GEMV 沒量過，預設待 c1 .. c8 的 2 vs 3 比較後定案。只有 `ar2_kernel` / `ar2_bnd_kernel` 會觸發 2、3；`MUSE_TOPO_PDL=1` 時所有 kernel 一開始就觸發 |
+| `MUSE_TOPO_GEMV_PUSH`、`MUSE_TOPO_GEMV_MAX_ROWS`、`MUSE_TOPO_GEMV_VARIANT` | 1、8、未設（依 row 數選） | PUSH、MAX_ROWS 不影響數值；VARIANT 0 / 3 同一個加總順序，1 / 2 是另一個順序（deterministic，rounding 不同） | `PUSH` 的 bits 0-1 = push 模式（0 = 只存、由 gather kernel push；1 = 每個 CTA 算完就 push；2 = 最後一個 CTA 用 coalesced store push），+4 = 權重在等前一個 kernel 之後才載入。合法值 0、1、2、4、5、6；**不可用 3 或 7**（不 push 卻告訴 gather kernel 已 push，peers 會 spin 到 watchdog trap）。S1-4a：late weights（5）與 2 / 6 都沒有比 1 好。`MAX_ROWS` = GEMV kernel 服務的最大 padded decode batch（1 .. 8）；超過就維持 cuBLAS + r2d gather，padded T = 8（c5 .. c8）尚未量測，早期 bench 顯示 T = 8 的 GEMV chain 比 cuBLAS 慢。`VARIANT` 未設時 T = 1 用 V0（128 CTAs）、T >= 2 用 V3（64 CTAs x 512 threads）；以上都要在所有 rank 相同 |
+| `VLLM_MUSE_SPARK_SM120_ROUTER_GEMV`（vLLM branch 的 flag，不是 plugin 的） | **預設 ON**（1） | **deterministic_different**（對 cuBLAS router） | decode（T <= 8）的 fp32 router `[T, 8192] x [256, 8192]^T` 改用 `_muse_C::router_gemv`：一個 kernel 讀一次 8 MiB 權重，加總順序固定、與 T / rank / run 無關（cuBLAS 在 T = 1 與 T >= 2 用不同演算法，不是 batch invariant），也讓後面的 routing kernel 提早啟動。與 cuBLAS 的差異在最後幾個 bit，測試限定誤差不超過 cuBLAS 的（最大 relative error 8 倍、mean absolute error 2 倍）。輸入的 fp32 router input 在 decode graph 中只有 expert prefetch 開啟時才由 boundary kernel 寫出，否則 router 維持 cuBLAS，vLLM log 會印一行 warning。`=0` 回到 cuBLAS router。單用 router GEMV：c1 -1.0 %、c4 -0.5 %；與 GEMV 融合一起：c1 -4.2 %、c4 -3.2 %（第 6.4c 節） |
+| `VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES`（vLLM branch 的 flag） | 12582912（12 MiB） | identical（cache hint，不寫任何 tensor） | routing-aware expert L2 prefetch 每次拉進 L2 的 bytes（第一個 expert 的開頭，GEMM1 再 GEMM2）。預設與原本的常數相同，行為不變；> 0。更大的 budget 要有更早的 routing ids 才划算（router GEMV 讓 ids 提早），太大會與 kernel 自己的載入搶 HBM（整個 rank 的 96 MiB 比不 prefetch 慢 1.2 %）。20 / 28 MiB 的 sweep 待做 |
 | `NCCL_GRAPH_FILE=<host folder>/nccl/graph_r4.xml` | **`env/host.env` 預設 ON**（檔案存在時 export；呼叫端已設定 `NCCL_GRAPH_FILE` 時以呼叫端的值為準） | **deterministic_different** | 合法的 4-channel ring，NCCL 在 <= 512 KiB 改用 LL。2026-10-21 實測 decode 51.2 -> 70.2 t/s（prefill 不變），但**不是 bitwise identical**（小而奇數 row 的 shape 有 1 bf16 ulp 差；end-to-end 3/20 mixed-batch requests 在 decode 發散，|dlogprob| <= 3.8e-6）。與 topo plugin 同時開啟時，TP collectives 都已繞過 NCCL，graph file 只影響 fallback（非 TP group 與不在 envelope 的呼叫）；這個組合已隨 final defaults 的 GSM8K 與 determinism A/B 驗證過（見上一列），throughput 列（`r2fin_*`）另行量測 |
 | `VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP`（vLLM branch 的 flag，不是 plugin 的；plugin 只負責把 comm stream 上 collective 的結果配置在 compute stream，見 `docs/h2_vllm_plugin.md`「Microbatched prefill」） | ON | deterministic_different | 把 eager batch（>= 2050 tokens）切成兩個 microbatch，一個的 TP collective 在 comm stream 上與另一個的 compute 重疊。real weights prefill（ctx10 / 50 / 90）：replicated stream +33 / +30 / +27 %，sequence-parallel stream +14 / +13 / +11 %；decode 不變。run-to-run bitwise 相同（兩個 process、replicated 與 SP 兩條 stream 都驗證過）；與不切分的輸出有 rounding 等級的差異。只在 V2 runner 能 microbatch 的 launch 生效：需 `--limit-mm-per-prompt '{"image":0,"audio":0,"video":0}'`（所有 modality 都要設 0），且沒有 PIECEWISE CUDA graph / context parallel / spec decode / LoRA / `VLLM_BATCH_INVARIANT`；其他 launch 上 flag 無作用，也不會改變 runner。memory profile 會多跑一次切分後的 batch，KV pool 約少 0.65 GiB / GPU |
 | `MUSE_TOPO_PDL=1`、`MUSE_TOPO_STRICT_STREAM=1`、`MUSE_TOPO_VERBOSE=1`、`MUSE_TOPO_TRACE=1` | OFF | - | 實驗 / 除錯用：PDL（back-to-back -0.3 us，kernel 之後 +0.1 .. 0.2 us，所以關閉）、第二條 stream 直接報錯、JIT build log、in-kernel timeline（需另一份 JIT build，只給 `trace_*.py`） |
@@ -280,6 +287,26 @@ pp +6.7 / +11.8 / +9.7 / +8.9 %（ctx90 每個 chunk 再省約 120 ms）。decod
 
 microbenchmark（CUDA graph b2b，us）：256 KiB 18.9 -> 13.8、512 KiB 33.3 -> 22.5、1 MiB 62.5 -> 43.1、2 MiB 123.7 -> 82.8、8 MiB 480 -> 321；在 8 MiB 以內都比 large 演算法快。GSM8K（real weights、c64、200 題 x 2 pass）97.5 / 96.5 %（沒有 medium exchange 的 `r2integ_acc`：96.0 / 97.0 %）。完整表格、測試與限制見 `docs/r3c_medium_ar.md`。
 
+### 6.4c pooler / unpooler GEMV 與 all-gather 融合 + router GEMV（r3b，`MUSE_TOPO_GEMV`、`VLLM_MUSE_SPARK_SM120_ROUTER_GEMV`；real weights，S1-4a，2026-10-27）
+
+協定：random 512/128、EP8 + TP8、fp8 KV、max-model-len 131072、memory 0.95、max-num-seqs 128、正式的 `env/host.env`；一次 GPU lock 內每個 arm 一個 server session，每個 concurrency 兩次重複
+（SEED 9000 + i，c1 / c4 / c16 / c64 的 prompts 數 32 / 32 / 64 / 256），表中是 TPOT ms（兩次的平均）。`A0` = 正式版行為（`MUSE_TOPO_GEMV=0`、`VLLM_MUSE_SPARK_SM120_FUSED_GEMV=0`、
+`VLLM_MUSE_SPARK_SM120_ROUTER_GEMV=0`），session 開頭與結尾各量一次，百分比對兩者的平均（9.593 / 15.256 / 26.849 / 53.941 ms）。c16 / c64（batch > 8 tokens）不會被這些改動影響，
+它們的變動（約 1 %）就是 session 雜訊。
+
+| arm | 設定 | c1 | c4 | c16 | c64 |
+|-----|------|----|----|-----|-----|
+| A0 開頭 / 結尾 | 全關 | 9.606 / 9.580 | 15.301 / 15.210 | 26.709 / 26.988 | 54.086 / 53.797 |
+| A1 | GEMV 融合，trigger 2 | 9.385（-2.2 %） | 15.094（-1.1 %） | 26.447 | 53.608 |
+| A2 | GEMV 融合，trigger 3 | 9.379（-2.2 %） | 15.241（-0.1 %） | 26.632 | 53.604 |
+| A4 | 只有 router GEMV | 9.495（-1.0 %） | 15.175（-0.5 %） | 26.727 | 53.787 |
+| **A5** | A2 + router GEMV（**預設組合**） | **9.187（-4.2 %）** | **14.763（-3.2 %）** | 26.159 | 53.989 |
+| BEST2 | A5 在第二個 session | 9.178（-4.3 %） | 14.737（-3.4 %） | 26.929 | 54.013 |
+
+late weights（push 5）、last-CTA push（2）與兩者合用（6）都沒有勝過預設的 push 1（c1 9.456 / 9.424 / 9.495，c4 15.480 / 15.485 / 15.611）。兩項改動合起來比個別相加更多
+（GEMV -2.2 %、router GEMV -1.0 %、兩者 -4.2 %）；profile 顯示只融合 GEMV 時 router chain（cuBLAS dot + reduce + routing = 10.5 us）成為 layer 的長桿。
+沒量的：trigger 2 加 router GEMV、padded T = 8（c5 .. c8）、expert prefetch budget 20 / 28 MiB。詳細的 profile、microbenchmark 與精度表見 `docs/r3b_gemv_push.md`。
+
 ### 6.5 NCCL graph file（2026-10-21，dummy weights，`c_muse_gf_ep8`，當時未採用；2026-10-24 起 `env/host.env` 預設使用，只影響 plugin 之外的 NCCL collectives）
 
 c1 4366 / 70.2（TPOT 14.3 ms）、ctx10 5331 / 71.0、ctx50 5201 / 70.4、ctx90 5010 / 70.5：decode +37 %、prefill 不變，但不是 bitwise identical（第 5 節）。topo plugin
@@ -318,6 +345,8 @@ bash scripts/locked_job.sh v1 7200 bash -c 'bash scripts/run_h1a.sh v1 tests oth
 extension build 失敗時所有 rank 一致 fallback、plugin 經 vLLM wrapper 的 eager / graph / fallback。最近一次完整結果（2026-10-24，review fix 之後，全部 PASS）：
 `tests_h1a.py` 256 checks x 8 ranks、`test_h1a.py`（第二套）ALL TESTS PASSED、`tests_h1b.py` 284 checks、`test_epoch.py` PASS、`test_plugin.py` 416 checks x 8 ranks（0 failures）、
 `test_timeout.py`、`test_timeout_large.py`（3/3）、`test_init_failure.py`、`check_ctx.py`、`test_plugin_unit.py`、`test_topology.py`。
+r3b 的 GEMV + all-gather 融合另有 `bench/test_gemv_push.py`（8 ranks，T = 1..8、兩個 projection、所有 variant 與 push 模式、每個 trigger stage、eager 與 CUDA graph；
+對 torch 的 emulation 與「`all_gather` + 模型的 Triton kernel」逐 bit 比較，並與 fp64 精確值及 cuBLAS 比精度）；用法：`GPU=0,1,2,3,4,5,6,7 SRC=<vLLM tree> scripts/py_topo.sh bench/test_gemv_push.py [--quick]`（GPU lock 下）。
 
 ### 7.3 End-to-end determinism 與 NCCL 對照
 
@@ -382,13 +411,16 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 * bf16 exchange 與 NCCL graph file 都是 `deterministic_different`，現為 `env/host.env` 的預設（使用者 2026-10-24 決策）；final defaults 的 GSM8K 與 determinism A/B 已通過（第 5 節）。
   bf16 exchange 在兩個 partial 互相抵銷時最大誤差可到約 32640 ulp，且對 padded batch size 不是 batch invariant；需要 exact 結果或批次不變性的場合設 `MUSE_TOPO_LARGE_BF16_EXCHANGE=0`。
   medium all-reduce 的 bf16 exchange（r3c）讓 decode 範圍內出現新的 batch size 邊界：embedding all-reduce 在 eager T 3 與 4 之間（graph 的 padded T = 2 與 4 之間）、attn-out 在 T <= 8（fused kernel，exact；T = 3 與 4 都 exact）與 T >= 9（graph 的 padded T = 16 起，bf16 exchange）之間、MoE-out 在 eager T 7 與 8 之間（padded T = 4 與 8 之間）；只想關掉這一項設 `MUSE_TOPO_MEDIUM_BX=0`。fused 關閉時（`MUSE_TOPO_FUSED=0` 等）T = 4..8 的 attn-out 也走 bf16 exchange，所以 fused 開 / 關的 bitwise A/B 兩次都要設 `MUSE_TOPO_MEDIUM_BX=0`。
+* r3b 的 GEMV + all-gather 融合（`MUSE_TOPO_GEMV`）與 router GEMV 都是 `deterministic_different`（對 cuBLAS；見第 5 節）：同一個 token row 在任何 batch size、rank、run 下 bits 相同，但與 cuBLAS 路徑的輸出
+  在最後一個 bit 可能不同（router 的 sigmoid + top-8 只會在兩個 logits 差距小於那幾個 bit 時選到另一個 expert）。GEMV kernel 的環境變數（`MUSE_TOPO_GEMV*`）必須在所有 rank 相同，`MUSE_TOPO_GEMV_PUSH` 不可設成 3 或 7。
+  padded T = 8（c5 .. c8）的 GEMV chain 尚未在整個模型上量測；router GEMV 需要 fp32 router input（decode graph 中只有 expert prefetch 開啟時才有），沒有時維持 cuBLAS。
 * 研究 probe（`a2a_probe.py`、`ce_cut_probe.py`、`host_relay_probe.py`）顯示：cross-socket 的 copy engine 或 host relay 做 cut transport 沒有實質增益（host relay 約 13 GB/s per GPU，island egress 隨後成為瓶頸，估計最多約 15 %，未實作）。
 * 已知的後續項目：把 LL8 tag 的 64-bit modulo 換成 compare / select 可省約 0.05 us per all-gather（每個 decode step 約 6 us，未出貨，需再做一輪驗證）。
 
 ## 9. 文件索引與資料位置
 
 * 實測拓樸與瓶頸：`docs/topology.md`；演算法與 API：`docs/h1a_collectives.md`、`docs/h1b_collectives.md`；latency 表：`docs/h1a_latency.md`、`docs/h1b_latency.md`；
-  plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
+  plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；pooler / unpooler GEMV 與 all-gather 融合：`docs/r3b_gemv_push.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
 * 伺服器上的資料（不在本資料夾）：benchmark 結果 `/raid/vllm-runtime/musetest/results/<tag>/`；測試 / benchmark 的 log 與 jsonl `/raid/vllm-runtime/work/host/`；
   JIT cache `/raid/vllm-runtime/sm120-dev/vllm_cache/muse_topo/`；拓樸量測 script 與原始結果 `/raid/vllm-runtime/musetest/topo/`；NCCL 量測 `/raid/vllm-runtime/musetest/nccl/`。
 * 歷史：H1a（小訊息演算法）、H1b（large-message 演算法）、H2 / H2b（vLLM plugin）、review fixes（64-bit counter / flags、supports() 與 kernel 一致、fp16 的 bf16 exchange 溢位、對齊與 stream 規則，2026-10-24）、H3（本資料夾的定稿）。

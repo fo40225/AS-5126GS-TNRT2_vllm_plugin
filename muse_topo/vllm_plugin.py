@@ -100,7 +100,18 @@ Environment (all optional):
                              ``gemv_all_gather_rmsnorm`` / ``gemv_all_gather_residual_boundary``: the GEMV kernel of
                              ``csrc/gemv_push.cu`` + the pushed gather kernel, see ``docs/r3b_gemv_push.md``); needs
                              ``MUSE_TOPO_FUSED`` != 0; default 1
-``MUSE_TOPO_GEMV_PUSH``      0: the GEMV kernel only stores its columns and the gather kernel pushes them (A/B switch); default 1
+``MUSE_TOPO_GEMV_PUSH``      push mode of the GEMV kernel: 0 = it only stores its columns and the gather kernel pushes them, 1 = every CTA
+                             pushes as soon as it is done (default), 2 = the last CTA pushes the block in coalesced stores; +4 loads the
+                             weights behind the wait for the kernel in front instead of before it (A/B switches). Valid: 0, 1, 2, 4, 5,
+                             6; 3 and 7 push nothing but tell the gather kernel that the data was pushed, so the peers spin until the
+                             watchdog traps
+``MUSE_TOPO_GEMV_TRIGGER``   when the all-reduce kernel in front lets the GEMV kernel start: 0 = never (at its completion), 1 = at its start
+                             (delays the all-reduce by ~5 us), 2 = when its last phase begins, 3 = when it ends; default 3 (provisional,
+                             2 measured the same within the noise). Only ``ar2_kernel`` / ``ar2_bnd_kernel`` fire stages 2 and 3
+``MUSE_TOPO_GEMV_VARIANT``   pin one geometry variant (0 .. 3) of the GEMV kernels; unset (default) = by rows: V0 for one row, V3 for 2 .. 8
+                             (same summation order; V1 / V2 sum in another order, for tuning only)
+``MUSE_TOPO_GEMV_MAX_ROWS``  largest padded decode batch the GEMV + gather kernels serve, 1 .. 8, default 8; above it the model keeps cuBLAS
+                             and the r2d gather
 ``MUSE_TOPO_LOG_OPS``        0 (default): the per-op summary goes to the debug log; 1: info log on group rank 0;
                              2: info log on every rank
 
