@@ -16,16 +16,23 @@
 # When serve_cmd.txt (written by the harness) sits next to the log it must carry --numa-bind exactly when the bind is expected, a
 # --kv-transfer-config naming SimpleCPUOffloadConnector with the same cpu_bytes_to_use_per_rank, and a --kv-cache-memory-bytes that is not above
 # MUSE_OFFLOAD_EXPECT_KV_MAX (default MUSE_OFFLOAD_KV_BYTES, the S1-7 bytes of the profile with the tier on).
-# Exit 0 = in effect; 1 = a line with other values, no line, or a mismatch; 2 = usage or unreadable log.
+# FAIL-CLOSED (S1-10 gate review): with the tier expected the check needs the expectation itself. Per-rank bytes, bytes per block-id and the offload-on KV maximum
+# come from the sourcing shell (env/offload.env of the launch's profile) or MUSE_OFFLOAD_EXPECT_BYTES / _BPB / _KV_MAX; when one is unknown, or serve_cmd.txt is
+# missing, or env/offload.env reported an error (unknown profile, no derived bytes), the check FAILS instead of skipping the comparison
+# (MUSE_OFFLOAD_ALLOW_LOG_ONLY=1 accepts a missing serve_cmd.txt for a log-only check; the KV maximum is then not checked).
+# Exit 0 = in effect; 1 = a line with other values, no line, a mismatch or an unknown expectation; 2 = usage or unreadable log.
 if [ $# -ne 1 ]; then echo "usage: check_offload_launch.sh <serve.log>" >&2; exit 2; fi
 log=$1
 [ -r "$log" ] || { echo "check_offload_launch: cannot read $log" >&2; exit 2; }
 want=${MUSE_OFFLOAD_EXPECT:-$([ "${MUSE_OFFLOAD:-1}" = 0 ] && echo off || echo simple)}
-bind=${MUSE_OFFLOAD_EXPECT_BIND:-${MUSE_OFFLOAD_NUMA_BIND:-1}}
+# a launch without the tier has no bind either (env/offload.env adds --numa-bind only together with the connector)
+bind=${MUSE_OFFLOAD_EXPECT_BIND:-$([ "$want" = off ] && echo 0 || echo "${MUSE_OFFLOAD_NUMA_BIND:-1}")}
 bytes=${MUSE_OFFLOAD_EXPECT_BYTES:-${MUSE_OFFLOAD_PER_RANK_BYTES:-}}
 bpb=${MUSE_OFFLOAD_EXPECT_BPB:-${MUSE_OFFLOAD_BPB:-}}
 cmd="$(dirname "$log")/serve_cmd.txt"
 fail() { echo "FAIL $*"; exit 1; }
+[ -z "${MUSE_OFFLOAD_ERROR:-}" ] || fail "env/offload.env reported an error in the sourcing shell: $MUSE_OFFLOAD_ERROR"
+case "${MUSE_OFFLOAD:-1}" in 0|1) ;; *) fail "MUSE_OFFLOAD=${MUSE_OFFLOAD} is neither 0 nor 1" ;; esac
 
 # ---- binding
 declare -A node_of=([0]=3 [1]=3 [2]=0 [3]=0 [4]=7 [5]=7 [6]=4 [7]=4)
@@ -43,6 +50,12 @@ else
 fi
 
 # ---- connector
+if [ "$want" = simple ]; then
+  # fail-closed: the comparisons below only mean something with a known expectation
+  [ -n "$bytes" ] || fail "per-rank tier bytes unknown (MUSE_OFFLOAD_PER_RANK_BYTES / MUSE_OFFLOAD_EXPECT_BYTES unset: source env/offload.env of the launch's profile in the checking shell)"
+  [ -n "$bpb" ] || fail "bytes per block-id unknown (MUSE_OFFLOAD_BPB / MUSE_OFFLOAD_EXPECT_BPB unset: source env/offload.env of the launch's profile in the checking shell)"
+  [ -n "${MUSE_OFFLOAD_EXPECT_KV_MAX:-${MUSE_OFFLOAD_KV_BYTES:-}}" ] || fail "offload-on KV bytes maximum unknown (MUSE_OFFLOAD_KV_BYTES / MUSE_OFFLOAD_EXPECT_KV_MAX unset: source env/offload.env of the launch's profile in the checking shell)"
+fi
 if [ "$want" = off ]; then
   grep -a -q "SimpleCPUOffload" "$log" && fail "offload expected off but the log has SimpleCPUOffload lines"
   echo "OK offload=off bind=$bind"; exit 0
@@ -54,10 +67,8 @@ workers=$(grep -a -o -E "SimpleCPUOffloadWorker \[CPU\]: [0-9]+ tensors, [0-9]+ 
 nw=$(echo "$workers" | awk '{print $1}'); tens=$(echo "$workers" | awk '{print $2}'); wblocks=$(echo "$workers" | awk '{print $3}')
 [ "$nw" = 8 ] || fail "expected 8 worker allocation lines, found $nw"
 [ "$wblocks" = "$sched" ] || fail "scheduler hands out $sched CPU blocks but the workers allocated $wblocks"
-if [ -n "$bytes" ] && [ -n "$bpb" ]; then
-  exp=$(( bytes / bpb ))
-  [ "$exp" = "$sched" ] || fail "per-rank bytes $bytes / $bpb B per block-id = $exp blocks, the log has $sched"
-fi
+exp=$(( bytes / bpb ))
+[ "$exp" = "$sched" ] || fail "per-rank bytes $bytes / $bpb B per block-id = $exp blocks, the log has $sched"
 grep -a -q "Using LBNHC KV cache layout" "$log" || fail "no 'Using LBNHC KV cache layout' line (a connector that flips the layout?)"
 grep -a -q "enable_mm_embeds is True" "$log" && fail "'enable_mm_embeds is True' in the log: the vLLM tree takes the kv_both connector for a disaggregated KV consumer (no receives_remote_kv fix): +128 MiB of GPU memory and the model runs from input embeddings, so the exact KV bytes of this profile do not hold"
 grep -a -q "Pinned memory not available" "$log" && fail "pinned memory not available (the tier is pageable)"
@@ -66,6 +77,9 @@ grep -a -q "cpu_bytes_to_use_per_rank .* != " "$log" && fail "cpu_bytes_to_use_p
 
 # ---- launch line next to the log
 kvmax=${MUSE_OFFLOAD_EXPECT_KV_MAX:-${MUSE_OFFLOAD_KV_BYTES:-}}
+if [ ! -r "$cmd" ] && [ "${MUSE_OFFLOAD_ALLOW_LOG_ONLY:-0}" != 1 ]; then
+  fail "no serve_cmd.txt next to the log: the launch line (--numa-bind, the tier bytes, the exact --kv-cache-memory-bytes) cannot be checked (MUSE_OFFLOAD_ALLOW_LOG_ONLY=1 accepts a log-only check)"
+fi
 if [ -r "$cmd" ]; then
   # the exact --kv-cache-memory-bytes of an offload-on launch is stepped down for the page tables of the tier (S1-7 rule): never above MUSE_OFFLOAD_KV_BYTES
   kvb=$(grep -o -E -e "--kv-cache-memory-bytes[ =][0-9]+" "$cmd" | head -1 | grep -o -E "[0-9]+$")
@@ -73,9 +87,11 @@ if [ -r "$cmd" ]; then
     [ -n "$kvb" ] || fail "serve_cmd.txt has no --kv-cache-memory-bytes (the exact bytes are part of the offload profile)"
     [ "$kvb" -le "$kvmax" ] || fail "--kv-cache-memory-bytes $kvb is above the offload-on maximum $kvmax (the tier's page tables take GPU memory: S_live of the stress boot would fall below the floor)"
   fi
-  if [ "$bind" = 1 ]; then grep -q -e "--numa-bind" "$cmd" || fail "serve_cmd.txt has no --numa-bind"; else grep -q -e "--numa-bind" "$cmd" && fail "serve_cmd.txt has --numa-bind but the bind is expected off"; fi
+  # exactly the flag: --numa-bind-nodes / --numa-bind-cpus alone are not the strict membind of the tier
+  nb='(^|[[:space:]])--numa-bind([[:space:]]|$)'
+  if [ "$bind" = 1 ]; then grep -q -E -e "$nb" "$cmd" || fail "serve_cmd.txt has no --numa-bind"; else grep -q -E -e "$nb" "$cmd" && fail "serve_cmd.txt has --numa-bind but the bind is expected off"; fi
   grep -q "SimpleCPUOffloadConnector" "$cmd" || fail "serve_cmd.txt has no SimpleCPUOffloadConnector"
-  if [ -n "$bytes" ]; then grep -q -E "cpu_bytes_to_use_per_rank(\\\\)?\":$bytes([^0-9]|$)" "$cmd" || fail "serve_cmd.txt does not carry cpu_bytes_to_use_per_rank=$bytes"; fi
+  grep -q -E "cpu_bytes_to_use_per_rank(\\\\)?\":$bytes([^0-9]|$)" "$cmd" || fail "serve_cmd.txt does not carry cpu_bytes_to_use_per_rank=$bytes"
 fi
 echo "OK offload=simple bind=$bind blocks=$sched tensors=$tens workers=$nw layout=LBNHC${bytes:+ per_rank=$bytes}"
 exit 0
