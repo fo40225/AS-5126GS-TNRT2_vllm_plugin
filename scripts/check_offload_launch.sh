@@ -77,6 +77,13 @@ if [ "$want" = off ]; then
       done
     fi
   fi
+  # the same bytes in the startup log (S1-11, review m2): a log whose parsed arguments carry the offload-on bytes is a tier-less launch with tier bytes also
+  # when serve_cmd.txt is missing (the launch scripts and the harness always write it; a log-only check must not pass it)
+  for kvb in $(grep -a 'non-default args' "$log" | grep -a -o -E "'kv_cache_memory_bytes': [0-9]+" | sed -E 's/.*: //' | sort -u); do
+    for onb in ${MUSE_OFFLOAD_EXPECT_KV_MAX:-} ${MUSE_OFFLOAD_KV_BYTES:-} 11645337600 16854810624 17257267200; do
+      [ "$kvb" = "$onb" ] && fail "offload expected off but the startup log's non-default args carry kv_cache_memory_bytes $kvb, the offload-on bytes of a profile (the bytes and the tier travel together)"
+    done
+  done
   echo "OK offload=off bind=$bind"; exit 0
 fi
 sched=$(grep -a -o -E "SimpleCPUOffloadScheduler: Allocating [0-9]+ offload blocks" "$log" | grep -o -E "[0-9]+" | sort -u)

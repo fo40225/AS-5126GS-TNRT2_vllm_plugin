@@ -128,6 +128,16 @@ echo 'vllm serve m --kv-cache-memory-bytes 11720212480 --kv-transfer-config \{\"
 MSG='serve_cmd.txt has a SimpleCPUOffloadConnector' run specoff_on 1 "A2: OFF expected but serve_cmd.txt carries the connector FAILS" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
 echo 'vllm serve m --kv-cache-memory-bytes 11720212480 --numa-bind' > "$d/specoff_on/serve_cmd.txt"
 MSG='serve_cmd.txt has --numa-bind' run specoff_on 1 "A2: OFF expected but serve_cmd.txt carries --numa-bind FAILS" MUSE_OFFLOAD=0 -- "$d/specoff_on/serve.log"
+# S1-11 review m2: with the tier expected off and NO serve_cmd.txt, the startup log's parsed arguments carry the bytes check
+mkdir -p "$d/m2"
+echo "(APIServer pid=1) INFO 11-12 02:17:16 [startup.py:96] non-default args: {'model_tag': 'm', 'kv_cache_memory_bytes': 11645337600, 'max_num_seqs': 128}" > "$d/m2/serve.log"
+MSG='non-default args carry kv_cache_memory_bytes 11645337600' run m2 1 "m2: OFF expected, no serve_cmd.txt, the log's parsed arguments carry the spec offload-on bytes FAILS" MUSE_OFFLOAD=0 -- "$d/m2/serve.log"
+echo "(APIServer pid=1) INFO 11-12 02:17:16 [startup.py:96] non-default args: {'model_tag': 'm', 'kv_cache_memory_bytes': 16854810624}" > "$d/m2/serve.log"
+MSG='16854810624' run m2 1 "m2: the same with the ns256 offload-on bytes" MUSE_OFFLOAD=0 -- "$d/m2/serve.log"
+echo "(APIServer pid=1) INFO 11-12 02:17:16 [startup.py:96] non-default args: {'model_tag': 'm', 'kv_cache_memory_bytes': 11720212480}" > "$d/m2/serve.log"
+run m2 0 "m2: the no-tier bytes in the log pass without serve_cmd.txt" MUSE_OFFLOAD=0 -- "$d/m2/serve.log"
+echo "(APIServer pid=1) INFO 11-12 02:17:16 [startup.py:96] non-default args: {'model_tag': 'm'}" > "$d/m2/serve.log"
+run m2 0 "m2: a log without kv_cache_memory_bytes still passes (nothing to compare)" MUSE_OFFLOAD=0 -- "$d/m2/serve.log"
 # the offload-on bytes hard-coded as the fallback list equal the three profiles of env/offload.env
 got=$(for pr in spec ns256 ns128; do env -i PATH="$PATH" bash -c "MUSE_OFFLOAD_PROFILE=$pr source $here/env/offload.env; echo \$MUSE_OFFLOAD_KV_BYTES"; done | tr '\n' ' ')
 want=$(grep -o -E '11645337600 16854810624 17257267200' "$check" | head -1)
