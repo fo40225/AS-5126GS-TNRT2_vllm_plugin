@@ -528,17 +528,17 @@ step-down：(951 / 2 + 128) = 603.5 MiB per rank -> 1,932 L = 633,077,760 B，�
 |---|---|---|
 | **cold 1M prefill TTFT**（2 次） | **296.1 / 295.6 s**（3,528 / 3,533 tok/s） | **294.9 / 294.9 s**（3,542 tok/s） |
 | 每個 8,192-token chunk 的時間 | 0.735 s（深度 0）-> 3.631 s（約 1M 深度），約 3 ms per 1k 深度（總成本是深度的平方），兩個 profile 在每個深度都相同 | 同左 |
-| **decode，約 1M 深度，單一 stream** | TPOT 3.00 ms = **333.4 tok/s，AL 7.125**；每個 verify step 21.3 ms | TPOT 12.06 ms = **82.9 tok/s** |
-| 相對深度 0 的 step | 21.3 ms 對約 17.2 ms：每個 step 約多 4 ms（+24 %） | 12.06 ms 對 8.19 ms：每個 step 約多 4 ms |
+| **decode，約 1M 深度，單一 stream** | **每個 verify step 21.3 ms**（量測）；TPOT 3.00 ms = 333.4 tok/s 只在 AL 7.125 時成立（acceptance 被抬高，不代表 production；見下方第一點） | TPOT 12.06 ms = **82.9 tok/s** |
+| 相對深度 0 的 step | 21.3 ms 對 17.3-17.6 ms（final matrix 的 spec c1 STEADY step，OFF / ON）：每個 step 約多 4 ms（+21-23 %） | 12.06 ms 對 8.19 ms：每個 step 約多 4 ms |
 | 最大並行的 decode | n/a（admitted 1） | N=3：aggregate 133.8 tok/s（每個 stream 22.4-22.7 ms；單 stream 的 1.61 倍） |
 | GPU-hit TTFT / **tier restore TTFT** 的 1M prefix | 1.52 s / **3.28 s**（x2.16） | 0.89 s / **2.35 s**（x2.63） |
 | tier restore 的內容 | 與 GPU-hit bitwise 相同（64 tokens） | 同左（flood 153 份 x 32,768 = 5,013,504 tokens 造成 eviction） |
 | 8k 的 short（c4）在 cold 1M prefill 3 s 後送入：TTFT | 約 294-295 s（control 無 prefill 時 0.777 s） | 約 293 s（control 2.032 s） |
 
-* **333.4 tok/s 是 acceptance 被抬高的數字**：它是在 pile 文章的續寫上量到的 AL 7.125（接近 K+1 = 8 的上限）；同一個 server 上其他 cell 的 AL 是 4.85（M4 needle 文字）、5.62（M3）、2.66（M5 control），production matrix 的 AL 是 4.64-4.88。
+* **333.4 tok/s 是 acceptance 被抬高的數字，不能當作 1M 深度的 decode 速度**：它是在 pile 文章的續寫上量到的 AL 7.125（接近 K+1 = 8 的上限）；同一個 server 上其他 cell 的 AL 是 4.85（M4 needle 文字）、5.62（M3）、2.66（M5 control），production matrix 的 AL 是 4.64-4.88。
   以 production 的 AL 約 4.7 與同樣的 21.3 ms step 推算，1M 深度的 spec decode 約 **220 tok/s**（4.7 / 21.3 ms，**推算值，不是量測**）。
-* 深度的成本是 attention 讀 KV：decode step 在 1M 深度每個 step 多約 4 ms（spec 21.3 vs 約 17.2 ms、ns256 12.06 vs 8.19 ms；約 17.2 ms 是 c1 的 production step，8.19 ms 是 final matrix 的 ns256 c1 STEADY step）。
-  事前的估計是 17.2 ms + 2.79 ms 的 KV 讀取（+16 %）；實測 +24 %。cold prefill 的事前估計是 267 s（fit），實測 296 s，超過整個 95-267 s 的預測範圍；non-spec 只快約 1 s，draft prompt 的額外成本看不出來。
+* 深度的成本是 attention 讀 KV：decode step 在 1M 深度每個 step 多約 4 ms（spec 21.3 vs 17.3-17.6 ms、ns256 12.06 vs 8.19 ms；17.3-17.6 ms 與 8.19 ms 都是 final matrix 的 c1 STEADY step）。
+  事前的估計是 17.2 ms（預測的 base step）+ 2.79 ms 的 KV 讀取（+16 %）；實測 21.3 ms，相對該預測 +24 %（相對上面的 production step 為 +21-23 %）。cold prefill 的事前估計是 267 s（fit），實測 296 s，超過整個 95-267 s 的預測範圍；non-spec 只快約 1 s，draft prompt 的額外成本看不出來。
 * **head-of-line blocking**：1M 的 prefill 每個 step 用滿整個 8,192 / 8,199-token budget，排在它後面的 short 要等到整個 prefill 結束才有第一個 token（TTFT 約 294-295 s，約 control 的 380 倍（spec）/ 145 倍（ns256））。
   n = 4 的 p50 取的是上中位數（294.8 / 293.5 s）；兩個中間值的平均為 294.43 s（spec）/ 293.16 s（ns256）。short 的 TPOT 是 prefill 結束後的 c4 decode，不是 prefill 期間的 decode 速度。
 * chunk 時間曲線是由 4 Hz 的 GPU KV-usage gauge 事後推導的（vLLM 的 prompt-token counter 與 iteration histogram 只在 request 結束時才動，sampler 直接讀到的 tok/s 與 ms per chunk 是 artifact）。
