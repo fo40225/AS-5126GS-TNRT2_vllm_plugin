@@ -1,6 +1,6 @@
 #!/bin/bash
 # Regression test of scripts/check_spec_launch.sh (S1-9 L11: the graph-floor line, the cap > 256 bytes rule and the default floor of a
-# larger capture list) on synthetic boot logs. No GPU, no vLLM: usage  bash bench/test_check_spec_launch.sh   Exit 0 = all cases as expected.
+# larger capture list, S1-14 F2: the scheduled-token cap) on synthetic boot logs. No GPU, no vLLM: usage  bash bench/test_check_spec_launch.sh   Exit 0 = all cases as expected.
 here=$(cd "$(dirname "$0")/.." && pwd)
 check=$here/scripts/check_spec_launch.sh
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
@@ -10,13 +10,16 @@ sp_line() { echo "INFO MuseSpark SM120: sequence-parallel residual stream for ba
 gsp_line() { echo "INFO MuseSpark SM120: sequence parallel inside FULL decode CUDA graphs for batches of at least $1 tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=$2; decode MoE engines serve up to ${4:-128} tokens; eager, mixed and PIECEWISE batches keep the floor of $3 tokens)."; }
 # the graph manager's line of every worker (8): <flagged> <range or none> <other FULL> <PIECEWISE>
 flagged_line() { for _ in 1 2 3 4 5 6 7 8; do echo "INFO CUDA graphs: $1 FULL decode graphs are flagged full_decode_graph (token counts $2), $3 other FULL graphs, $4 PIECEWISE graphs."; echo "Model loading took 70.8 GiB"; done; }
+# vLLM's startup line of the API server (arg_utils / startup.py:96): the parsed non-default args; <mnst> empty = no --max-num-scheduled-tokens on the command line
+nda_line() { echo "(APIServer pid=1) INFO 11-10 19:49:51 [startup.py:96] non-default args: {'model_tag': 'm', 'tensor_parallel_size': 8, 'kv_cache_memory_bytes': 11720212480, 'max_num_batched_tokens': 8199${1:+, 'max_num_scheduled_tokens': $1}, 'max_num_seqs': 128, 'max_cudagraph_capture_size': 256}"; }
 # mk <name> <eager floor> <cap> <graph floor line args or ''> [bytes] [flagged line args, default: 33 FULL decode graphs 8..256 for cap 256, 48 8..384 for cap 384]
+# (MNST=<n> in the environment of mk sets the scheduled-token cap of the log and the command line, default 8192; MNST= (empty) = no flag)
 mk() {
   mkdir -p "$d/$1"
-  local fl="${6:-}"
+  local fl="${6:-}" mst="${MNST-8192}"
   if [ -z "$fl" ]; then if [ "$3" = 384 ]; then fl="48 8..384 1 56"; else fl="32 8..256 1 40"; fi; fi
-  { sp_line "$2" "$3"; [ -n "$4" ] && gsp_line $4; flagged_line $fl; echo "Chunked prefill is enabled with max_num_batched_tokens=8199"; echo "Graph capturing finished in 30 secs, took 0.95 GiB"; } > "$d/$1/serve.log"
-  echo "vllm serve m --max-cudagraph-capture-size $3 --max-num-batched-tokens 8199 --kv-cache-memory-bytes ${5:-9000000000}" > "$d/$1/serve_cmd.txt"
+  { sp_line "$2" "$3"; [ -n "$4" ] && gsp_line $4; flagged_line $fl; echo "Chunked prefill is enabled with max_num_batched_tokens=8199"; nda_line "$mst"; echo "Graph capturing finished in 30 secs, took 0.95 GiB"; } > "$d/$1/serve.log"
+  echo "vllm serve m --max-cudagraph-capture-size $3 --max-num-batched-tokens 8199${mst:+ --max-num-scheduled-tokens $mst} --kv-cache-memory-bytes ${5:-9000000000}" > "$d/$1/serve_cmd.txt"
 }
 # expect <name> <rc wanted> <description> [env assignments...] -- <args to the script>
 run() {
@@ -55,11 +58,11 @@ run a1b 1 "cap 384 boot checked as the production profile (cap 256)" SPEC_EXPECT
 run a1b 0 "cap 384, floor and cap given" SPEC_EXPECT_GRAPH_SP=136 SPEC_CAP_MAX_BYTES=10900000000 -- "$d/a1b/serve.log" 385 384
 run a1b 1 "cap 384 with the cap-256 floor" SPEC_EXPECT_GRAPH_SP=136 SPEC_CAP_MAX_BYTES=10900000000 -- "$d/a1b/serve.log" 384 384
 mk a1b_json 385 384 "136 136 385" 10900000000
-echo 'vllm serve m --compilation-config \{\"cudagraph_capture_sizes\":\[1,2,4,8,256,264,384\],\"max_cudagraph_capture_size\":384\} --max-num-batched-tokens 8199 --kv-cache-memory-bytes 10900000000' > "$d/a1b_json/serve_cmd.txt"
+echo 'vllm serve m --compilation-config \{\"cudagraph_capture_sizes\":\[1,2,4,8,256,264,384\],\"max_cudagraph_capture_size\":384\} --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 10900000000' > "$d/a1b_json/serve_cmd.txt"
 run a1b_json 0 "cap 384 as an escaped compilation-config JSON (explicit capture list)" MUSE_SPEC_GRAPH_CAP=384 SPEC_EXPECT_GRAPH_SP=136 SPEC_CAP_MAX_BYTES=10900000000 -- "$d/a1b_json/serve.log"
-echo 'vllm serve m --compilation-config {"max_cudagraph_capture_size":384} --max-num-batched-tokens 8199 --kv-cache-memory-bytes 10900000000' > "$d/a1b_json/serve_cmd.txt"
+echo 'vllm serve m --compilation-config {"max_cudagraph_capture_size":384} --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 10900000000' > "$d/a1b_json/serve_cmd.txt"
 run a1b_json 0 "cap 384 as a plain compilation-config JSON" MUSE_SPEC_GRAPH_CAP=384 SPEC_EXPECT_GRAPH_SP=136 SPEC_CAP_MAX_BYTES=10900000000 -- "$d/a1b_json/serve.log"
-echo 'vllm serve m --compilation-config \{\"max_cudagraph_capture_size\":256\} --max-num-batched-tokens 8199 --kv-cache-memory-bytes 10900000000' > "$d/a1b_json/serve_cmd.txt"
+echo 'vllm serve m --compilation-config \{\"max_cudagraph_capture_size\":256\} --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 10900000000' > "$d/a1b_json/serve_cmd.txt"
 run a1b_json 1 "serve_cmd.txt names another escaped cap (256) than the boot (384)" MUSE_SPEC_GRAPH_CAP=384 SPEC_EXPECT_GRAPH_SP=136 SPEC_CAP_MAX_BYTES=10900000000 -- "$d/a1b_json/serve.log"
 mk a1b_nograph 385 384 "" 10900000000
 run a1b_nograph 1 "cap 384 without the graph line while it is demanded" MUSE_SPEC_GRAPH_CAP=384 SPEC_EXPECT_GRAPH_SP=136 SPEC_CAP_MAX_BYTES=10900000000 -- "$d/a1b_nograph/serve.log"
@@ -99,6 +102,39 @@ mk_f2 f2_at 11720212480
 run f2_at 0 "flag-2 pairing (r2e, aux projection, FP8 2 cutlass) at 11,720,212,480" -- "$d/f2_at/serve.log"
 mk_f2 f2_over 11720212481
 run f2_over 1 "flag-2 pairing, one byte above FP8_F2_MAX_BYTES (11,720,212,481)" -- "$d/f2_over/serve.log"
+# S1-14 F2: the scheduled-token cap (--max-num-scheduled-tokens 8192) in the log line and the command line
+run prod 0 "production boot with the cap 8192 (log line and flag), default expectation" -- "$d/prod/serve.log"
+run prod 0 "production boot, cap 8192 demanded explicitly" SPEC_EXPECT_MNST=8192 -- "$d/prod/serve.log"
+run prod 1 "production boot, another cap (4096) demanded" SPEC_EXPECT_MNST=4096 -- "$d/prod/serve.log"
+run prod 1 "production boot has the cap but 'no cap' is demanded" SPEC_EXPECT_MNST=off -- "$d/prod/serve.log"
+run prod 1 "production boot has the cap but 0 is demanded (= off)" SPEC_EXPECT_MNST=0 -- "$d/prod/serve.log"
+run prod 2 "garbage cap expectation" SPEC_EXPECT_MNST=8k -- "$d/prod/serve.log"
+MNST= mk nocap 384 256 ""
+run nocap 1 "boot without the flag (the plain 0.33.0 port: 8199-token chunks), default expectation" -- "$d/nocap/serve.log"
+run nocap 1 "boot without the flag, cap 8192 demanded" SPEC_EXPECT_MNST=8192 -- "$d/nocap/serve.log"
+run nocap 0 "boot without the flag, off demanded" SPEC_EXPECT_MNST=off -- "$d/nocap/serve.log"
+run nocap 0 "boot without the flag, 0 demanded" SPEC_EXPECT_MNST=0 -- "$d/nocap/serve.log"
+MNST=4096 mk othercap 384 256 ""
+run othercap 1 "boot with cap 4096, default expectation 8192" -- "$d/othercap/serve.log"
+run othercap 0 "boot with cap 4096, 4096 demanded" SPEC_EXPECT_MNST=4096 -- "$d/othercap/serve.log"
+run othercap 1 "boot with cap 4096, off demanded" SPEC_EXPECT_MNST=off -- "$d/othercap/serve.log"
+# log and command line disagree: the flag is missing from serve_cmd.txt (log line present), or only in the command line (no log entry)
+mkdir -p "$d/cmdonly"; cp "$d/nocap/serve.log" "$d/cmdonly/serve.log"; sed 's/ --max-num-batched-tokens 8199/ --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192/' "$d/nocap/serve_cmd.txt" > "$d/cmdonly/serve_cmd.txt"
+run cmdonly 1 "flag on the command line but not in the parsed args of the log" -- "$d/cmdonly/serve.log"
+run cmdonly 1 "flag on the command line, off demanded" SPEC_EXPECT_MNST=off -- "$d/cmdonly/serve.log"
+mkdir -p "$d/logonly"; cp "$d/prod/serve.log" "$d/logonly/serve.log"; sed 's/ --max-num-scheduled-tokens 8192//' "$d/prod/serve_cmd.txt" > "$d/logonly/serve_cmd.txt"
+run logonly 1 "cap in the log line but not on the command line of serve_cmd.txt" -- "$d/logonly/serve.log"
+mkdir -p "$d/noargs"; grep -v 'non-default args' "$d/prod/serve.log" > "$d/noargs/serve.log"; cp "$d/prod/serve_cmd.txt" "$d/noargs/"
+run noargs 1 "no non-default args line in the log: the cap cannot be confirmed" -- "$d/noargs/serve.log"
+run noargs 0 "no non-default args line, off demanded and not on the command line" SPEC_EXPECT_MNST=off -- "$d/nocap/serve.log"
+mkdir -p "$d/nocmd"; cp "$d/prod/serve.log" "$d/nocmd/serve.log"
+run nocmd 0 "log only (no serve_cmd.txt), cap 8192 in the parsed args" -- "$d/nocmd/serve.log"
+mkdir -p "$d/mixedcap"; { cat "$d/prod/serve.log"; nda_line 4096; } > "$d/mixedcap/serve.log"; cp "$d/prod/serve_cmd.txt" "$d/mixedcap/"
+run mixedcap 1 "two non-default args lines with different caps" -- "$d/mixedcap/serve.log"
+mkdir -p "$d/sub"; { cat "$d/prod/serve.log"; echo "INFO other line mentioning 'max_num_scheduled_tokens': 4096 outside the args line"; } > "$d/sub/serve.log"; cp "$d/prod/serve_cmd.txt" "$d/sub/"
+run sub 0 "a max_num_scheduled_tokens text outside the non-default args line is ignored" -- "$d/sub/serve.log"
+# the OK line names the cap, and the KV bytes of the capped profile are the bytes of the flag-2 pairing (the cap moves no bytes)
+out=$(env -i PATH="$PATH" bash "$check" "$d/f2_at/serve.log" 2>&1); if echo "$out" | grep -q 'mnbt=8199 mnst=8192'; then echo "ok   the OK line carries mnbt=8199 mnst=8192"; else echo "FAIL OK line: $out"; fails=$((fails+1)); fi
 # env/spec_k7.env: off is a property of sourcing the profile
 got=$(env -i PATH="$PATH" bash -c "MUSE_SPEC_GRAPH_SP_MIN_TOKENS=136; source $here/env/spec_k7.env; a=\${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}; MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0; source $here/env/spec_k7.env; echo \$a \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}" 2>&1)
 if [ "$got" = "136 unset" ]; then echo "ok   spec_k7.env: a re-source with the flag at 0 unsets the vLLM variable"; else echo "FAIL spec_k7.env re-source: got '$got' wanted '136 unset'"; fails=$((fails+1)); fi
@@ -106,6 +142,10 @@ got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKE
 if [ "$got" = "unset" ]; then echo "ok   spec_k7.env: a stray vLLM variable does not survive the profile at flag 0"; else echo "FAIL spec_k7.env stray variable: got '$got'"; fails=$((fails+1)); fi
 # the adopted default (S1-9 L11 gate): the profile arms the graph floor 136 on the production capture list, bytes unchanged
 got=$(env -i PATH="$PATH" bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset} \$MUSE_SPEC_GRAPH_CAP \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
-if [ "$got" = "136 256 11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199" ]; then echo "ok   spec_k7.env: the default profile is A1a (graph floor 136, cap 256, production bytes of the 0.33.0 line)"; else echo "FAIL spec_k7.env default profile: got '$got'"; fails=$((fails+1)); fi
+if [ "$got" = "136 256 11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192" ]; then echo "ok   spec_k7.env: the default profile is A1a (graph floor 136, cap 256, mnst 8192, production bytes of the 0.33.0 line)"; else echo "FAIL spec_k7.env default profile: got '$got'"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=0 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
+if [ "$got" = "11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=0 drops the flag, bytes unchanged"; else echo "FAIL spec_k7.env MNST=0: got '$got'"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=4096 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
+if [ "$got" = "11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 4096" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=4096 overrides the cap, bytes unchanged"; else echo "FAIL spec_k7.env MNST=4096: got '$got'"; fails=$((fails+1)); fi
 [ $fails = 0 ] && echo "ALL CASES PASSED" || echo "$fails case(s) FAILED"
 exit $((fails > 0))

@@ -48,6 +48,8 @@ low-concurrency TTFT, and `real_*` c40 measures the replicated eager band (c33..
 The graph sets shrink with the cap: target FULL 48 -> 32 and PIECEWISE 51 -> 35, drafter FULL 48 -> 32 (the draft step runs eagerly above 32
 requests), graph pool 2.11 -> 1.22 GiB per rank. Non-speculative launches, `envs.py` defaults and `model.py` are not touched.
 
+**S1-14 F2 (2026-11-10) adds `--max-num-scheduled-tokens 8192` to the profile** (`MUSE_SPEC_MNST`, default 8192, 0 = no flag; `MUSE_SPEC_SERVE_ARGS` is now `--max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192`). The KV bytes stay 11,720,212,480. See the section "S1-14 F2" at the end of this file.
+
 ## Launch line (the production speculative launch line since the S1-9 lever 1 merge)
 
 The stage C line (`/tmp/muse_wf/s1-8/stageC/RESULTS.md` Part 5.3) plus the two settings and the KV bytes re-derived for this graph set:
@@ -477,3 +479,29 @@ layout controls OFFB 17.29 / 17.22 and CAPB 17.31 / 17.99: the bumps (17.5 .. 18
 
 Evidence: server `/raid/vllm-runtime/work/s1-9/L11/g/` (ADOPTION_RULE.txt, verdict.txt, master_l11.log, scripts, determinism outputs), `musetest/results/s19l11g_*` (A/B), `s19l11gd_*` (c1 controls), `s19l11n_*` (non-speculative), `s19l11x_*` (stress boots),
 `s19l11g_gsm_*` (GSM8K); local `/tmp/muse_wf/s1-9/L11/` (PROGRESS.md, gate/, verdict_final.txt, master_l11.log).
+
+## S1-14 F2: the scheduled-token cap (`--max-num-scheduled-tokens 8192`), 2026-11-10
+
+**Why.** Attribution (`muse_wf/s1-14/ATTRIBUTION.md`): the speculative cold prefill of multi-chunk prompts is 1.7 % (profiled) / 2.0 % (client wall at 32k) slower on vLLM 0.33.0 than on 0.32.0.
+`SpeculativeConfig.max_num_new_slots_for_drafting` is 0 for DFlash on 0.33.0 (K = 7 on 0.32.0; `vllm/config/speculative.py:2058`, "DFlash and DSpark draft in a separate query pass"), and the scheduler's prefill
+chunk is `min(token_budget, max_num_batched_tokens - draft_slots)` (`vllm/v1/core/sched/scheduler.py:719-722`, `:1295`), so `--max-num-batched-tokens 8199` (S1-9 L5, made for K = 7) now schedules 8199-token chunks:
+8199 % 8 = 7, the r2e microbatches have 4100 / 4099 rows and the S1-9 L5 gain (no `sp_reduce_scatter` F.pad staging copy, M-aligned cuBLAS tiles) is lost.
+
+**What the flag is (vLLM 0.33.0 source, branch 7f32b76f49).** `max_num_scheduled_tokens` is a `SchedulerConfig` field (`vllm/config/scheduler.py:55`, "usually equal to max_num_batched_tokens, but can be smaller ... when the model might
+append tokens into the batch (such as speculative decoding)"), CLI `--max-num-scheduled-tokens` (`vllm/engine/arg_utils.py:1745-1750`, human-readable ints at `:399`). With a speculative config an unset value becomes
+`max_num_batched_tokens` and values below 8192 log a warning (`vllm/config/vllm.py:2359-2385`; 8192 itself does not warn). The scheduler uses it as the per-step budget (`scheduler.py:139-141` and `:719`, so it caps
+the tokens of the whole step incl. the 1 + K verify rows of the decoders, and asserts it at `:1620`) and as the chunk bound for block-aligned prefill (`:613`). The draft slots are 0, so MNBT 8199 and the cap 8192 give
+`min(8192, 8199 - 0)` = 8192-row chunks; a 32k prompt is 4 x 8192 with no tail. A mixed step (decoders + prefill) loses 7 tokens of budget (8192 instead of 8199).
+
+**What it does not change.** `max_num_batched_tokens` stays 8199 and is what sizes the runner (`gpu_model_runner.py:524`, `self.max_num_tokens`), the profile run, the cudagraph range (`vllm/config/vllm.py:2569`: capture sizes
+are `min(MNBT, cap)` = 256, unchanged), the compile range end (`:2682`), the Muse SP / MoE buffers (`model.py:1220`, `gemm_rs.py:75,104`) and the sliding-window KV reservation
+(`VllmConfig.max_in_flight_tokens`, `vllm/config/vllm.py:612-623` -> `SlidingWindowSpec.max_admission_blocks_per_request`, `kv_cache_interface.py:937-940`, both use MNBT). Only two b12x helpers read the cap
+(`modelopt_block_quant.py:326`, `b12x_warmup.py:72-74`) and both take `max(MNBT, cap)` = 8199. So the memory profile, the CUDA graph sizes and the KV pool are expected not to move, and **the exact bytes stay
+11,720,212,480** (flag and bytes travel together: a profile with the flag carries these bytes; `MUSE_SPEC_MNST=0` is the plain port with the same bytes). The S1-14 A/B verifies this (KV blocks per rank, GPU MiB at READY).
+
+**Check.** vLLM logs no line for the effective cap (an unset cap silently becomes MNBT), so `scripts/check_spec_launch.sh` reads the startup line `non-default args: {... 'max_num_scheduled_tokens': 8192 ...}`
+(`vllm/entrypoints/common/startup.py:96`) and, next to a harness `serve_cmd.txt`, the flag `--max-num-scheduled-tokens 8192`. `SPEC_EXPECT_MNST=<n>` (default 8192) or `off` / `0` (the plain port) demands the state; a boot without the
+cap FAILS by default. No KV token number is checked. The OK line ends in `mnbt=8199 mnst=8192`. `bench/test_check_spec_launch.sh` covers boots with and without the flag.
+
+**Status.** Implemented on host branch `s114-mnst`; adoption is decided by the pre-registered S1-14 A/B (`muse_wf/specs/S1-14_v033_regressions.md`, F2 cells: 32k cold prefill wall, 64k wall, cold tok/s; guards 8192 wall, mixed churn,
+AL, KV blocks, GPU MiB at READY).

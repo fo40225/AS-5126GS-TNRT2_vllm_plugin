@@ -40,6 +40,9 @@
 # graph at or above the floor is what the sharded stream is captured in). The OK line prints "flagged=<N>@<lo>..<hi>".
 # A cap above 256 (A1b: the capture list reaches cap, the graph pool grows) has no derived bytes: it is checked against SPEC_CAP_MAX_BYTES=<bytes> (the S1-7 value of that cap) and FAILS without it; at cap 256 the graph floor changes no bytes (the pool shrinks 0.95 -> 0.89 GiB: the
 # production maximum stays safe, exact bytes with the smaller pool are the gate's job).
+# S1-14 F2 (scheduled-token cap): the profile also carries --max-num-scheduled-tokens 8192 (MUSE_SPEC_MNST of env/spec_k7.env; the DFlash drafter has 0 slots on vLLM 0.33.0, so without the cap the chunks are 8199 tokens). The cap
+# is read from vLLM's startup line "non-default args: {... 'max_num_scheduled_tokens': <n> ...}" and, next to a harness serve_cmd.txt, from the flag. SPEC_EXPECT_MNST=<n> (default 8192) | off|0 (no cap, the plain port) demands the state.
+# The KV bytes do not depend on the cap (max_num_batched_tokens stays 8199), and no KV token number is checked.
 # Exit 0 = profile in effect; 1 = a line with other values, no line, the flag is missing or the pairing is wrong; 2 = usage or unreadable log.
 if [ $# -lt 1 ] || [ $# -gt 3 ]; then
   echo "usage: check_spec_launch.sh <serve.log> [expected_sp_floor [expected_graph_cap]]" >&2; exit 2
@@ -232,5 +235,34 @@ if [ -r "$cmd" ]; then
     echo "FAIL serve_cmd.txt has no --max-num-batched-tokens $mnbt"; rc=1
   fi
 fi
-[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt$cap_bytes_note ($pool)"
+# scheduled-token cap (S1-14 F2): the DFlash drafter takes no slots in the target batch on vLLM 0.33.0 (max_num_new_slots_for_drafting = 0), so a prefill chunk is
+# min(max_num_scheduled_tokens, max_num_batched_tokens): 8199 without --max-num-scheduled-tokens 8192, which brings the 8192-row chunks of the S1-9 L5 alignment back.
+# vLLM logs no line for the effective value (an unset cap silently becomes max_num_batched_tokens), but its startup line "non-default args: {... 'max_num_scheduled_tokens': <n> ...}"
+# lists the parsed CLI value; the launch command line in serve_cmd.txt must carry the same flag. SPEC_EXPECT_MNST=<n> (default 8192, the profile) | off (or 0) demands the state:
+# off = no cap in the log and no flag in serve_cmd.txt. No KV token count is checked here: the cap does not move the KV bytes (max_num_batched_tokens stays 8199).
+mnst=${SPEC_EXPECT_MNST:-8192}
+[ "$mnst" = 0 ] && mnst=off
+mnst_seen=$(grep -a 'non-default args' "$log" | grep -a -o -E "'max_num_scheduled_tokens': [0-9]+" | sed -E 's/.*: //' | sort | uniq -c)
+n_args_lines=$(grep -a -c 'non-default args' "$log")
+if [ "$mnst" = off ]; then
+  if [ -n "$mnst_seen" ]; then
+    echo "FAIL max_num_scheduled_tokens is capped in the log (count value):"; echo "$mnst_seen"; echo "     expected no cap (SPEC_EXPECT_MNST=off)"; rc=1
+  fi
+  if [ -r "$cmd" ] && grep -q -E -e '--max-num-scheduled-tokens[ =]' "$cmd"; then
+    echo "FAIL serve_cmd.txt carries --max-num-scheduled-tokens but no cap was expected (SPEC_EXPECT_MNST=off)"; rc=1
+  fi
+else
+  case "$mnst" in *[!0-9]*) echo "check_spec_launch: SPEC_EXPECT_MNST must be a number or off, got '$mnst'" >&2; exit 2 ;; esac
+  if [ "$n_args_lines" = 0 ]; then
+    echo "FAIL no \"non-default args\" line in $log: the cap --max-num-scheduled-tokens $mnst cannot be confirmed"; rc=1
+  elif [ -z "$mnst_seen" ]; then
+    echo "FAIL the \"non-default args\" line has no max_num_scheduled_tokens: the boot ran without --max-num-scheduled-tokens $mnst (8199-token prefill chunks, unaligned)"; rc=1
+  elif [ "$(echo "$mnst_seen" | wc -l)" != 1 ] || ! echo "$mnst_seen" | grep -q -E "^ *[0-9]+ $mnst\$"; then
+    echo "FAIL expected max_num_scheduled_tokens=$mnst; found (count value):"; echo "$mnst_seen"; rc=1
+  fi
+  if [ -r "$cmd" ] && ! grep -q -E -e "--max-num-scheduled-tokens[ =]$mnst([^0-9]|\$)" "$cmd"; then
+    echo "FAIL serve_cmd.txt has no --max-num-scheduled-tokens $mnst"; rc=1
+  fi
+fi
+[ $rc = 0 ] && echo "OK floor=$floor graphs<=$cap graphsp=$gsp flagged=$flagged r2e=$r2e fcshard=$fcs fp8=$fp8/$fp8k mnbt=$mnbt mnst=$mnst$cap_bytes_note ($pool)"
 exit $rc
