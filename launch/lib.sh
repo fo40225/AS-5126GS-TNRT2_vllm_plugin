@@ -237,7 +237,10 @@ lc_await_session() {
   local n=$(( LC_SESS_WAIT_S * 10 )) i
   for i in $(seq 1 "$n"); do
     if sx_read_record "$LC_OUT/server.sess"; then
-      if [ "$SX_PID" = "$LC_SPID" ] && [ "$SX_SID" = "$SX_PID" ] && [ "$SX_PGRP" = "$SX_PID" ] && sx_guard "$SX_SID"; then LC_SID=$SX_SID; return 0; fi
+      if [ "$SX_PID" = "$LC_SPID" ] && [ "$SX_SID" = "$SX_PID" ] && [ "$SX_PGRP" = "$SX_PID" ] && sx_guard "$SX_SID"; then
+        # keep the accepted tuple in memory: lc_stop falls back to it when the record file is removed later
+        LC_SID=$SX_SID; LC_REC="$SX_PID $SX_SID $SX_PGRP $SX_START${SX_BOOT:+ $SX_BOOT}"; return 0
+      fi
       LC_ODD_PID=$SX_PID
       return 2
     fi
@@ -256,13 +259,15 @@ lc_kill_pid() {
 }
 
 # lc_stop: TERM the recorded server session, then KILL it and its leftovers (never a pattern kill). Only the session in $LC_OUT/server.sess is signalled, and only when
-# its leader is the recorded pid with the recorded start time and the session does not contain this launcher or its parent (launch/session.sh); without a usable
-# record only the pid we started is signalled.
+# its leader is the recorded pid with the recorded start time and the session does not contain this launcher or its parent (launch/session.sh); when the record file is
+# gone or unreadable the tuple the launcher accepted (LC_REC) takes its place and passes the same guards. Without any accepted session only the pid we started is
+# signalled. STOPPED is logged only when the stop ended clean; a refusal or a leaderless session with members that are not provably ours logs NOT_STOPPED (the
+# server may still run), and either way the EXIT trap does not stop a second time.
 lc_stop() {
   [ -n "${LC_SPID:-}" ] || return 0
-  local msg
+  local msg src=0
   if [ -n "${LC_SID:-}" ]; then
-    msg=$(sx_stop "$LC_OUT/server.sess" "$LC_STOP_ITERS" "$LC_STOP_POLL_S")
+    msg=$(sx_stop "$LC_OUT/server.sess" "$LC_STOP_ITERS" "$LC_STOP_POLL_S" "${LC_REC:-}"); src=$?
     [ -n "$msg" ] && lc_log "STOP $(echo "$msg" | tr '\n' '|')"
   else
     lc_kill_pid "$LC_SPID"
@@ -270,8 +275,12 @@ lc_stop() {
     lc_log "STOP no usable session record: signalled pid $LC_SPID only (no session or group)"
   fi
   LC_STOPPED=1
-  lc_gpus_free 90 || lc_log "WARN GPU memory still in use after the stop"
-  lc_log "STOPPED gpu_used_mib=$(lc_gpus_used 2> /dev/null)"
+  if [ $src = 0 ]; then
+    lc_gpus_free 90 || lc_log "WARN GPU memory still in use after the stop"
+    lc_log "STOPPED gpu_used_mib=$(lc_gpus_used 2> /dev/null)"
+  else
+    lc_log "NOT_STOPPED rc=$src: nothing (or not everything) was signalled, the server session $LC_SID (pid $LC_SPID) may still be running; stop it by hand. gpu_used_mib=$(lc_gpus_used 2> /dev/null)"
+  fi
 }
 
 lc_on_exit() {

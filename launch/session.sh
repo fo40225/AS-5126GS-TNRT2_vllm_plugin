@@ -43,15 +43,27 @@ sx_guard() {
   return 0
 }
 
-# sx_read_record <file>: SX_PID SX_SID SX_PGRP SX_START and the optional SX_BOOT (boot_id) from a complete record; rc 1 when missing or malformed
-sx_read_record() {
-  local extra
-  SX_PID=; SX_SID=; SX_PGRP=; SX_START=; SX_BOOT=
-  [ -r "$1" ] || return 1
-  read -r SX_PID SX_SID SX_PGRP SX_START SX_BOOT extra < "$1" || true
+# sx_record_ok: validates the SX_* variables just set by sx_read_record / sx_parse_record (all four numbers present, a plain boot id, no extra field)
+sx_record_ok() {
   case "$SX_PID$SX_SID$SX_PGRP$SX_START" in ""|*[!0-9]*) return 1 ;; esac
   case "$SX_BOOT" in *[!0-9a-f-]*) return 1 ;; esac
-  [ -n "$SX_PID" ] && [ -n "$SX_SID" ] && [ -n "$SX_PGRP" ] && [ -n "$SX_START" ] && [ -z "$extra" ]
+  [ -n "$SX_PID" ] && [ -n "$SX_SID" ] && [ -n "$SX_PGRP" ] && [ -n "$SX_START" ] && [ -z "$SX_EXTRA" ]
+}
+
+# sx_read_record <file>: SX_PID SX_SID SX_PGRP SX_START and the optional SX_BOOT (boot_id) from a complete record; rc 1 when missing or malformed
+sx_read_record() {
+  SX_PID=; SX_SID=; SX_PGRP=; SX_START=; SX_BOOT=; SX_EXTRA=
+  [ -r "$1" ] || return 1
+  read -r SX_PID SX_SID SX_PGRP SX_START SX_BOOT SX_EXTRA < "$1" || true
+  sx_record_ok
+}
+
+# sx_parse_record <text>: the same as sx_read_record for a record held in memory (the launcher keeps the tuple it accepted)
+sx_parse_record() {
+  SX_PID=; SX_SID=; SX_PGRP=; SX_START=; SX_BOOT=; SX_EXTRA=
+  [ -n "$1" ] || return 1
+  read -r SX_PID SX_SID SX_PGRP SX_START SX_BOOT SX_EXTRA <<< "$1" || true
+  sx_record_ok
 }
 
 # sx_members <sid>: the live (non-zombie) pids of the session / group, minus this script's pid and its parent's
@@ -71,14 +83,25 @@ sx_own_members() {
   done
 }
 
-# sx_stop <record> <term wait iterations> <poll seconds>: stops the recorded server session. Prints what it did.
+# sx_stop <record> <term wait iterations> <poll seconds> [<accepted record text>]: stops the recorded server session. Prints what it did.
 #   rc 0 stopped (or nothing left), 2 no valid record, 3 refused to signal (leader mismatch, a session that contains the caller, or members of a
 #   leaderless session that cannot be shown to belong to the server: they are listed and left running).
 #   Leader alive: TERM to the group, wait for the leader, KILL to the group, KILL of the leftovers. Leader gone: only the provably own members
 #   (sx_own_members) are signalled, one by one.
+#   The launcher passes the tuple it accepted (the record text); it is used when <record> is gone or unreadable, and goes through the same guards.
 sx_stop() {
-  local rec=$1 iters=$2 poll=$3 f ppid pg sd st l i own foreign out rc=0
-  sx_read_record "$rec" || { echo "no valid session record $rec"; return 2; }
+  local rec=$1 iters=$2 poll=$3 mem=${4:-} src=file
+  if ! sx_read_record "$rec"; then
+    if [ -n "$mem" ] && sx_parse_record "$mem"; then src=memory
+    else echo "no valid session record $rec"; return 2; fi
+  fi
+  sx_stop_tuple "$(dirname "$(readlink -m "$rec")")" "$iters" "$poll" "$src"
+}
+
+# sx_stop_tuple <out dir> <term wait iterations> <poll seconds> <source label>: the core of sx_stop, on the SX_* variables set by the caller
+sx_stop_tuple() {
+  local out=$1 iters=$2 poll=$3 src=$4 f ppid pg sd st l i own foreign rc=0
+  [ "$src" = memory ] && echo "session record gone or unreadable: using the tuple the launcher accepted ($SX_PID $SX_SID $SX_PGRP $SX_START)"
   sx_guard "$SX_SID" || { echo "REFUSED session $SX_SID contains this script (pid $$) or its parent ($PPID), or is not a plain id: nothing signalled"; return 3; }
   if f=$(sx_proc "$SX_PID"); then
     read -r ppid pg sd st <<< "$f"
@@ -95,7 +118,6 @@ sx_stop() {
     l=$(sx_members "$SX_SID")
     if [ -n "$l" ]; then kill -KILL $l 2> /dev/null; echo "KILLED leftovers of the session: $(echo $l)"; fi
   else
-    out=$(dirname "$(readlink -f "$rec")")
     own=$(sx_own_members "$SX_SID" "$out" "$SX_START" "$SX_BOOT")
     if [ -n "$own" ]; then
       kill -TERM $own 2> /dev/null

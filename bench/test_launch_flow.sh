@@ -376,5 +376,41 @@ bash "$here/launch/stop_server.sh" "$d/notvllm" > /dev/null 2>&1; rc=$?
 if [ $rc = 2 ] && kill -0 "$spid" 2> /dev/null; then pass "stop_server.sh does not touch a pid that is not a vllm process"; else bad "stop_server.sh on a foreign pid" "rc=$rc"; fi
 kill "$spid" 2> /dev/null
 
+# ---- review p2 r2 F1: the stop path with a missing or tampered session record. The launcher keeps the tuple it accepted: when server.sess is gone it signals that session (the same
+# guards apply); when the record disagrees with the leader the stop is refused and the log must not say STOPPED.
+freeport() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+f1_launch() { # <name>: starts a hanging stub launch in the background; sets f1pid (the launcher, from this subshell's exec) and waits for the LAUNCHED line with the session
+  local name=$1 p; p=$(freeport)
+  rm -rf "${d:?}/$name" "${d:?}/$name.rc"
+  (exec env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$p \
+    MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$p STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/$name" > "$d/$name.stdout" 2>&1) &
+  f1pid=$!
+  for _ in $(seq 1 100); do grep -q -a 'LAUNCHED pid=.* sid=' "$d/$name/status.txt" 2> /dev/null && break; sleep 0.1; done
+  grep -q -a 'LAUNCHED pid=.* sid=' "$d/$name/status.txt" 2> /dev/null
+}
+# 1. the record file is removed after the launcher accepted it; a TERM to the launcher must still stop the server
+if f1_launch f1_gone; then
+  f1srv=$(cat "$d/f1_gone/serve.pid")
+  rm -f "$d/f1_gone/server.sess"
+  kill -TERM "$f1pid"; wait "$f1pid"; rc=$?
+  if [ $rc = 3 ] && ! kill -0 "$f1srv" 2> /dev/null && grep -q -a 'using the tuple the launcher accepted' "$d/f1_gone/status.txt" && grep -q -a 'STOPPED gpu_used_mib' "$d/f1_gone/status.txt" \
+     && ! grep -q -a 'NOT_STOPPED' "$d/f1_gone/status.txt"; then pass "F1: server.sess removed after the launch was accepted: a TERM still stops the server from the accepted tuple (exit 3, STOPPED)"
+  else bad "F1: record removed, TERM to the launcher" "rc=$rc server alive=$(kill -0 "$f1srv" 2> /dev/null && echo yes || echo no) $(grep -a -E 'SIGNAL|STOP|RESULT' "$d/f1_gone/status.txt" | tr '\n' '|' | cut -c1-400)"; kill "$f1srv" 2> /dev/null; fi
+else bad "F1 setup (record removed)" "no LAUNCHED line"; kill "$f1pid" 2> /dev/null; fi
+# 2. the record is rewritten with another start time (a stale / forged record): the stop is refused, nothing is signalled and the log must not claim STOPPED
+if f1_launch f1_forged; then
+  f1srv=$(cat "$d/f1_forged/serve.pid")
+  cp "$d/f1_forged/server.sess" "$d/f1_forged.sess.good"
+  read -r a1 a2 a3 a4 a5 < "$d/f1_forged/server.sess"
+  echo "$a1 $a2 $a3 $((a4 + 1)) $a5" > "$d/f1_forged/server.sess"
+  kill -TERM "$f1pid"; wait "$f1pid"; rc=$?
+  if [ $rc = 3 ] && kill -0 "$f1srv" 2> /dev/null && grep -q -a 'not the recorded session leader' "$d/f1_forged/status.txt" && grep -q -a 'NOT_STOPPED' "$d/f1_forged/status.txt" \
+     && ! grep -q -a 'STOPPED gpu_used_mib' "$d/f1_forged/status.txt"; then pass "F1: a record that disagrees with the leader: the stop is refused, the log says NOT_STOPPED and not STOPPED, the server was not signalled (exit 3)"
+  else bad "F1: forged record, TERM to the launcher" "rc=$rc server alive=$(kill -0 "$f1srv" 2> /dev/null && echo yes || echo no) $(grep -a -E 'SIGNAL|STOP|RESULT' "$d/f1_forged/status.txt" | tr '\n' '|' | cut -c1-400)"; fi
+  cp "$d/f1_forged.sess.good" "$d/f1_forged/server.sess"
+  bash "$here/launch/stop_server.sh" "$d/f1_forged" > /dev/null 2>&1
+  kill -0 "$f1srv" 2> /dev/null && kill "$f1srv" 2> /dev/null
+else bad "F1 setup (forged record)" "no LAUNCHED line"; kill "$f1pid" 2> /dev/null; fi
+
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))
