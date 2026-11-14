@@ -150,9 +150,12 @@ if [ "$got" = "136 unset" ]; then echo "ok   spec_k7.env: a re-source with the f
 got=$(env -i PATH="$PATH" VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=264 MUSE_SPEC_GRAPH_SP_MIN_TOKENS=0 bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset}" 2>&1)
 if [ "$got" = "unset" ]; then echo "ok   spec_k7.env: a stray vLLM variable does not survive the profile at flag 0"; else echo "FAIL spec_k7.env stray variable: got '$got'"; fails=$((fails+1)); fi
 # the adopted default (S1-9 L11 gate): the profile arms the graph floor 136 on the production capture list, bytes unchanged
+# S1-10R adoption: spec_k7.env sources env/offload.env (offload ON by default, bytes 11,645,337,600); MUSE_OFFLOAD=0 is the pre-adoption launch with the 0.33.0 no-tier bytes
 got=$(env -i PATH="$PATH" bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset} \$MUSE_SPEC_GRAPH_CAP \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
-if [ "$got" = "136 256 11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192" ]; then echo "ok   spec_k7.env: the default profile is A1a (graph floor 136, cap 256, mnst 8192, production bytes of the 0.33.0 line)"; else echo "FAIL spec_k7.env default profile: got '$got'"; fails=$((fails+1)); fi
-got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=0 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
+if [ "$got" = "136 256 11645337600 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192" ]; then echo "ok   spec_k7.env: the default profile is A1a (graph floor 136, cap 256, mnst 8192) with the offload-on bytes"; else echo "FAIL spec_k7.env default profile: got '$got'"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" MUSE_OFFLOAD=0 bash -c "source $here/env/spec_k7.env; echo \${VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS:-unset} \$MUSE_SPEC_GRAPH_CAP \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
+if [ "$got" = "136 256 11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192" ]; then echo "ok   spec_k7.env: MUSE_OFFLOAD=0 is the pre-adoption profile (production bytes of the 0.33.0 line)"; else echo "FAIL spec_k7.env MUSE_OFFLOAD=0 profile: got '$got'"; fails=$((fails+1)); fi
+got=$(env -i PATH="$PATH" MUSE_OFFLOAD=0 MUSE_SPEC_MNST=0 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
 if [ "$got" = "11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=0 drops the flag, profile bytes are not coupled to MUSE_SPEC_MNST"; else echo "FAIL spec_k7.env MNST=0: got '$got'"; fails=$((fails+1)); fi
 got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=off bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_MNST \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
 if [ "$got" = "0 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=off is normalised to 0"; else echo "FAIL spec_k7.env MNST=off: got '$got'"; fails=$((fails+1)); fi
@@ -160,7 +163,7 @@ for v in 8k -5 9000; do
   got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=$v bash -c "source $here/env/spec_k7.env && echo sourced" 2>&1)
   case "$got" in *"MUSE_SPEC_MNST"*) if echo "$got" | grep -q sourced; then echo "FAIL spec_k7.env MNST=$v was accepted: $got"; fails=$((fails+1)); else echo "ok   spec_k7.env: MUSE_SPEC_MNST=$v is rejected"; fi ;; *) echo "FAIL spec_k7.env MNST=$v: got '$got'"; fails=$((fails+1)) ;; esac
 done
-got=$(env -i PATH="$PATH" MUSE_SPEC_MNST=4096 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
+got=$(env -i PATH="$PATH" MUSE_OFFLOAD=0 MUSE_SPEC_MNST=4096 bash -c "source $here/env/spec_k7.env; echo \$MUSE_SPEC_KV_BYTES \"\$MUSE_SPEC_SERVE_ARGS\"" 2>&1)
 if [ "$got" = "11720212480 --max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 4096" ]; then echo "ok   spec_k7.env: MUSE_SPEC_MNST=4096 overrides the cap, profile bytes are not coupled to MUSE_SPEC_MNST"; else echo "FAIL spec_k7.env MNST=4096: got '$got'"; fails=$((fails+1)); fi
 # S1-10R Phase 0: the fused boundary state comes from an env.txt snapshot next to the log (the model logs nothing about it)
 fbenv() { mkdir -p "$d/$1"; cp "$d/prod/serve.log" "$d/prod/serve_cmd.txt" "$d/$1/"; printf '%s\n' "${@:2}" > "$d/$1/env.txt"; }

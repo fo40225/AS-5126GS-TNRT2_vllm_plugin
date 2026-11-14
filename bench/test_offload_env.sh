@@ -32,8 +32,9 @@ t "MUSE_OFFLOAD=0 keeps an operator MUSE_SPEC_KV_BYTES_OVERRIDE (cap 384 launche
   'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520 MUSE_OFFLOAD=0; source $E/offload.env; MUSE_SPEC_GRAPH_CAP=384 source $E/spec_k7.env; echo "${MUSE_SPEC_KV_BYTES_OVERRIDE:-} $MUSE_SPEC_KV_BYTES"'
 t "tier on discards an operator MUSE_SPEC_KV_BYTES_OVERRIDE (the bytes are an offload property)" "$SPEC" \
   'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520; source $E/offload.env; echo $MUSE_SPEC_KV_BYTES_OVERRIDE'
-t "MUSE_OFFLOAD_KV_BYTES_OVERRIDE replaces the offload bytes everywhere" "11346000000 11346000000 11346000000" \
-  'MUSE_OFFLOAD_KV_BYTES_OVERRIDE=11346000000 source $E/offload.env; source $E/spec_k7.env; echo "$MUSE_OFFLOAD_KV_BYTES $MUSE_SPEC_KV_BYTES_OVERRIDE $MUSE_SPEC_KV_BYTES"'
+# S1-10R adoption: spec_k7.env sources offload.env itself and re-derives everything, so the operator input must be EXPORTED before spec_k7.env (a one-shot prefix on an earlier source is not carried over)
+t "MUSE_OFFLOAD_KV_BYTES_OVERRIDE (exported) replaces the offload bytes everywhere" "11346000000 11346000000 11346000000" \
+  'export MUSE_OFFLOAD_KV_BYTES_OVERRIDE=11346000000; source $E/offload.env; source $E/spec_k7.env; echo "$MUSE_OFFLOAD_KV_BYTES $MUSE_SPEC_KV_BYTES_OVERRIDE $MUSE_SPEC_KV_BYTES"'
 t "numa bind off: no --numa-bind, connector kept" "0 1" \
   'MUSE_OFFLOAD_NUMA_BIND=0 source $E/offload.env; echo "$(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c -- "--numa-bind") $(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c SimpleCPUOffloadConnector)"'
 t "per-rank bytes override reaches the JSON (a multiple of the block lcm stays the caller's duty)" "1" \
@@ -46,7 +47,57 @@ t "ns128 with an explicit MUSE_OFFLOAD_KV_BYTES_OVERRIDE replaces the bytes" "rc
   'MUSE_OFFLOAD_PROFILE=ns128 MUSE_OFFLOAD_KV_BYTES_OVERRIDE=17000000000 source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD kv=$MUSE_OFFLOAD_KV_BYTES bpb=$MUSE_OFFLOAD_BPB"'
 t "ns128 with the tier off (the OFF arm of the stress / gate boots)" "rc=0 off=0 err=[]" \
   'export MUSE_OFFLOAD=0 MUSE_OFFLOAD_PROFILE=ns128; source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD err=[${MUSE_OFFLOAD_ERROR:-}]"'
-t "host.env + spec_k7.env alone: offload not enabled" "[] 11720212480" \
-  'source $E/host.env; source $E/spec_k7.env; echo "[${MUSE_OFFLOAD_SERVE_ARGS:-}] $MUSE_SPEC_KV_BYTES"'
+t "MUSE_OFFLOAD=0 with host.env + spec_k7.env alone: offload not enabled, the pre-adoption bytes" "[] 11720212480 0" \
+  'export MUSE_OFFLOAD=0; source $E/host.env; source $E/spec_k7.env; echo "[${MUSE_OFFLOAD_SERVE_ARGS:-}] $MUSE_SPEC_KV_BYTES $MUSE_OFFLOAD"'
+# ---- S1-10R adoption (A1 / A2 / A3): env/spec_k7.env sources env/offload.env for the speculative profile
+GATED='--max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 11645337600 --numa-bind --kv-transfer-config {"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":414512578560,"cpu_bytes_to_use_per_rank":51814072320}}'
+LINE='echo "$MUSE_SPEC_SERVE_ARGS --kv-cache-memory-bytes $MUSE_SPEC_KV_BYTES $MUSE_OFFLOAD_SERVE_ARGS"'
+t "A2: the documented production line equals the gated serve_extra.txt of s110r_fulltier_spec_a5 byte for byte" "$GATED" \
+  "source \$E/host.env; source \$E/spec_k7.env; $LINE"
+t "A2: the documented line after the gate's explicit offload.env source is the same string" "$GATED" \
+  "source \$E/host.env; source \$E/offload.env; source \$E/spec_k7.env; $LINE"
+t "A2: MUSE_OFFLOAD=0, the same line is the pre-adoption launch (no connector, no --numa-bind, 11,720,212,480 B)" "--max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192 --kv-cache-memory-bytes 11720212480" \
+  "export MUSE_OFFLOAD=0; source \$E/host.env; source \$E/spec_k7.env; echo \$($LINE)"
+t "A1: spec_k7.env alone defaults to offload ON: flag, profile, bytes, override" "1 spec 11645337600 11645337600" \
+  'source $E/spec_k7.env; echo "$MUSE_OFFLOAD $MUSE_OFFLOAD_PROFILE $MUSE_SPEC_KV_BYTES $MUSE_SPEC_KV_BYTES_OVERRIDE"'
+t "A1: a shell that exports MUSE_OFFLOAD_PROFILE=ns256 still gets the spec profile (forced for that source)" "spec 20480 11645337600 11645337600" \
+  'export MUSE_OFFLOAD_PROFILE=ns256; source $E/offload.env; source $E/spec_k7.env; echo "$MUSE_OFFLOAD_PROFILE $MUSE_OFFLOAD_BPB $MUSE_OFFLOAD_KV_BYTES $MUSE_SPEC_KV_BYTES"'
+t "A1: ns256 sourced first (serve args, override), then spec_k7.env: spec bytes and args" "$GATED" \
+  "MUSE_OFFLOAD_PROFILE=ns256 source \$E/offload.env; source \$E/spec_k7.env; $LINE"
+t "A1: sourced twice in one shell: same result" "$GATED" \
+  "source \$E/spec_k7.env; source \$E/spec_k7.env; $LINE"
+t "A1: sourced from another directory with a relative path (BASH_SOURCE, no cwd dependence)" "11645337600" \
+  'cd "$E" && cd .. && source env/spec_k7.env; echo $MUSE_SPEC_KV_BYTES'
+t "A1: no helper variable is left behind: the shell variables after spec_k7.env equal those of the gated order" "same" \
+  'a=$(source $E/offload.env; source $E/spec_k7.env; compgen -v | grep -v -x -E "a|b" | sort | md5sum); b=$(source $E/spec_k7.env; compgen -v | grep -v -x -E "a|b" | sort | md5sum); [ "$a" = "$b" ] && echo same || echo differ'
+t "A1: an exported MUSE_OFFLOAD_KV_BYTES_OVERRIDE reaches the bytes through the nested source" "11346000000" \
+  'export MUSE_OFFLOAD_KV_BYTES_OVERRIDE=11346000000; source $E/spec_k7.env; echo $MUSE_SPEC_KV_BYTES'
+t "A1: a one-shot prefix on an EARLIER offload.env source is not carried over (inputs must be exported)" "11645337600" \
+  'MUSE_OFFLOAD_KV_BYTES_OVERRIDE=11346000000 source $E/offload.env; source $E/spec_k7.env; echo $MUSE_SPEC_KV_BYTES'
+t "A1: MUSE_OFFLOAD=2 is an error (rc 1), nothing is derived" "rc=1" \
+  'export MUSE_OFFLOAD=2; source $E/spec_k7.env 2>/dev/null; echo "rc=$?"'
+t "A1: MUSE_OFFLOAD= (empty) is the default ON" "1 11645337600" \
+  'export MUSE_OFFLOAD=; source $E/spec_k7.env; echo "$MUSE_OFFLOAD $MUSE_SPEC_KV_BYTES"'
+t "A1: MUSE_OFFLOAD=0 sources nothing of offload.env: no MUSE_OFFLOAD_* variable but the switch itself is exported" "MUSE_OFFLOAD" \
+  'export MUSE_OFFLOAD=0; source $E/host.env; source $E/spec_k7.env; export -p | grep -o -E "MUSE_OFFLOAD[A-Z_]*" | sort -u | tr "\n" " " | sed "s/ *$//"'
+t "A1: MUSE_OFFLOAD=0 after an ON source in the same shell drops the serve args and the override (stale state)" "off=0 args=[] ov=[] kv=11720212480" \
+  'source $E/spec_k7.env; export MUSE_OFFLOAD=0; source $E/spec_k7.env; echo "off=$MUSE_OFFLOAD args=[$MUSE_OFFLOAD_SERVE_ARGS] ov=[${MUSE_SPEC_KV_BYTES_OVERRIDE:-}] kv=$MUSE_SPEC_KV_BYTES"'
+t "A1: MUSE_OFFLOAD=0 keeps an operator MUSE_SPEC_KV_BYTES_OVERRIDE without offload.env (cap 384 launches)" "11346923520 11346923520" \
+  'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520 MUSE_OFFLOAD=0; MUSE_SPEC_GRAPH_CAP=384 source $E/spec_k7.env; echo "${MUSE_SPEC_KV_BYTES_OVERRIDE:-} $MUSE_SPEC_KV_BYTES"'
+# A3 literal proofs: every exported variable (export -p, sorted) of the default launch equals the gated order's; the OFF launch equals main 942acddc48's
+exps() { env -i PATH="$PATH" "${@:2}" bash -c "$1" 2>/dev/null | sort; }
+if [ "$(exps "source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "source $here/env/host.env; source $here/env/offload.env; source $here/env/spec_k7.env; export -p")" ]; then
+  echo "ok   A3: every exported variable of host.env + spec_k7.env (default) equals the gated host.env + offload.env + spec_k7.env"
+else echo "FAIL A3: default and gated exports differ"; fails=$((fails+1)); fi
+if [ "$(exps "export MUSE_OFFLOAD_PROFILE=ns256; source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "source $here/env/host.env; source $here/env/offload.env; source $here/env/spec_k7.env; export -p")" ]; then
+  echo "ok   A3: same with a shell that exports MUSE_OFFLOAD_PROFILE=ns256"
+else echo "FAIL A3: ns256 shell and gated exports differ"; fails=$((fails+1)); fi
+mt=$(mktemp -d)
+if git -C "$here" cat-file -e 942acddc48^{commit} 2>/dev/null && git -C "$here" archive 942acddc48 env | tar -x -C "$mt"; then
+  if [ "$(exps "export MUSE_OFFLOAD=0; source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "export MUSE_OFFLOAD=0; source $mt/env/host.env; source $mt/env/spec_k7.env; export -p")" ]; then
+    echo "ok   A3: MUSE_OFFLOAD=0 exports exactly what main 942acddc48 exports (host.env + spec_k7.env)"
+  else echo "FAIL A3: MUSE_OFFLOAD=0 exports differ from main 942acddc48"; fails=$((fails+1)); fi
+else echo "skip A3: main 942acddc48 not available in this checkout (the proof is recorded in muse_wf/s1-10r/adoption_impl.json)"; fi
+rm -rf "$mt"
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))
