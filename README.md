@@ -1,4 +1,4 @@
-# host_as5126_topology
+# AS-5126GS-TNRT2_vllm_plugin
 
 針對 **10.19.209.74（Supermicro AS-5126GS-TNRT2，8x NVIDIA RTX PRO 6000 Blackwell Server）** 這台主機的 PCIe / NUMA 拓樸所做的最佳化，
 用來加速 `unsloth/Muse-Spark-Open-816B-A42B-NVFP4`（vLLM branch `sm120-muse-spark-open`，v0.32.0 + Muse Spark backport，
@@ -7,7 +7,7 @@ TP8 + EP8）的推論。
 這個資料夾只放「只對這台機器的拓樸才有意義」的東西：topology-specialized 的 P2P collectives（`muse_topo` 套件與 vLLM plugin）、NCCL 環境變數與
 graph file、啟動 / 驗證 script 與量測文件。與機器無關的通用 SM120 最佳化則是 vLLM branch 裡的 git commits，不在這裡。
 
-本資料夾是 deliverable，**本機的 `/home/user/trivial/host_as5126_topology/` 是 source of truth**；伺服器上的
+本資料夾是 deliverable，**本機的 `/home/user/trivial/AS-5126GS-TNRT2_vllm_plugin/` 是 source of truth**；伺服器上的
 `/raid/vllm-runtime/host_topo/` 只是用 `scripts/deploy_host.sh` rsync 出去的 mirror。
 
 ## 1. 摘要
@@ -40,7 +40,7 @@ graph file、啟動 / 驗證 script 與量測文件。與機器無關的通用 S
 ## 3. 資料夾內容
 
 ```
-host_as5126_topology/
+AS-5126GS-TNRT2_vllm_plugin/
 ├── README.md                    本檔
 ├── muse_topo/                   Python 套件（JIT 編譯的 CUDA extension + vLLM plugin）
 │   ├── __init__.py              對外 API：TopoComm、TopoUnavailable
@@ -102,7 +102,7 @@ host_as5126_topology/
 ### 4.1 部署到伺服器
 
 ```bash
-cd /home/user/trivial/host_as5126_topology
+cd /home/user/trivial/AS-5126GS-TNRT2_vllm_plugin
 scripts/deploy_host.sh        # rsync -a --delete 到 user@10.19.209.74:/raid/vllm-runtime/host_topo/（排除 __pycache__、*.pyc、.git、build）
 # 試驗用：DEST=<server dir> FROM=<local dir> scripts/deploy_host.sh
 ```
