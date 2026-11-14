@@ -54,6 +54,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 ├── muse_topo-0.1.dist-info/     entry_points.txt：[vllm.general_plugins] muse_topo = muse_topo.vllm_plugin:register
 │                                （放在 PYTHONPATH 上就會被 vLLM 找到，不需要 pip install）
 ├── env/host.env                 主機環境變數：NCCL_P2P_LEVEL=SYS、MUSE_TOPO_ENABLE=1、bf16 exchange 與 NCCL graph file（2026-10-24 起預設 ON），其他選項以註解列出
+├── env/spec_k7.env              speculative decoding（RadixArk DFlash2 K=7）專用的 launch profile：`--max-cudagraph-capture-size 256` 搭配 `VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384`（只在 host.env 之後 source，見 `docs/s19_spec_launch.md`）
 ├── scripts/
 │   ├── deploy_host.sh           本機 -> 伺服器 mirror 的 rsync（只同步本資料夾）
 │   ├── run_src_topo.sh          /raid/vllm-runtime/musetest/run_src.sh 的副本：把本資料夾加進 PYTHONPATH、source env/host.env，
@@ -65,6 +66,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── run_h1a.sh               小訊息演算法的驗證序列（steps：smoke tests bench_* topology unit ...）
 │   ├── run_h2.sh                vLLM plugin 的驗證序列（steps：plugin e2e_* compare ops bench* real_* ...）
 │   ├── prefill_chain.sh         一次 lock 內依序啟動多組 server 設定、量單一 request 的 prefill latency（microbatched prefill 的 A/B；搭配 bench/prefill_probe.py）
+│   ├── check_spec_launch.sh     由 serve log 確認 speculative launch profile 有生效（SP floor 384、graph 上限 256；不符就 exit 1）
 │   ├── run_r3c.sh               medium all-reduce（r3c）的驗證 / 量測步驟（steps：medium_test h1a_quick h1b_quick bench_* ...）
 │   ├── r3c_chain.sh             r3c 在一次 GPU lock 內的完整序列：測試、sweep、產生 table、dispatch 檢查、real-weight concurrency A/B、GSM8K smoke
 │   └── conc_sweep.sh            real weights、單一 server session 的 concurrency sweep（random 512/128，可重複；r2 sweep script 的參數化副本）
@@ -421,6 +423,7 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 
 * 實測拓樸與瓶頸：`docs/topology.md`；演算法與 API：`docs/h1a_collectives.md`、`docs/h1b_collectives.md`；latency 表：`docs/h1a_latency.md`、`docs/h1b_latency.md`；
   plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；pooler / unpooler GEMV 與 all-gather 融合：`docs/r3b_gemv_push.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
+  speculative launch 的 graph 上限 / sequence-parallel floor 組合（S1-9）：`docs/s19_spec_launch.md`。
 * 伺服器上的資料（不在本資料夾）：benchmark 結果 `/raid/vllm-runtime/musetest/results/<tag>/`；測試 / benchmark 的 log 與 jsonl `/raid/vllm-runtime/work/host/`；
   JIT cache `/raid/vllm-runtime/sm120-dev/vllm_cache/muse_topo/`；拓樸量測 script 與原始結果 `/raid/vllm-runtime/musetest/topo/`；NCCL 量測 `/raid/vllm-runtime/musetest/nccl/`。
 * 歷史：H1a（小訊息演算法）、H1b（large-message 演算法）、H2 / H2b（vLLM plugin）、review fixes（64-bit counter / flags、supports() 與 kernel 一致、fp16 的 bf16 exchange 溢位、對齊與 stream 規則，2026-10-24）、H3（本資料夾的定稿）。
