@@ -113,6 +113,15 @@ form (calls per step per site).
 | prefill4096 (r2e half) | QKV-in AG | (512, 8192) 8 MiB | 124 | AGL (4611686018427387904, 524288, 8, 1024, 1) | unchanged |
 | prefill4096 (r2e half) | packed-latent AG | (512, 2304) 1.12 MiB | 120 | AGL (4611686018427387904, 524288, 8, 1024, 1) | unchanged |
 
+### 3.1 Slab-path shapes beyond the band table
+
+The slab path (8 MiB < bytes <= 64 MiB) is reached by far more shapes than the c96 / c128 draft all-reduce of the table above. The round-5 op log (distinct shapes only) holds about 405 distinct
+`[T, 8192]` bf16 all-reduce shapes in that range, at odd T from 513 to 4096: the remainder chunks of chunked prefill and the mixed prefill + decode steps (embedding all-reduce and the draft rows
+of the same step). Examples: `[519, 8192]` 8.1 MiB (3 slabs of 173 rows), `[1001, 8192]` 15.6 MiB (4 slabs of 251 / 251 / 251 / 248), `[2049, 8192]` 32 MiB (9 slabs of 228 / 225); `[4096, 8192]` = exactly 64 MiB sits at
+the cap (16 slabs of 256 rows; one row more, `[4097, 8192]`, stays on the large algorithm). The rows of 16 KiB make every row count a whole number of 64-byte packs, so slab boundaries are free
+and the arithmetic per element does not depend on them (rows are independent); the review asked for the uneven splits to be checked on 8 GPUs, and `bench/test_a1_tables.py` now does (section 7).
+The calls per step of these shapes are not counted in the band tables of this section.
+
 ## 4. Method and the bitwise proof
 
 * `bench/bench_a1_tables.py` (8 processes, one per GPU, TopoComm with the bf16 exchange, both islands run; the headline is the max over ranks, island means are
@@ -133,7 +142,7 @@ form (calls per step per site).
 * **Confirmation through the dispatch path** (`--mode dispatch`, the code the plugin calls): host main a7e7a03 and the new tree measured in interleaved launches
   (before, after, before, after; 3 rounds each), with a SHA-256 of the output of every rank for the four data kinds. Result: every size of the table below
   has **identical digests before and after on all ranks and all kinds** (bitwise identical outputs) and equals the torch emulation of the contract.
-  One more confirmation pair on the final tree (after reverting the two rows of 5.4) is in section 7.
+  One more confirmation pair on the final tree (after reverting the two rows of 5.4) is in section 7; the sizes just above `max_bytes` (target group `arm`: 520, 600, 700, 1001, 2049 rows) were added after the review (5.3).
 
 Both islands ({0..3}, {4..7}) are timed: the collectives run in lock step across the cut, and the island means of every changed cell agree within 0.1 us
 (e.g. 4 MiB reduce-scatter warm 115.3 -> 88.1 us on both islands, 16 MiB all-reduce 740.8 / 740.9 -> 655.8 / 655.8), so the tables below use the max over ranks.
@@ -192,7 +201,14 @@ MoE-out and attn-out all-reduces) passed the sweep rule (cold -4.4 / -9.0 us) bu
 trial rows were reverted: the cold gain is a cold-start effect that costs steady-state spacing (cold: -3.2 / -5.1 us, memset-cold -10.9 / -25.8 us, spacer +2.4 / +5.7 us).
 Row chunking of a medium all-reduce (n sub-calls) never won below 8 MiB under the pre-registered rule: measured with `--force`, 4 MiB as 4 x 1 MiB is warm +7.0 / spacer +7.4 / cold -3.4 /
 memset-cold -14.3 us against the single call (2 x 2 MiB: +3.1 / +3.2 / +3.9 / -0.4), 2 MiB as 4 x 512 KiB +6.1 / +6.7 / +0.8 / -3.2 (2 x 1 MiB +1.4 / +1.8 / -2.1 / -11.0): it only wins when the
-whole call is cold (the L8 protocol); a collective in the middle of a layer chain is not cold in that sense.
+whole call is cold (the L8 protocol); a collective in the middle of a layer chain is not cold in that sense. The harness-to-harness gap on the same 4 MiB call (memset-cold 176.2 us in section 2,
+184.3 us in the dispatch table above) is about 8 us, larger than the effects at 1.5 / 2 MiB, and which protocol matches an all-reduce behind an O-projection GEMM that left its output hot in L2 is
+undecided: the four-1-MiB lever of L8 is therefore not adopted here and not gated as an arm (it would need its own forced 4 x 1 MiB A/B at c32; it belongs to the R2 work, not to a table row).
+
+The 1.5 / 2 MiB rows (the c16 attn-out and c32 MoE-out all-reduces, and the draft all-reduces) are worth at most 0.1 ms per step (0.1 .. 0.2 %): warm -1.1 .. -1.7 us and spacer -0.2 .. -0.8 us in the first pair, inside the
+pair-to-pair drift of the unchanged controls (-1.5 .. -2.1 us warm at 5 .. 8 MiB, -1.0 .. -1.8 us spacer at 64 .. 512 KiB); only the cold protocols (-3.4 .. -4.9 us, about 5 %) exceed it. In the graph bands (T <= 256) the host
+plugin's L2 weight prefetch (`AFTER_EXPERTS_CTAS=8`) runs on a side stream beside the MoE-out all-reduce, which the microbench does not model. The rows are kept only if the model A/B shows no regression at c16 / c32 (section 8: STEADY c16 and
+c32 must not be worse than +0.3 % beyond noise); the revert is two table rows.
 
 ### 5.3 all_reduce above `max_bytes`: 2bx slabs
 
@@ -201,9 +217,16 @@ With the bf16 exchange algorithm 2 (island partials exchanged once) beats the la
 slabs, each through `_AR_BX_TABLE` at its own size; the slabs are bitwise equal to the large algorithm with the exchange (same arithmetic per element, rows are
 independent; the digests above). Conditions (all functions of shape / dtype / settings, so identical on every rank): bf16 with the bf16 exchange and the medium exchange
 on, `max_bytes < bytes <= 64 MiB`, 2-D or more with rows of whole 64-byte packs, `bytes < ar_large_min_bx` (a tuning file that lowers it keeps its large algorithm), slabs within
-`max_bytes`. The plugin always passes a fresh output buffer (never aliasing the input), so in-place use is not exercised; each slab is an ordinary 2bx call. CPU: the large pipeline launches `ceil(bytes / 8 MiB) + 1` kernels, the slabs
-`ceil(bytes / 4 MiB)` (16 MiB: 4 against 3, 64 MiB: 16 against 9; about 10 us per launch on the eager c96 / c128 steps, i.e. 11 calls x 1 extra launch = about 0.1 ms per
-step at c128). The cap is the measured range (64 MiB); the 128 MiB prefill embedding all-reduce (once per step) stays on the large algorithm.
+`max_bytes`. The plugin always passes a fresh output buffer (never aliasing the input); in the test an `out=` that is aligned, at a 64-byte offset or misaligned by 2 bytes (staged through a copy) gives the same bits, and the
+words around it stay untouched. Each slab is an ordinary 2bx call. CPU: the large pipeline is one C++ call (`ceil(bytes / 8 MiB) + 1` kernel launches inside it), the slabs are a Python loop with one iteration per slab
+(two slice views, a table pick, the pybind launch): an estimate of 15 .. 25 us per slab (not measured: no torch on the machine that wrote this), i.e. about 0.3 .. 0.6 ms per eager c128 step (11 draft all-reduces of 4 slabs, plus 1 for
+the embedding) and about 0.3 .. 0.4 ms for a 64 MiB prefill all-reduce (16 slabs). The R2 gate probe measured the CPU slack of the eager verify steps (S1-9 L9 R2_GATE, pure verify steps, no profiler): c64 about 12 ms,
+c80 about 20 ms, c96 about 35 ms, c112 about 45 ms, c128 about 57 ms, so the slab loop fits where it runs (c65 and above); the model A/B of section 8 measures it directly (STEADY c128). If the CPU ever binds, the loop moves into a
+C++ binding next to `all_reduce_large` (one call, atomic under the GIL). The cap is the measured range (64 MiB); the 128 MiB prefill embedding all-reduce (once per step) stays on the large algorithm.
+
+Sizes just above `max_bytes` were measured after the review (dispatch pair, B A B A, 3 protocols, digests identical on all ranks and kinds): 520 rows (8.1 MiB, 3 slabs of 2.7 MiB) -66 us warm / -61 cold (402.7 against
+469 us), 600 rows (9.4 MiB) -64 / -60, 700 rows (10.9 MiB) -73 / -62, 1001 rows (15.6 MiB, 4 uneven slabs) -86 / -85, 2049 rows (32 MiB, 9 slabs) -149 / -146: the slab path wins by 12 .. 14 % over the whole range, the 2.7 .. 3.9 MiB
+slabs of the c65 .. c95 band included.
 
 **Deviation from the pre-registered rule.** The rule written before the sweeps said that a row-chunked all-reduce is adoptable "only inside CUDA-graph bands (T <= 256)". The slab path
 is taken in the eager c96 / c128 bands anyway: the baseline it replaces is already a multi-launch pipeline (`chunks + 1` = 3 launches at 16 MiB), so the net cost is one launch
