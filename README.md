@@ -1,7 +1,7 @@
 # AS-5126GS-TNRT2_vllm_plugin
 
 針對 **10.19.209.74（Supermicro AS-5126GS-TNRT2，8x NVIDIA RTX PRO 6000 Blackwell Server）** 這台主機的 PCIe / NUMA 拓樸所做的最佳化，
-用來加速 `unsloth/Muse-Spark-Open-816B-A42B-NVFP4`（vLLM branch `sm120-muse-spark-open`，v0.32.0 + Muse Spark backport，
+用來加速 `unsloth/Muse-Spark-Open-816B-A42B-NVFP4`（vLLM branch `sm120-muse-spark-open`，目前 production 為 v0.33.0 + Muse Spark backport（`f6a60ab9d7`），
 TP8 + EP8）的推論。
 
 這個資料夾只放「只對這台機器的拓樸才有意義」的東西：topology-specialized 的 P2P collectives（`muse_topo` 套件與 vLLM plugin）、NCCL 環境變數與
@@ -18,6 +18,7 @@ graph file、啟動 / 驗證 script 與量測文件。與機器無關的通用 S
 | prefill（pp） | c1（512 tokens）+7 %、13k / 65k / 118k tokens 的 context 約 +13 .. +14 %；real weights +8 .. +12 % |
 | 額外記憶體 | 每張 GPU 61.1 MiB（large-message 演算法不再增加） |
 | accuracy class（預設） | `more_accurate`：fp32 加總、單次最終 rounding，所有 size / 演算法 / rank / run 之間 bitwise 相同 |
+| production 最終結果（S1-11，vLLM 0.33.0、host `f540ce1b37`，2026-11-13） | spec ON c1 / c16 / c64 / c128 的 DEC greedy 221.4 / 756.6 / 1252.2 / 1479.1 tok/s（AL 4.64 .. 4.88）；ns256 ON 115.2 / 535.5 / 980.9 / 1212.2（c256 1432.2）；ns128 OFF 116.1 / 540.5 / 980.4 / 1232.8；9 / 9 gates PASS；表格、exact bytes、已知限制見第 4.8 節 |
 | 啟用條件 | `MUSE_TOPO_ENABLE=1`，且拓樸簽章（2 sockets x 2 virtual switches x 2 GPUs，cc 12.0，56 組 P2P 全通）吻合，否則自動退回 NCCL |
 
 ## 2. 為什麼需要（背景）
@@ -97,6 +98,7 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── r3b_gemv_push.md         decode 的 pooler / unpooler GEMV 與 all-gather 融合（r3b）：算術與精度、protocol、環境變數、S1-4a 量測
 │   ├── r3c_medium_ar.md         medium all-reduce（64 KiB .. 8 MiB）的 bf16 exchange：算術、dispatch table、latency、real-weight concurrency、GSM8K
 │   ├── s110_numa_offload.md     S1-10：NUMA-local KV CPU offload — connector 2x2 比較、每個 rank 的 tier 大小公式與量測、offload 開啟後的 exact GPU KV bytes、determinism、CPU bytes per token
+│   ├── s111_final_matrix.md     S1-11：最終 matrix（四個 launch 的完整 grid）、exact bytes 與 tier 公式、9 個 gate 與其具名偏離、已知限制、parked lever 與條件
 │   └── a1_table_retune.md       S1-9 L9 A1：bf16 exchange 下 dispatch table 的逐 size 重調（verify band c1 .. c128 與 prefill chunk 的 message size、reduce-scatter 8 blocks、2bx slabs、方法與 bitwise 證明）；S1-9 L10 model-level gate（2 x 2 factorial）通過，已合併
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
@@ -223,7 +225,7 @@ gate 數字（ON vs OFF）：reuse TTFT p50 x0.0481、prompt tok/s x26.19、TTFT
 **ns128 offload profile**（shipped，**預設 OFF**：S1-10R 的規則只憑 X stress 就讓 ns128 作為 profile 出貨，沒有 A/B，是 orchestrator 的決定；`launch/serve_nonspec.sh ns128` 預設不帶 tier，`MUSE_OFFLOAD=1` 才開）：`MUSE_OFFLOAD_PROFILE=ns128`，`--max-num-seqs 128`，ON bytes 17,257,267,200（2,962,366 KV tokens per rank），S_live 501.1 MiB（floor 500）。舊 launch（無 tier）：用 `launch/serve_spec.sh` / `launch/serve_nonspec.sh <ns128|ns256>` 加 `MUSE_OFFLOAD=0`（第 4.7 節），no-tier bytes 在 `env/launch.env`（ns256 16,957,243,392、ns128 17,357,799,424）。手動組 line 時不要 source `offload.env` 來取 no-tier bytes：ns256 / ns128 的 `offload.env` 即使 `MUSE_OFFLOAD=0` 仍 export ON bytes（只有 `spec_k7.env` 會切換 bytes）。
 
 **Swap（必讀）**：gate 中 14 / 18 個 ON 類 boot 發生 swap（launch 到 READY 增加 3.8-7.4 GiB），16 / 16 的 OFF / CTL 類 boot 沒有；swap 峰值 7,444.8 MiB / 8,192 MiB（`s110r_spec_ON_1`）；adoption 的 gate-T boot `s110r_fulltier_spec_a5` 只有 45.6 MiB。
-所以 ON launch 不是 swap-free，也不保證每次 boot 都不 swap；c128 p99 TTFT 在六組中都比 OFF 高 3.5-7.7 %；spec 的 stress S_live 餘裕只有 1,256.4 vs 1,256 MiB。完整記錄見 `docs/s110_numa_offload.md` 第 11 節。需要 vLLM branch 的 `receives_remote_kv` 修正。
+所以 ON launch 不是 swap-free，也不保證每次 boot 都不 swap；c128 p99 TTFT 在六組中都比 OFF 高 3.5-7.7 %；spec 的 stress S_live 餘裕只有 1,256.4 vs 1,256 MiB。完整記錄見 `docs/s110_numa_offload.md` 第 11 節。需要 vLLM branch 的 `receives_remote_kv` 修正。S1-11 的 matrix 中 ns256 ON 在 3 次 boot 有 2 次在 READY 時已 swap（spec ON 1 次沒有）；沒有找到可預測 swap 的量（第 4.8 節「已知限制」）。
 
 以下效能結果是 0.32.0 實測（45 GiB tier），0.33.0 的 gate 數字見上與 `docs/s110_numa_offload.md` 第 11 節；結果（real weights、spec profile）：64k / 118k prompt 的 re-admission TTFT 6.30 / 12.44 s -> 0.29 / 0.47 s；比 GPU pool 大 1.6 倍的 working set 循環讀取時 TTFT p50 5.9 -> 0.24 s、throughput 10.9k -> 217k prompt tokens/s；
 沒有 reuse 時 decode -0.5 %（三次 boot 的 gmean）。native `OffloadingConnector` 已量測、不採用（每個 worker pin 整個 region：boot +100 s .. +21 分鐘、GPU page table 8 倍、decode -1.2 .. -2.1 %）。
@@ -254,12 +256,207 @@ launch/stop_server.sh /raid/vllm-runtime/work/launch/spec                       
 * 結束碼：0 = READY 且所有檢查通過（server 留著繼續跑）；1 = 開機後檢查失敗（除非 `--keep-on-fail`，server 已停止）；2 = 拒絕啟動（輸入錯誤、GPU 忙、preflight 失敗、env 檔錯誤，什麼都沒啟動）；3 = server 一直沒有 READY（死掉、逾時或被中斷，已停止）；64 = 用法錯誤。
 * 輸出目錄：`serve_cmd.txt`、`env.txt`（與 gated boot 同樣的寫法與 filter）、`serve.log`、`serve.pid`、`server.sess`（`<pid> <sid> <pgrp> <start time> <boot_id>`，由 server 自己的 child process 在 setsid 之後寫入；leader 已消失時，`stop_server.sh` 只會處理 boot_id 相同、cwd 為此輸出目錄、start time 不早於 leader 的成員，其餘只列出不送 signal，exit 3）、`status.txt`（最後一行 `RESULT ...`）、`preflight.txt`、`cache_config_info.txt`（`/metrics` 的 `vllm:cache_config_info`，block 數只在這裡）、`pid_cmdline.txt`、`pid_environ.txt`、`pid_environ_expected.txt`、`clean_ref/`、`clean_check/`（clean shell 的 dry run：啟動前與開機後各一次）、`gpu_mem_ready.txt`、`check_*.txt`。
   `status.txt` 有 swap 紀錄（launch / READY 的 swap used、`pswpin` / `pswpout` 差）。
-* 開機後檢查（任何一個失敗都是失敗）：`env`（server process 的 live environ 經過與 gated boot 的 `pid_environ.txt` 相同的 filter，必須與 clean shell（`env -i`，只帶 `MUSE_OFFLOAD`）dry run 推導出的 `clean_ref/pid_environ_expected.txt` 逐行相同；`--keep-env` 時改比 calling shell 自己的紀錄，status.txt 有 `KEEP_ENV` 行）、`line`（`scripts/check_serve_line.py`：live API-server 的 `/proc/<pid>/cmdline`（NUL 為界）= `serve_cmd.txt` = 開機後在 clean shell 重新推導的 serve line，且 vLLM 自己解析出的 `non-default args` 行帶有完全相同的選項與值、沒有多的選項；啟動前 launcher 也先拒絕與 clean shell 推導不同的 serve line；`--keep-env` 時不比 clean shell 的推導）、speculative：`SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD=$MUSE_OFFLOAD scripts/check_spec_launch.sh`、`scripts/check_offload_launch.sh`、`scripts/check_kv_launch.sh spec <1|0>`；
+* 停止路徑：launcher 在收到 TERM / INT / HUP 或開機檢查失敗時停止 server，使用 `server.sess`；該檔案消失或無法讀取時，改用 launcher 接受 session 當下記在記憶體裡的 tuple（pid、session、process group、start time、boot id），並通過同樣的 guard（leader 必須是記錄的 pid 與 start time，session 不得含 launcher 或其 parent）。
+  只有停止以結束碼 0 結束才記 `STOPPED gpu_used_mib=...`；被拒絕、或 leader 已不在而 member 無法證明屬於這次 launch 時記 `NOT_STOPPED rc=...`（server 可能還在跑，要手動停；EXIT trap 不會重複停止）。
+* 開機後檢查（任何一個失敗都是失敗）：`env`（server process 的 live environ 經過與 gated boot 的 `pid_environ.txt` 相同的 filter，必須與 clean shell（`env -i`，只帶 `MUSE_OFFLOAD`）dry run 推導出的 `clean_ref/pid_environ_expected.txt` 逐行相同；`--keep-env` 時改比 calling shell 自己的紀錄，status.txt 有 `KEEP_ENV` 行）、`line`（`scripts/check_serve_line.py`：live API-server 的 `/proc/<pid>/cmdline`（NUL 為界）= `serve_cmd.txt` = 開機後在 clean shell 重新推導的 serve line，且 vLLM 自己解析出的 `non-default args` 行帶有完全相同的選項與值、沒有多的選項，且 log 的 KVTransferConfig 不得有 command line 沒有的 `kv_connector` / `kv_role`；啟動前 launcher 也先拒絕與 clean shell 推導不同的 serve line；`--keep-env` 時不比 clean shell 的推導）、speculative：`SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD=$MUSE_OFFLOAD scripts/check_spec_launch.sh`、`scripts/check_offload_launch.sh`、`scripts/check_kv_launch.sh spec <1|0>`；
   non-speculative：`scripts/check_offload_launch.sh`（tier OFF 時 `MUSE_OFFLOAD_EXPECT=off`）與 `scripts/check_kv_launch.sh <ns128|ns256> <1|0>`（`--kv-cache-memory-bytes`、`--max-num-seqs`、ns256 的 capture cap 256 / ns128 無 cap、
   KV tokens、`num_gpu_blocks`、FULL decode graph 的上限）。數字見第 4.6 節與 `env/launch.env` 的表。測試用的 `MUSE_LAUNCH_*` hook（取代 vllm / preflight / nvidia-smi / venv）只要有設就會在 `status.txt` 記一行 `HOOK ...`；production 啟動前確認 calling shell 沒有殘留這些 export。
 * 等價性：每條路徑的 serve line 與 export 的環境和 gated / adoption boot 逐 byte 相同，由 `bench/test_launch_equiv.sh` 靜態證明（spec ON / OFF、ns256 ON、ns128 ON 對 `muse_wf/s1-10r/adoption_boots/runs`；ns128 / ns256 OFF 對 S1-14 production 與 0.33.0 validation 的 line）。
   已知差異：0.33.0 validation 的 ns256 OFF boot 沒有 env 紀錄，環境只能對 S1-14 的 ns128 record 與它的 `flags` 行證明；script 的 ns256 OFF launch 會 export `VLLM_PLUGINS=muse_topo`，而 0.33.0 validation boot（v033s3_ns256_1）沒有（host a26c2be 在它之後才加；S1-10R gate boot s110r_ns256_OFF_1 有，證據只有 0 tracebacks）；ns256 OFF 的 `cache_config_info` fixture（blocks 258,747）是從 VALIDATION.md 合成的（該文件第 204 行），s110r boot 沒存 metrics，smoke boot 會記錄真正的 `cache_config_info` 與 pid environ；speculative 的 script 會 export `VLLM_SERVER_DEV_MODE=1`（adoption boot 也有），non-speculative 沒有。
   不是這些路徑的 line 或環境就是新的 configuration（S1-17：每個 configuration 有 0.4-0.6 % SD 的固定偏移，margin 只有 spec ON 0.4 MiB、ns ON 1.1-1.8 MiB）。
+
+### 4.8 最終結果、exact bytes、gates 與已知限制（S1-11；0.33.0 production；完整表格與證據 `docs/s111_final_matrix.md`）
+
+**範圍與出處。** matrix 與 gates 跑在 production tree 上：host main `f540ce1b37`（205 個檔案）+ vLLM `sm120-muse-spark-open` `f6a60ab9d7`，2026-11-13 02:36:49 -> 07:11:47（4 h 35 min、13 個 hold、7 次 boot、216 個 cell）。
+每次 boot 都經 `launch/serve_*.sh` 啟動，並通過第 4.7 節的開機後檢查。下面的數字以 script 逐行複製自 `muse_wf/s1-11/PHASE2_RESULTS.md`（沒有重算），該檔案經獨立重算驗證（`phase2_verify.json`：216 個 cell、4237 個數值比較、0 個差異）。
+這是量測，不是 adoption 決定。matrix 跑完之後的 commit 只改 launcher 的停止路徑、serve line 檢查、測試與文件，不改任何 export、serve line 或預設值。
+
+**量測 protocol（表中每個 metric 的意義）。**
+
+* STEADY：`drive_steady_g11.py` 固定 batch，值 = 各 window step time 的 upper median；tok/s 是由 step 推得（c x 1000 / step x tokens per step），沒有 TTFT。spec `--win 12 --windows 3`、ns128 `--win 10 --windows 3`、ns256 `--win 12 --windows 2`，各與其 baseline 的 protocol 相同。
+* DEC：`conc_driver_s110.py`，gsm80 + mtbench 的真實 prompt，n = max(16, 4c)，128 output tokens，每個 request 一個 `cache_salt`；greedy 重複 2 次（表中為平均），default sampling 與 top_p 0.95 各 1 次。rand 512/128：隨機 prompt。natural 8k：自然文 8,192 tokens。mixed churn：S1-9 L2，256 tokens，jitter 24，stagger 0.15 s（c1 不是 churn cell）。
+* TTFT / TPOT 的 percentile 定義依 driver 而不同：conc / rand / nat8k 用 index `round(p x (n - 1))`（偶數 n 的 p50 = upper median），reuse driver 用 `ceil(p x n) - 1`（81 個 request 的 p99 = 最大值）。
+* 每個 non-reuse cell 都有 per-request salt，並記錄 `prompt_tokens_cached_by_source` 的差值：216 個 cell 全部有效，0 個 invalid、0 個失敗 request、0 次 preemption。reuse / goff / long cell 依設計有 tier hit，標為 reuse。
+* swap 不使 cell 無效：每個 cell 都帶它那次 boot 的 swap 狀態（見下方「已知限制」）。
+
+**最終 matrix（output tok/s、ms；欄位 = concurrency；數字與 `PHASE2_RESULTS.md` 第 3 節逐字相同）。**
+
+spec ON（`launch/serve_spec.sh` 預設，tier ON）：
+
+| workload / metric | c1 | c4 | c16 | c32 | c64 | c128 |
+|---|---:|---:|---:|---:|---:|---:|
+| STEADY tok/s (derived) | 402.9 | 737.2 | 1395.8 | 1935.4 | 2813.8 | 3752.0 |
+| DEC greedy out tok/s | 221.4 | 416.5 | 756.6 | 961.9 | 1252.2 | 1479.1 |
+| DEC greedy TPOT ms | 3.49 | 7.30 | 15.19 | 23.24 | 36.64 | 61.86 |
+| DEC greedy TTFT p50 ms | 154 | 216 | 462 | 644 | 1033 | 1746 |
+| DEC greedy TTFT p99 ms | 179 | 462 | 1419 | 2544 | 4361 | 8875 |
+| DEC greedy AL | 4.671 | 4.639 | 4.872 | 4.880 | 4.830 | 4.841 |
+| rand 512/128 out tok/s | 148.5 | 283.1 | 578.5 | 768.3 | 1008.6 | 1272.2 |
+| natural 8k out tok/s | 92.0 | 130.2 | 156.1 | 168.9 | 175.2 | 177.2 |
+| mixed churn out tok/s | - | 498.5 | 918.3 | 1201.0 | 1567.4 | 1944.9 |
+
+spec `MUSE_OFFLOAD=0`（reference，同一個 chain 的 OFF boot）：
+
+| workload / metric | c1 | c4 | c16 | c32 | c64 | c128 |
+|---|---:|---:|---:|---:|---:|---:|
+| STEADY tok/s (derived) | 410.2 | 724.8 | 1433.4 | 1966.4 | 2801.9 | 3757.0 |
+| DEC greedy out tok/s | 224.5 | 427.0 | 752.0 | 975.8 | 1254.3 | 1481.8 |
+| DEC greedy TPOT ms | 3.43 | 6.94 | 15.23 | 22.86 | 36.63 | 61.93 |
+| DEC greedy TTFT p50 ms | 154 | 233 | 467 | 646 | 1063 | 1748 |
+| DEC greedy TTFT p99 ms | 178 | 461 | 1392 | 2586 | 4354 | 8804 |
+| DEC greedy AL | 4.671 | 4.710 | 4.791 | 4.946 | 4.838 | 4.839 |
+| rand 512/128 out tok/s | 150.3 | 284.6 | 581.5 | 772.7 | 997.8 | 1269.5 |
+| natural 8k out tok/s | 93.0 | 130.4 | 156.4 | 169.0 | 175.4 | 177.3 |
+| mixed churn out tok/s | - | 501.6 | 924.0 | 1206.3 | 1572.7 | 1922.1 |
+
+ns256 ON（預設，tier ON；c256 欄只有 ns256）：
+
+| workload / metric | c1 | c4 | c16 | c32 | c64 | c128 | c256 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| STEADY tok/s (derived) | 122.1 | 294.9 | 690.4 | 1023.5 | 1599.3 | 2281.6 | 3070.6 |
+| DEC greedy out tok/s | 115.2 | 263.5 | 535.5 | 722.6 | 980.9 | 1212.2 | 1432.2 |
+| DEC greedy TPOT ms | 7.73 | 12.28 | 21.95 | 30.54 | 41.86 | 72.89 | 133.05 |
+| DEC greedy TTFT p50 ms | 158 | 366 | 935 | 1640 | 2980 | 3824 | 4072 |
+| DEC greedy TTFT p99 ms | 169 | 447 | 1372 | 2503 | 4215 | 8316 | 15842 |
+| rand 512/128 out tok/s | 113.3 | 263.3 | 534.3 | 736.3 | 1011.1 | 1295.0 | 1543.8 |
+| natural 8k out tok/s | 73.8 | 117.0 | 150.1 | 163.4 | 173.7 | 181.4 | 181.5 |
+| mixed churn out tok/s | - | 278.1 | 557.4 | 740.6 | 1013.5 | 1353.6 | 1745.5 |
+
+ns128 OFF（預設，無 tier）：
+
+| workload / metric | c1 | c4 | c16 | c32 | c64 | c128 |
+|---|---:|---:|---:|---:|---:|---:|
+| STEADY tok/s (derived) | 123.1 | 302.6 | 700.4 | 1036.0 | 1592.7 | 2302.2 |
+| DEC greedy out tok/s | 116.1 | 264.7 | 540.5 | 726.9 | 980.4 | 1232.8 |
+| DEC greedy TPOT ms | 7.67 | 12.20 | 21.67 | 30.28 | 42.67 | 72.18 |
+| DEC greedy TTFT p50 ms | 157 | 366 | 928 | 1679 | 2762 | 3822 |
+| DEC greedy TTFT p99 ms | 168 | 456 | 1384 | 2479 | 4151 | 7797 |
+| rand 512/128 out tok/s | 114.2 | 265.0 | 538.7 | 745.1 | 1007.7 | 1303.5 |
+| natural 8k out tok/s | 74.3 | 117.4 | 150.7 | 163.7 | 174.0 | 181.8 |
+| mixed churn out tok/s | - | 280.2 | 563.9 | 744.6 | 1015.5 | 1354.2 |
+
+完整的 grid（default sampling、top_p 0.95、rand / nat8k 的 TTFT 與 TPOT、churn 的 TTFT、各 cell 的 AL）與逐 cell 附錄（每個 cache source、swap、`pswpin`、`pgmajfault`）見 `docs/s111_final_matrix.md` 第 4 節與 `PHASE2_RESULTS.md` 附錄 A。
+
+冷 TTFT（client wall，`max_tokens 1`、新的 salt、5 次取中位數；= 8k / 32k / 64k / 118k tokens 的冷 prefill TTFT，秒）：
+
+| prompt tokens | spec ON s | spec OFF s | ns256 ON s | ns128 OFF s | spec ON - OFF ms | spec OFF - ns128 OFF ms | ns256 ON - ns128 OFF ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 0.7430 | 0.7286 | 0.7143 | 0.7082 | +14.5 | +20.3 | +6.1 |
+| 32768 | 2.9749 | 2.9633 | 2.9222 | 2.9143 | +11.6 | +49.1 | +8.0 |
+| 65536 | 6.2794 | 6.2657 | 6.2002 | 6.1880 | +13.7 | +77.7 | +12.2 |
+| 117964 | 12.4243 | 12.4090 | 12.2857 | 12.2625 | +15.3 | +146.5 | +23.2 |
+
+prefix-reuse workload（frozen reuse driver，cycle，32k 文件，working set 約 1.61-1.62 倍 GPU pool，4 個 client）：
+
+| launch | pass | prompt tok/s | TTFT p50 s | TTFT p99 s | host-source tokens | ok/n |
+|---|---:|---:|---:|---:|---:|---:|
+| spec_on | cycle_p1 | 11,059.6 | 5.247 | 11.830 | 0 | 81/81 |
+| spec_on | cycle_p2 | 204,306.1 | 0.256 | 0.512 | 2,658,096 | 81/81 |
+| spec_on | cycle_p3 | 202,163.9 | 0.256 | 0.608 | 2,658,096 | 81/81 |
+| spec_off | cycle_p1 | 11,048.6 | 5.151 | 11.840 | 0 | 81/81 |
+| spec_off | cycle_p2 | 11,036.4 | 5.146 | 12.457 | 0 | 81/81 |
+| spec_off | cycle_p3 | 11,049.6 | 5.217 | 11.834 | 0 | 81/81 |
+| ns256_on | cycle_p1 | 11,216.3 | 5.160 | 9.418 | 0 | 142/142 |
+| ns256_on | cycle_p2 | 282,816.9 | 0.278 | 0.415 | 4,659,872 | 142/142 |
+| ns256_on | cycle_p3 | 295,762.5 | 0.246 | 0.375 | 4,659,872 | 142/142 |
+
+**與 baseline 的比較。** 規則：比同一 launch 的 0.33.0 baseline 差超過 3 % 的 cell 要先調查。結果：**0 個 PRIMARY（protocol 相符）的列超過 3 %（最差 +1.16 %）**；3 個相符的 SECONDARY 列超過 3 %（spec dec.c1 兩列 3.44 %、spec_off AL c1 3.81 %），
+原因是 16 個 replay prompt 的 AL（4.671 對 validation 的 4.856；232.5 x 4.671 / 4.856 = 223.6，量到 224.5）；2 列 protocol 不符（7.5 %，只列在旁邊、不算 flag）。
+protocol 相符的 primary baseline 只有 29 列：rand512、nat8k、churn、default sampling、top_p、c4 / c32 / c256 的 DEC、65k / 118k 的 wall 與所有 TTFT / TPOT 都**沒有** 0.33.0 baseline，所以「0 個 primary flag」不代表每個 cell 都在 3 % 內。
+chain 的 13 個 non-spec STEADY cell 沒有被 parse（`parse_result` 的 `TypeError`），由分析重新從原始 window 值算出（15 個額外的 baseline 列，最差 +0.67 %）。
+tier 的成本（spec ON 對同一 chain 的 OFF boot）：沒有任何 throughput cell 比 OFF 差超過 2.6 %（STEADY step 最多 +1.6 %）、冷 wall +11.6..+15.3 ms（+0.1..+2.0 %）、冷 prefill pass 1 11,059.6 對 11,048.6 tok/s；reuse 的 pass 2 / 3 為 18.5 倍 / 18.3 倍 prompt tok/s。
+ns256 ON 對 ns128 OFF（跨 profile，非同一 chain 的 OFF）最多低 2.6 %。與 campaign 開頭（r2fin）與 stage C 的對照（protocol 不同，只當背景）見 `docs/s111_final_matrix.md` 第 5 節：non-spec 的 random 512/128 比 r2fin sweep 高 9.6..18.9 %、比 S1-6 結束時的 production 高 1.2..4.0 %。
+
+**Exact bytes 與 tier 公式**（數字只存在 `env/spec_k7.env`、`env/offload.env`、`env/launch.env`）：
+
+| profile | tier | `--kv-cache-memory-bytes` | blocks per rank（bytes per block-id） | KV tokens per rank | S_live（floor）MiB | S_live 的來源 |
+|---|---|---:|---:|---:|---:|---|
+| spec | OFF（`MUSE_OFFLOAD=0`） | 11,720,212,480 | 572,276（20,480） | 1,649,935 | 1,278.4（1,256） | S1-13 boot |
+| spec | ON（預設） | 11,645,337,600 | 568,620（20,480） | 1,639,394 | 1,256.6（1,256） | S1-10R phase 3 確認 boot |
+| spec | ON（預設） | 11,645,337,600 | 568,620（20,480） | 1,639,394 | 1,256.4（1,256；餘裕 0.4） | S1-10R gate 的 X boot |
+| ns256 | OFF（`MUSE_OFFLOAD=0`） | 16,957,243,392 | 258,747（65,536） | 2,910,864 | 500.8（500） | 0.33.0 validation boot |
+| ns256 | ON（預設） | 16,854,810,624 | 257,184（65,536） | 2,893,281 | 501.8（500） | S1-10R phase 3 / gate X boot |
+| ns128 | OFF（預設） | 17,357,799,424 | 264,859（65,536） | 2,979,623 | 503.1（500） | 0.33.0 validation boot |
+| ns128 | ON（`MUSE_OFFLOAD=1`） | 17,257,267,200 | 263,325（65,536） | 2,962,366 | 501.1（500） | S1-10R phase 3 / gate X boot |
+
+spec ON 的兩個 S_live 來自兩次不同的 run，不合併。餘裕很薄（spec ON 0.4 MiB、ns ON 1.1-1.8 MiB）：不是這六個 launch 的 serve line 或環境就是新的 configuration（S1-17）。ON bytes = no-tier bytes 依 tier 的 GPU page table（每註冊 1 GiB 為 2 MiB，P* 時 96.5 MiB）造成的 S_live 不足量往下調（2 MiB 為單位），
+用 S1-7 stress 程序確認（`docs/s110_numa_offload.md` 第 5a 節）。每個 rank 的 tier：
+
+```
+P* = L x floor((min_N A_N - M) / (2 L))      L = 327,680 B（兩個 profile 的 bytes per block-id 20,480 與 65,536 的最小公倍數），M = 6.6 GiB
+A_N = MemFree_N + Active(file)_N + Inactive(file)_N（每個 GPU node，0.33.0、server 運作中量測，MiB）：node 3 119,262.8、node 0 118,644.1、node 7 105,586.3（限制者）、node 4 119,641.2
+P* = 327,680 x 158,124 = 51,814,072,320 B per rank（48.2556 GiB）；cpu_bytes_to_use_per_rank = P*；cpu_bytes_to_use = 8 x P* = 414,512,578,560 B
+tier blocks per rank：2,529,984（spec）、790,620（ns256 / ns128）
+```
+
+P* 只在 node 7 的 reclaimable slab 低於約 0.3 GiB 時有效（量測時為 302 MiB），所以每次 ON boot 之前跑 `scripts/preflight_offload.sh`（launch script 會跑）。
+
+**每個 flag 的作用**（serve line 由 `env/*.env` 與 `launch/lib.sh` 組出，見第 4.7 節）：
+
+| flag | 作用 |
+|------|------|
+| `--tensor-parallel-size 8 --enable-expert-parallel` | TP8 attention + EP8 MoE（tokens replicated，沒有 all2all） |
+| `--max-model-len 131072` | context 長度 |
+| `--gpu-memory-utilization 0.95` | 一般情況下決定 KV pool；給了 `--kv-cache-memory-bytes` 之後 KV 大小由該值決定（vLLM 的 `CacheConfig` 在 `kv_cache_memory_bytes` 不是 None 時忽略它），此旗標仍留在 line 上以與 gated boot 逐 byte 相同 |
+| `--kv-cache-memory-bytes N` | 每張 GPU 的 exact KV bytes（上表；與 offload 參數是同一個 launch 屬性，`check_kv_launch.sh` / `check_offload_launch.sh` 檢查配對） |
+| `--max-num-seqs 128 / 256` | 同時 running request 上限：spec 與 ns128 為 128，ns256 為 256 |
+| `--kv-cache-dtype fp8`、`--quantization modelopt_fp4` | fp8 KV、NVFP4 權重 |
+| `--limit-mm-per-prompt '{"image":0,"audio":0,"video":0}'` | text-only launch（所有 modality 設 0；microbatched prefill overlap 需要它） |
+| `--reasoning-parser muse --tool-call-parser muse --enable-auto-tool-choice` | chat API 的 reasoning / tool-call 解析 |
+| `--host 127.0.0.1 --port 8100` | 只聽 loopback |
+| `--speculative-config {...}`（spec only） | RadixArk DFlash2 drafter：method `dflash`、`num_speculative_tokens` 7、`draft_sample_method` probabilistic、`rejection_sample_method` block |
+| `--per-request-spec-decode-metrics detailed`（spec only） | 每個 request 的 acceptance 統計（AL 的來源） |
+| `--max-cudagraph-capture-size 256`（spec 與 ns256） | FULL decode CUDA graph 的 capture 上限 256 tokens；ns256 必須明確給（否則 SP floor 變 513）；ns128 沒有此旗標（vLLM 預設 list） |
+| `--max-num-batched-tokens 8199`、`--max-num-scheduled-tokens 8192`（spec only） | K=7 時 prefill chunk 對齊成 8192 tokens（S1-9 L5）；0.33.0 的 DFlash draft slots 為 0，MNBT 8199 單獨會排出 8199-token 的 chunk，所以 MNST 把 chunk 壓回 8192（S1-14 F2；少了它 32k 冷 prefill 約慢 2.0 %） |
+| `--numa-bind` | 每個 worker 在 `numactl --cpunodebind=N --membind=N` 下執行（N = 該 GPU 的 node），使 tier 100 % 在自己 GPU 的 node 上 |
+| `--kv-transfer-config '{...}'` | `SimpleCPUOffloadConnector`、`kv_role` `kv_both`；`cpu_bytes_to_use_per_rank` = P*，`cpu_bytes_to_use` = 8 x P*（tier ON 才有） |
+
+**Gates：9 / 9 PASS（FAIL 0、ARTIFACT 0、NA 0）。** 判定標準在 chain 開始前固定（S1-11 Amendment 3 與 phase 2 rulings）。逐行（與 `PHASE2_RESULTS.md` 第 1 節相同）：
+
+- G-det/spec_on: PASS - two cold processes, 12 request files + 12 per-rank hash files identical (789 requests, 3072 logprob values; 8 ranks one hash)
+- G-det/ns256_on: PASS - same, 24 files identical (789 requests, 3072 logprob values; 8 ranks one hash)
+- G-gsm/spec_on greedy: PASS - 389/400 = 97.25 % (passes 194 + 195; band 382..392)
+- G-gsm/spec_on default sampling: PASS - 391/400 = 97.75 % (195 + 196; 1 below the band top 392)
+- G-gsm/ns256_on greedy: PASS - 386/400 = 96.50 % (194 + 192)
+- G-long/spec_on: PASS - 6/6 needles exact cold and 6/6 exact with a tier hit (32k x3, 118k x3; tier host fraction >= 0.9995)
+- G-long/ns256_on: PASS (NR1: dedicated fresh boot ns256_long) - 6/6 exact cold, 6/6 exact with a tier hit (host fraction >= 0.9995)
+- G-off/spec_on: PASS - D4' leg PASS (KV blocks tier == GPU bitwise: 59,100 blocks, xc_bad 0, hx_bad 0; 170/170 (b) checks) AND server leg PASS (6 lengths 4k..118k: tier-hit == GPU-hit == MUSE_OFFLOAD=0, restore after natural eviction == ON GPU-hit == OFF direct; tokens + 5 top-logprob values bitwise, 32 tokens)
+- G-off/ns256_on: PASS (NR1: dedicated fresh boots ns256_goff / ns256_off, 404 start reset accepted with counters-at-0 evidence) - D4' leg PASS (15,356 blocks, xc_bad 0, hx_bad 0; 170/170) AND server leg PASS (6 lengths; restore after eviction == GPU-hit == OFF)
+- spec_off and ns128_off: no gate defined (spec_off is the reference boot of G-off/spec; ns256_off is the OFF boot of G-off/ns256).
+
+gates 的**具名偏離**（結論只有這份清單允許的強度）：
+
+* Q2：G-det 與 D4' 是以綁定到 serve line 的 offline in-process `LLM` 執行（環境與 launch dry run 相同，`E2E_*` 取自 serve line），不是經 launch script；G-det 比較兩個 cold process（各有自己的 session 與 weight load，先後執行）。
+* Q5：「eviction 之後 restore」是 1.3 倍 pool 的 flood 造成的自然 GPU eviction（spec 66 份文件 / 192 s、ns256 115 份 / 330 s）；**tier 自己也在 evict 的 full-tier regime 沒有重新涵蓋**（S1-10R gate T 的範圍說明不變：D4' 只涵蓋非滿載 regime 的 byte 相等）。
+* M3：G-off 的 OFF / eviction leg（`goff_driver.py`）是新寫、未凍結的程式；D4' leg 用凍結的工具。
+* NR1：ns256 的 G-off / G-long 在專用的全新 boot（`ns256_goff`、`ns256_off`、`ns256_long`）上判定：ns 線沒有 dev endpoint，start reset 回 404，改以 cached-token counters 與 `prompt_tokens_total` 在第一個 request 前為 0 作證據；G-off/ns256 是在 swap 的 boot 上取得的。
+* GSM8K 把撞到 16,384 output tokens 上限的 request 算錯（沒有最後答案），已含在上面的總數中（spec greedy 1 + 3、ns256 greedy 2 + 4、default sampling 0 + 0 個）。
+* D4'（b）的 170 項中 4 項（index 15 與 59，greedy 與 `t1k64`）在 C、H、X 三種狀態都是 cached = 0（沒有 tier hit），所以「170/170 相等」成立，但只有 166 項是 hit 狀態的比較；spec 的 D4' verdict 有一則 warning（draft KV group 14 restored blocks 2324），沒有 fail 或 artifact 原因。block 數（59,100 / 15,356）是凍結 checker 的 verdict 明細，不是重新由 KV hash 算出。
+
+**已知限制。**
+
+* **DRAM 讀取上限**：實測冷 DRAM 讀取上限為 1.537 TB/s = ncu 1.596 TB/s 峰值的 96 %（唯一支援的 memory clock 12481 MHz，不是 1.79 TB/s 的標稱值），S1-6 L3 因此關閉；L2 常駐的資料可以超過。
+* **link-bound 的 PCIe collectives 與 IB lane 的 PARK**：沒有 NVLink；bf16 exchange 下每個大型 collective 都受每張 GPU 自己的 x16 link 限制，不是跨 socket 的 cut：all-reduce / reduce-scatter 量到的是其 link floor 的 0.91-1.04 倍（S1-12），所以經 ConnectX-7 的 lane 搬的是同樣的 bytes、同一條 link，IB lane 為 PARK FINAL（S1-12、S1-16：把 cut 的 store 改送同 socket 的 peer，大型 AG / RS 在每個 size 都更慢）。
+  大型 all-gather 為其 link floor 的 1.17-1.21 倍，超出部分在 AG kernel 內部（two-hop relay、per-range flag、chunk pipelining），同樣 cut 比例的 reduce-scatter 為 0.96-0.98 倍；這個 AG relay 在下方 parked。
+* **EP straggler**（R5 / R11）：排名低於 1.6 %（「不值得或找不到機制」），沒有處理；EP8 把 tokens replicate，沒有 all2all。
+* **tier ON 時的 swap**：P* 的 pinned tier 配置時，worker / EngineCore / API server 沒有 pin 的 anonymous memory 可能被換出到 8 GiB 的 swap file。本次 matrix：**ns256 ON 在 3 次 boot 中有 2 次在 READY 時已 swap**（`ns256_on` 使用 4,095.3 MiB、峰值 5,429.6 MiB；`ns256_goff` 使用 4,570.6 MiB、峰值 6,677.8 MiB；`ns256_long` 63.8 MiB 沒有 swap），spec ON 1 次 boot 沒有 swap。S1-10R gate 為 14 / 18 個 ON 類 boot swap（3.8-7.4 GiB，峰值 7,444.8 / 8,192 MiB），16 個 OFF / CTL 類 boot 都沒有。
+  包含 det / D4' boot 與 adoption 系列的 22 個 large-tier ON boot 中有 14 個 swap、8 個沒有，17 個沒有 tier 的 boot 都沒有。**沒有找到預測因子**（`muse_wf/s1-11/swap_predictor.json`，39 個 boot，不用 GPU）：preflight 的 A_N / LEFT、launch 前的 node 記憶體（free / file / slab）、tier profile、前一次 boot 都無法區分 swap 與否；
+  沒有 swap 的 boot 唯一反覆出現的特徵是 launch 前閒置 50 分鐘以上（3 / 3），校正後不顯著（Bonferroni 0.23），且 8 個沒有 swap 的 boot 中 5 個緊接在 3-41 秒前的 boot 之後。所以把 READY 時的 swap 視為可能發生，每次 boot 檢查（`status.txt` 有 swap 紀錄）；cell 不因 swap 作廢。
+* **c128 p99 TTFT 的 tail**：S1-10R gate 中 dec c128 的 p99 TTFT 在六組都比 OFF 高 3.5-7.7 %（有 tier，系統性、僅供參考）；本次 matrix（單次 run）spec ON 對 OFF 的 c128 p99 TTFT 為 +0.8 %（greedy）/ +6.8 %（default）/ +2.4 %（top_p）、nat8k 0.0 %、churn c128 -27 %。
+* **ns256 bound-TTFT 偏離從未重新 gate**（0.32.0 研究：bound 的 ns256 比 unbound 慢 9-12 %）；本次 matrix 中 ns256 ON 對 ns128 OFF 的 median TTFT 在 -4.3..+7.9 %（跨 profile、單次 run、不同的量），不構成 gate。
+* **batched 的 tier-hit 輸出不是每個 request 都與 GPU-hit 逐位元相同**：同一個 process 中 H（GPU hit）與 X（GPU-only reset 之後的 tier hit）在 85 個 request 都有相同的 hit 長度，但 batched pass 中仍有一部分輸出不同（spec greedy H = X 72 / 85、ns256 81 / 85；原因沒找到，候選是 batched 排程 / chunk shape）。
+  成立的證據：single-stream 的 tier restore 逐位元相同（D4' 的 KV block 與 server leg 的 tokens + logprob 值），兩個 cold process 完全相同（G-det）。
+* **每個 configuration 約 1.5-2.5 % 的 offset floor**：每個 configuration（serve line、環境、記憶體 layout）在 dispatch 相同的 cell 有 0.4-0.6 % SD（最大 1.3 %）的固定偏移，單一 configuration 的 A/B 差異低於約 1.5-2.5 % 時，不做 layout 隨機化就不能歸因於被測機制。這個 floor 是由兩個 cell（ns c1、c4）**推論**出來的，不是量到的常數；
+  S1-10R 的 STEADY c1 pass（0.9859 對門檻 0.985，餘裕 0.0009）落在它之內。
+* GSM8K 把 16,384-token 截斷算錯（見上）。
+
+**Parked 的 lever 與重啟條件**（只列來源寫明的條件）：
+
+* S1-17（fused-boundary dispatch rows）：PARKED，production 維持 8 / 8 / 16；host branch `s117-bndcap`（`e7491668cb`，未 merge）與 `muse_wf/s1-17/` 保留為證據。四個 open lever：(1) ns 的兩種 T = 8 kind 改 two-step（Q-like，ns c8 -1.86 %，在 floor 上；最有支持的一個：S1-14 F1 打開後 c8 +1.20 %，stage 1 關閉後 -1.86 %）、(2) T = 17..24 的 RMS 24（spec raw c3 -1.4..-2.1 %）、(3) AG 16（out of class）、(4) T = 4 的 AR 3（無法解析）。重啟條件：需要能壓過 per-configuration floor 的 protocol（每個 configuration 多次 layout 抽樣），或效果大於約 2.5 %。
+* S1-16 的 AG relay（AG 對其 link floor 的 1.17-1.21 倍超出）：已排名、未開始；ceiling 約 3.9 %（prefill）/ 2.1 %（c64）/ 3.0 %（c128），預期 gain 約 1.9 / 1.05 / 1.5 %（低於 2 % 的線）；來源沒有寫重啟條件。branch `s116-redirect`（`e9cc9926ee`）與 `s115-agcut`（`a043642133`）未 merge。
+* R1 out-of-class verification（不做完整 gather 的驗證）：當超過約 25 % 的 production request 是 out of class（top_p > 0.95、T > 1、penalty、top_k 在 40..64 之外）時，這是第一個要做的項目；handover 記載全部 out-of-class 流量的 c64 / c128 為 7.4 % / 10.3 %。
+* R3 layers 0 / 61 的 BF16 改 FP8 / NVFP4：會改變模型，需要使用者的 policy 決定（c64 -4.6 %、c128 -4.2 %、每 rank +4.6 GiB KV）；經同意才做 drift study。
+* R2a：REJECTED（S1-9 L10：real +0.67 %、KV -3.64 %、c1 -1.79 % 原因不明），沒有重啟條件；branch 保留為證據。
 
 ## 5. 設定一覽與 accuracy class
 
@@ -480,11 +677,11 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 
 * **只適用這台主機**：拓樸簽章要求 TP world size 8、同一個 node、全是 RTX PRO 6000 Blackwell（cc 12.0）、56 組 P2P 全通、PCI layout 為 2 sockets x 2 virtual switches x 2 GPUs，不吻合就用 NCCL。
   script 內的路徑寫死為 `/raid/vllm-runtime/...`。
-* **只測過這個版本**：vLLM v0.32.0 + branch `sm120-muse-spark-open`（HEAD a5eda7714f）、torch 2.13 cu130、NCCL 2.29.7。plugin 是在 runtime patch `CudaCommunicator`，換 vLLM 版本要重新驗證。
+* **版本**：第 5、6 節的 H1 / H2 / r3 microbenchmark 與 end-to-end 數字是 vLLM v0.32.0 + branch `sm120-muse-spark-open`（HEAD a5eda7714f）、torch 2.13 cu130、NCCL 2.29.7 時期量的，沒有重跑。目前 production 是 v0.33.0 線（vLLM `f6a60ab9d7`、torch 2.14.0+cu130、flashinfer 0.7.2.post1、NCCL 2.30.7、triton 3.8.0）+ host `f540ce1b37`；它的最終 matrix 與 gates 見第 4.8 節（2026-11-13）。plugin 是在 runtime patch `CudaCommunicator`，換 vLLM 版本要重新驗證。
 * 只涵蓋 TP group（名稱以 `tp` 開頭、8 ranks）的 `all_reduce` / `all_gather` / `reduce_scatter`；EP group、`gather`、`reduce_scatterv`、`all_gatherv`、send / recv 仍走原本的路徑。
   不在 envelope 的呼叫（其他 dtype、non-contiguous、不是 128 B 倍數的大訊息、reduce_scatter dim != 0、all-gather 的中間維度）由 `supports()` 退回 NCCL。
 * 本節的 H2 效能數字都是 **concurrency 1**；decode graph size 1..128 都有走 topo（正確性已驗證，128 requests 的 decode batch 重跑 128/128 相同）。高 concurrency（c4 .. c128，
-  real weights）的 throughput 見 `docs/h2_vllm_plugin.md` 的 Microbatched prefill 一節；final defaults 的整體 throughput 列（`r2fin_*`）尚未量測。
+  real weights）的 throughput 見 `docs/h2_vllm_plugin.md` 的 Microbatched prefill 一節；final defaults 的整體 throughput（c1 .. c256、四個 launch）已在第 4.8 節量測；已知限制（DRAM 上限、link-bound collectives、EP straggler、tier 時的 swap 等）也在該節。
 * vLLM branch 的 SM120 sequence-parallel stream（`VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL`，預設 1，不需要 `deep_gemm_mega_moe`）在 >= 512 tokens 的 eager prefill 會走 `reduce_scatter` 與 `all_gather`，
   end-to-end 的 op log 有 `reduce_scatter(dim=0) shape=(8192, 8192) -> topo`；`test_plugin.py` 另外覆蓋 CUDA graph 與 RS + AG == AR。
   只有 `deep_gemm_mega_moe` 的原版 SP 路徑在這台機器上是關的。
@@ -509,6 +706,7 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
   plugin、驗證紀錄、review fixes：`docs/h2_vllm_plugin.md`；pooler / unpooler GEMV 與 all-gather 融合：`docs/r3b_gemv_push.md`；medium all-reduce 的 bf16 exchange：`docs/r3c_medium_ar.md`。
   speculative launch 的 graph 上限 / sequence-parallel floor 組合與 prefill overlap（S1-9 lever 1、lever 2）：`docs/s19_spec_launch.md`；S1-10R Phase 0（spec profile 關閉 fused boundary）與 Phase 2b（2026-11-11，改回 fused boundary ON）亦在同一檔案。
   NUMA-local KV CPU offload（connector 比較、tier 大小公式、GPU KV bytes、determinism；S1-10）：`docs/s110_numa_offload.md`，量測工具 `bench/s110/`，檢查 `scripts/check_offload_launch.sh`（測試 `bench/test_check_offload_launch.sh`）。
+  最終 matrix、exact bytes 與 tier 公式、gates、已知限制、parked lever（S1-11）：`docs/s111_final_matrix.md`；原始紀錄 `muse_wf/s1-11/`（`PHASE2_RESULTS.md`、`phase2_results.json`、`phase2_verify.json`、`swap_predictor.json`）。
 * 伺服器上的資料（不在本資料夾）：benchmark 結果 `/raid/vllm-runtime/musetest/results/<tag>/`；測試 / benchmark 的 log 與 jsonl `/raid/vllm-runtime/work/host/`；
   JIT cache `/raid/vllm-runtime/sm120-dev/vllm_cache/muse_topo/`；拓樸量測 script 與原始結果 `/raid/vllm-runtime/musetest/topo/`；NCCL 量測 `/raid/vllm-runtime/musetest/nccl/`。
 * 歷史：H1a（小訊息演算法）、H1b（large-message 演算法）、H2 / H2b（vLLM plugin）、review fixes（64-bit counter / flags、supports() 與 kernel 一致、fp16 的 bf16 exchange 溢位、對齊與 stream 規則，2026-10-24）、H3（本資料夾的定稿）。
