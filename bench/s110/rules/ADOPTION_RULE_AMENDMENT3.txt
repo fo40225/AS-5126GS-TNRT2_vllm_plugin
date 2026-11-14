@@ -1,8 +1,0 @@
-S1-10 ADOPTION RULE AMENDMENT 3 (2026-11-07 13:02, before the lazy_offload boots)
-Observation (two SIM_B boots, pooled with two OFF_B boots of the same salted protocol): DEC gmean 0.9943, cells c1 0.998, c16 1.003, c64 0.992, c128 0.984
-(single boots: c128 0.9935 and 0.9715; the OFF boot-to-boot spread is 0.994..1.008). G1 passes pooled, but the c128 cell hints at ~1.6 % of eager-store work
-(every completed block of every running request is stored) at the highest concurrency.
-Variant arm: SIM_B with `lazy_offload: true` (blocks are stored only when they approach eviction) at the same tier, same tree, two boots of the salted decode
-protocol (DEC x2 reps each) and one boot with the reuse cycle. It replaces eager mode as the chosen mode iff ALL hold against the eager arm of the same
-boots set: (a) pooled DEC gmean at least +0.4 % higher and its c128 cell not below 0.985 of OFF, (b) REU passes 2+ TTFT p50 within +10 % and p99 within +25 % of eager
-(re-admission 118k TTFT within +25 %), HIT >= 0.95, (c) zero failed requests and the single-stream smoke pairs of the final configuration equal. Otherwise eager stays.
