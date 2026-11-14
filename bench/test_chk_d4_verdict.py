@@ -79,12 +79,12 @@ half = C.merge_rank_results([(0, rank_results(pairs[:20], hx=[(1, 3)])), (20, ra
 check("chunk merge: global indices", half[1]["hx_bad"] == [3, 23] and half[1]["n"] == 40, half[1])
 
 
-def nc_of(tier_t=(3, 7), gpu_t=(6, 12), ok=True):
-    """A negative control as the driver records it."""
-    base = kv_of(pairs)
+def nc_of(tier_t=(3, 7), gpu_t=(6, 12), dirty_hx=(), dirty_xc=()):
+    """A negative control as the driver records it; dirty_* = a systematic difference that the baseline restore already shows."""
+    base = kv_of(pairs, hx=list(dirty_hx), xc=list(dirty_xc))
     t, g = pairs[tier_t[1]], pairs[gpu_t[1]]
-    c1 = kv_of(pairs, hx=[tier_t])
-    c2 = kv_of(pairs, hx=[tier_t, gpu_t], xc=[gpu_t])
+    c1 = kv_of(pairs, hx=[tier_t, *dirty_hx], xc=list(dirty_xc))
+    c2 = kv_of(pairs, hx=[tier_t, gpu_t, *dirty_hx], xc=[gpu_t, *dirty_xc])
     return {"baseline": base, "after_tier_corrupt": c1, "after_gpu_corrupt": c2, "tier_digest_changed": True, "tier_undo_ok": True, "target_in_loads": True,
             "tier_target": {"rank": tier_t[0], "key": t[0]}, "gpu_target": {"rank": gpu_t[0], "key": g[0]}}
 
@@ -110,6 +110,15 @@ for flag in ("tier_digest_changed", "tier_undo_ok", "target_in_loads"):
 check("negative control: absent is invalid", not C.eval_nc(None)[0])
 
 
+ok, why = C.eval_nc(nc_of(dirty_hx=[(2, 5), (4, 5)], dirty_xc=[(1, 20)]))
+check("negative control: a systematic baseline difference does not invalidate an exact delta", ok, why)
+ok, why = C.eval_nc(nc_of(tier_t=(2, 5), dirty_hx=[(2, 5)]))
+check("negative control: a target that already differs in the baseline is invalid", not ok, why)
+nc = nc_of(dirty_hx=[(2, 5)])
+nc["after_tier_corrupt"] = kv_of(pairs, hx=[(3, 7)])
+check("negative control: the baseline difference must stay visible in the control passes", not C.eval_nc(nc)[0])
+
+
 def b_rec(i, kind, **over):
     sp = {"drafted": 70, "accepted": 20, "calls": 10}
     r = {"req": i, "kind": kind, "plen": 100, "lp_requested": False, "tokens_equal": True, "first_diff": None, "lp_equal": True, "lp_max_abs": None,
@@ -125,6 +134,18 @@ def full_D(spec=True):
 
 v = C.final_verdict(full_D())
 check("full clean run: PASS", v["verdict"] == "PASS" and not v["reasons_fail"] and not v["reasons_artifact"], v)
+D = full_D()
+D["a"] = kv_of(pairs, hx=[(2, 5), (4, 5)], xc=[(1, 20)])
+D["nc"] = nc_of(dirty_hx=[(2, 5), (4, 5)], dirty_xc=[(1, 20)])
+v = C.final_verdict(D)
+check("a systematic byte difference (dirty baseline) with an exact control delta: FAIL, not ARTIFACT", v["verdict"] == "FAIL", v)
+D = full_D()
+D["a_recompute_requests"] = [4]
+check("(a) a request recomputed in X (H hit, X cached 0): ARTIFACT", C.final_verdict(D)["verdict"] == "ARTIFACT")
+D = full_D()
+D["b"][7]["cached"]["X"] = 0
+v = C.final_verdict(D)
+check("(b) a request recomputed in X although H hit: ARTIFACT", v["verdict"] == "ARTIFACT" and "recompute" in v["reasons_artifact"][0], v)
 D = full_D()
 D["nc"] = None
 check("no negative control: ARTIFACT", C.final_verdict(D)["verdict"] == "ARTIFACT")
@@ -173,6 +194,7 @@ check("a hit-length difference with equal tokens is a warning only", v["verdict"
 D = full_D()
 for r in D["b"]:
     r["cached"]["X"] = 0
+    r["cached"]["H"] = 0
 check("no tier hit at all in (b): ARTIFACT", C.final_verdict(D)["verdict"] == "ARTIFACT")
 check("an empty run is ARTIFACT, never PASS", C.final_verdict({"profile": "spec", "spec": True, "n_groups": NG})["verdict"] == "ARTIFACT")
 

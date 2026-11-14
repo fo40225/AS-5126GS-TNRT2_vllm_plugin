@@ -6,7 +6,6 @@ worker, so only mismatch lists travel back; corrupt_tier / corrupt_gpu / tier_di
 """
 import hashlib
 
-_STATE = {}   # per worker process: {"H": {gpu block id: bytes}} (digests of the pass-H GPU copies)
 
 
 def _handler():
@@ -130,7 +129,7 @@ def snap_h(self, gpu_ids):
     names = sorted(h.gpu_kv_caches)
     ids = [int(i) for i in gpu_ids]
     dg = digests(h.gpu_kv_caches, names, ids)
-    _STATE["H"] = dict(zip(ids, dg))
+    self._chk_h = dict(zip(ids, dg))   # kept on the worker object: no dependence on how the module is imported in the worker process
     return {"rank": _rank(self), "n": len(ids), "n_regions": len(names)}
 
 
@@ -145,7 +144,7 @@ def compare_loads(self, gpu_x, cpu_ids, gpu_h):
     names = sorted(h.gpu_kv_caches)
     dx = digests(h.gpu_kv_caches, names, [int(i) for i in gpu_x])
     dc = digests(h.cpu_kv_caches, names, [int(i) for i in cpu_ids])
-    return compare_digests(_rank(self), len(names), dx, dc, gpu_h, _STATE.get("H", {}))
+    return compare_digests(_rank(self), len(names), dx, dc, gpu_h, getattr(self, "_chk_h", {}))
 
 
 def compare_digests(rank, n_regions, dx, dc, gpu_h, hdig):

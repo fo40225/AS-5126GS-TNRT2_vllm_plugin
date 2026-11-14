@@ -131,32 +131,36 @@ def _set(entries):
 
 
 def eval_nc(nc):
-    """The negative control must report exactly the corrupted block: -> (ok, reasons)."""
+    """The negative control must report exactly the corrupted block ON TOP OF whatever the baseline restore already reports (a systematic difference, e.g. one KV
+    group, must not make the control unusable and hide a real bug as an artifact): -> (ok, reasons)."""
     if not nc:
         return False, ["no negative control result"]
-    why = []
     base, c1, c2 = nc.get("baseline"), nc.get("after_tier_corrupt"), nc.get("after_gpu_corrupt")
     if not (base and c1 and c2):
         return False, ["negative control incomplete: " + ",".join(k for k in ("baseline", "after_tier_corrupt", "after_gpu_corrupt") if not nc.get(k))]
+    why = []
     t, g = nc["tier_target"], nc["gpu_target"]
-    if base["n_loaded"] <= 0 or base["xc_bad"] or base["hx_bad"]:
-        why.append("baseline restore of the control request is not clean (or empty)")
+    want_t, want_g = (t["rank"], t["key"]), (g["rank"], g["key"])
+    b_hx, b_xc = _set(base["hx_bad"]), _set(base["xc_bad"])
+    if base["n_loaded"] <= 0:
+        why.append("baseline restore of the control request is empty")
+    if want_t in b_hx or want_t in b_xc or want_g in b_hx or want_g in b_xc or want_t == want_g:
+        why.append("a control target already differs in the baseline (or both targets are the same block)")
     if not nc.get("tier_digest_changed"):
         why.append("the tier corruption did not change the tier digest")
     if not nc.get("tier_undo_ok"):
         why.append("the tier corruption was not undone")
     if not nc.get("target_in_loads"):
         why.append("the corrupted tier block was not restored in the control pass")
-    want_t = {(t["rank"], t["key"])}
-    if _set(c1["hx_bad"]) != want_t:
-        why.append(f"after the tier corruption the H-vs-X leg reported {sorted(_set(c1['hx_bad']))}, expected exactly {sorted(want_t)}")
-    if c1["xc_bad"]:
-        why.append(f"after the tier corruption the X-vs-tier leg reported {sorted(_set(c1['xc_bad']))} (the restored GPU copy equals the corrupted tier copy, expected none)")
-    want_g = {(g["rank"], g["key"])}
-    if _set(c2["xc_bad"]) != want_g:
-        why.append(f"after the GPU corruption the X-vs-tier leg reported {sorted(_set(c2['xc_bad']))}, expected exactly {sorted(want_g)}")
-    if _set(c2["hx_bad"]) != want_t | want_g:
-        why.append(f"after the GPU corruption the H-vs-X leg reported {sorted(_set(c2['hx_bad']))}, expected exactly {sorted(want_t | want_g)}")
+    if _set(c1["hx_bad"]) != b_hx | {want_t}:
+        why.append(f"after the tier corruption the H-vs-X leg reported {sorted(_set(c1['hx_bad']))}, expected the baseline {sorted(b_hx)} plus exactly {want_t}")
+    if _set(c1["xc_bad"]) != b_xc:
+        why.append(f"after the tier corruption the X-vs-tier leg reported {sorted(_set(c1['xc_bad']))} (the restored GPU copy equals the corrupted tier copy), "
+                   f"expected the baseline {sorted(b_xc)}")
+    if _set(c2["xc_bad"]) != b_xc | {want_g}:
+        why.append(f"after the GPU corruption the X-vs-tier leg reported {sorted(_set(c2['xc_bad']))}, expected the baseline {sorted(b_xc)} plus exactly {want_g}")
+    if _set(c2["hx_bad"]) != b_hx | {want_t, want_g}:
+        why.append(f"after the GPU corruption the H-vs-X leg reported {sorted(_set(c2['hx_bad']))}, expected the baseline {sorted(b_hx)} plus exactly {want_t} and {want_g}")
     return not why, why
 
 
@@ -168,6 +172,8 @@ def final_verdict(D):
     if D.get("tracer_errors"):
         art.append(f"tracer errors {D['tracer_errors'][:3]}")
     a_art, bad = eval_kv(D.get("a"), D.get("n_groups", 0), D.get("a_uncovered_requests") or [])
+    if D.get("a_recompute_requests"):
+        a_art.append(f"(a) requests that hit the GPU cache in pass H but were recomputed (0 cached tokens) in pass X, not a tier hit: {D['a_recompute_requests'][:10]}")
     nc_ok, nc_why = eval_nc(D.get("nc"))
     art += a_art
     art += ["negative control: " + w for w in nc_why]
@@ -193,7 +199,9 @@ def final_verdict(D):
             fail.append(f"(b) request {i} {k}: logprobs differ H vs X (max abs {r['lp_max_abs']})")
         if D.get("spec") and not r["spec_equal"]:
             fail.append(f"(b) request {i} {k}: accepted/drafted counts differ H vs X ({r['spec']['H']} vs {r['spec']['X']})")
-        if r["cached"]["H"] != r["cached"]["X"]:
+        if r["cached"]["H"] > 0 and r["cached"]["X"] == 0:
+            art.append(f"(b) request {i} {k}: pass X was a recompute (0 cached tokens, H cached {r['cached']['H']}), not a tier hit")
+        elif r["cached"]["H"] != r["cached"]["X"]:
             warn.append(f"(b) request {i} {k}: cached tokens H {r['cached']['H']} != X {r['cached']['X']}")
     if seen and not any(r["cached"]["X"] > 0 for r in seen.values()):
         art.append("(b) no single-stream pass X was a tier hit")
@@ -951,6 +959,7 @@ def main():
             kv = compare_pairs(pairs, hm, void, vex)
             D["a_uncovered_requests"] = [idxs[k] for k, row in enumerate(rows) if (row["num_cached_tokens"] or 0) > 0 and by_req.get(idxs[k], 0) == 0]
             D["a"] = kv
+            D["a_recompute_requests"] = [idxs[k] for k in range(len(idxs)) if (rec["cached_H"][k] or 0) > 0 and (rec2["cached_X"][k] or 0) == 0]
             D["a_rec"] = {"cold_hot": rec, "restore": rec2, "loaded_blocks_per_request": {str(k): v for k, v in sorted(by_req.items())}}
             log("D4'(a)", json.dumps({k: kv[k] for k in ("n_loaded", "n_void", "n_with_h", "n_block_rank_xc", "n_block_rank_hx", "groups_loaded", "groups_with_h")}),
                 "xc_bad", len(kv["xc_bad"]), "hx_bad", len(kv["hx_bad"]), "uncovered", D["a_uncovered_requests"])
@@ -970,12 +979,14 @@ def main():
             rows, loads, m, rec1 = restore_pass("d4nc1", idxs)
             pairs, void, vex, _ = build_pairs(loads, m, idxs, hm)
             nc["baseline"] = compare_pairs(pairs, hm, void, vex)
-            cand = [p for p in pairs if p[5]]
+            b_hx, b_xc = _set(nc["baseline"]["hx_bad"]), _set(nc["baseline"]["xc_bad"])
+            nreg = nc["baseline"]["n_regions"][0]
+            rank_t, region_t = 3, nreg - 1
+            rank_g, region_g = 6, 0
+            cand = [p for p in pairs if p[5] and (rank_t, p[0]) not in b_hx | b_xc]
             gmax = max(p[1] for p in cand)
             tg = [p for p in cand if p[1] == gmax]
             t = tg[len(tg) // 2]
-            nreg = nc["baseline"]["n_regions"][0]
-            rank_t, region_t = 3, nreg - 1
             before = digests_of(llm.collective_rpc(W.tier_digest, args=([t[4]],)))
             cor = [c for c in llm.collective_rpc(W.corrupt_tier, args=(rank_t, t[4], region_t)) if c]
             after = digests_of(llm.collective_rpc(W.tier_digest, args=([t[4]],)))
@@ -986,10 +997,9 @@ def main():
                 pairs2, void2, vex2, _ = build_pairs(loads2, m2, idxs, hm)
                 nc["target_in_loads"] = any(p[0] == t[0] for p in pairs2)
                 nc["after_tier_corrupt"] = compare_pairs(pairs2, hm, void2, vex2)
-                cand2 = [p for p in pairs2 if p[0] != t[0] and p[5]]
+                cand2 = [p for p in pairs2 if p[0] != t[0] and p[5] and (rank_g, p[0]) not in b_hx | b_xc]
                 other = [p for p in cand2 if p[1] != t[1]] or cand2
                 g2 = other[len(other) // 2]
-                rank_g, region_g = 6, 0
                 corg = [c for c in llm.collective_rpc(W.corrupt_gpu, args=(rank_g, g2[3], region_g)) if c]
                 nc["gpu_target"] = {"rank": rank_g, "key": g2[0], "group": g2[1], "gpu_id": g2[3], "region": region_g, "worker": corg}
                 nc["after_gpu_corrupt"] = compare_pairs(pairs2, hm, void2, vex2)
