@@ -164,7 +164,7 @@ expect_fail keep2 "--keep-on-fail does not keep a server that never became healt
 grep -q 'CHK line PASS' "$d/spec_def/status.txt" && grep -q 'CHK line PASS' "$d/ns128_on/status.txt" && pass "the unmutated launches pass the serve-line check (CHK line PASS)" || bad "CHK line PASS missing" "$(grep CHK "$d/spec_def/status.txt")"
 grep -q 'NOTE --keep-env' "$d/keepenv/check_line.txt" && pass "--keep-env: the serve-line check runs against the launching shell's own line (noted, no derivation)" || bad "--keep-env serve-line check" "$(cat "$d/keepenv/check_line.txt")"
 K6='s/(num_speculative_tokens[^0-9]*)7/\16/'
-line_case() { # <name> <desc> <regex> <env assignments...>
+line_case() { # <name> <desc> <regex> <env assignments...>   (spec launch; line_case_ns for ns256)
   local name=$1 desc=$2 re=$3; shift 3
   expect_fail "$name" "$desc" 1 'CHK line FAIL' 0 serve_spec.sh "" STUB_STATE=spec_1 "$@" --
   grep -q -E -- "$re" "$d/$name/check_line.txt" && pass "  ... naming the difference" || bad "  ... naming the difference ($re)" "$(cat "$d/$name/check_line.txt")"
@@ -180,7 +180,8 @@ grep -q 'CHK spec PASS' "$d/ln_k_cmd/status.txt" && grep -q 'CHK offload PASS' "
 # serve_cmd.txt, the live line and the log all say K=6: only the clean-shell derivation (the env files say 7) can tell
 line_case ln_derive "m1: serve_cmd.txt, the live command line and the log all say K=6, the env files derive K=7" 're-derived from the env files' \
   "STUB_SERVECMD_SED=$K6" "STUB_ARG_SED=$K6" "STUB_LOG_SED=s/'num_speculative_tokens': 7/'num_speculative_tokens': 6/"
-line_case ln_ns "m1: ns256: the live command line has --max-num-seqs 128 instead of 256" 'live command line differs' 'STUB_ARG_SED=s/^256$/128/'
+expect_fail ln_ns "m1: ns256: the live command line has --max-num-seqs 128 instead of 256 and the capture cap 128 (the sed hits both 256 arguments)" 1 'CHK line FAIL' 0 serve_nonspec.sh ns256 STUB_STATE=ns256_1 'STUB_ARG_SED=s/^256$/128/' --
+grep -q -E 'live command line differs' "$d/ln_ns/check_line.txt" && pass "  ... naming the difference" || bad "  ... naming the difference" "$(cat "$d/ln_ns/check_line.txt")"
 # the serve line built in the launching shell must equal the clean-shell derivation BEFORE anything starts: a copy of the host folder whose launch.env lets an exported
 # LAUNCH_PORT through (not scrubbed) is refused with exit 2 and nothing is started
 cp_root=$d/hostcopy; mkdir -p "$cp_root"; cp -r "$here/launch" "$here/env" "$here/scripts" "$cp_root/"
@@ -213,7 +214,7 @@ sentinel_run() { # <name> <seconds to wait before a TERM or 0> <env assignments.
 # a late setsid (1.5 s): the old capture read the LAUNCHER's session id in that window
 sentinel_run race_ok 0 MUSE_LAUNCH_SETSID="$stub/slow_setsid" STUB_STATE=spec_1
 o=$d/race_ok/out; read -r rp rs rg rt < "$o/server.sess"
-if [ "$(cat "$d/race_ok.rc")" = 0 ] && [ "$(result race_ok/out | sed 's#.*##')" = "" ] && grep -q 'RESULT pass' "$o/status.txt" && [ "$rp" = "$(cat "$o/serve.pid")" ] && [ "$rs" = "$rp" ] && [ "$rg" = "$rp" ] \
+if [ "$(cat "$d/race_ok.rc")" = 0 ] && grep -q 'RESULT pass' "$o/status.txt" && [ "$rp" = "$(cat "$o/serve.pid")" ] && [ "$rs" = "$rp" ] && [ "$rg" = "$rp" ] \
    && [ "$rs" != "$(ps -o sid= -p "$sent" 2> /dev/null | tr -d ' ')" ] && grep -q "LAUNCHED pid=$rp sid=$rp " "$o/status.txt" && [ "$sent_alive" = yes ]; then pass "M2: a late setsid: the launch passes, server.sess names the server's own session (pid = sid = pgrp), sentinel untouched"
 else bad "M2: late setsid, passing launch" "rc=$(cat "$d/race_ok.rc") record='$rp $rs $rg $rt' sentinel=$sent_alive $(grep -a -E 'LAUNCHED|RESULT' "$o/status.txt" | tr '\n' '|')"; fi
 bash "$here/launch/stop_server.sh" "$o" > /dev/null 2>&1
