@@ -1,5 +1,11 @@
 # NUMA-local KV CPU offload (S1-10): SimpleCPUOffloadConnector + `--numa-bind`, exact per-rank tier
 
+> **Status 2026-11-11 (S1-10R): the numbers in this document are 0.32.0 numbers.** The gate of this study ran on vLLM 0.32.0 (`268c64b0e2` + `9388ed1133`) with host `6f47eb1790`;
+> production is now the 0.33.0 line (`sm120-muse-spark-open` `0261903b9e`, host `3192c6dd77`: spec KV bytes without a tier 11,720,212,480, `--max-num-scheduled-tokens 8192`, `NCCL_IB_DISABLE=1`, `VLLM_PLUGINS=muse_topo`).
+> Every flag-keyed or bytes value (the offload-on GPU bytes 11,525,693,440 / 16,957,243,392 / 17,357,799,424, the bytes per block-id 20,480 / 65,536, the 45 GiB per-rank tier, the per-node A_N and the margin M of section 4,
+> the S_live figures) is **0.32.0-derived and not re-derived on 0.33.0**; `env/offload.env` and the checks carry the same marks. S1-10R re-derives them (phase 3) and re-runs the gate chain (phase 4);
+> until then treat them as study facts, not as launch values for 0.33.0. The offload branch is rebased as `s110r-offload` onto host main `3192c6dd77` without changing the design or the frozen gate tools.
+
 Launch-scoped plus two generic vLLM commits (branch `muse/s110-offload` on `sm120-muse-spark-open` 268c64b0e2): 9388ed1133 "Keep a local KV cache connector from turning on the multimodal embedding path of a text-only launch" (needed) and
 359cdc74aa "Add a NUMA memory policy option (bind | preferred)" (optional, section 8). Host side: `env/offload.env` (sourced after `env/host.env`, before `env/spec_k7.env`), `scripts/check_offload_launch.sh` (the boot check), `bench/s110/` (the tools).
 Measured on `sm120-muse-spark-open` 268c64b0e2 + 9388ed1133 and host 6f47eb1790, real weights, EP8 + TP8, fp8 KV, max-model-len 131072. The pre-registered adoption rule and its amendments are in `bench/s110/rules/`.

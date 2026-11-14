@@ -20,6 +20,10 @@
 # come from the sourcing shell (env/offload.env of the launch's profile) or MUSE_OFFLOAD_EXPECT_BYTES / _BPB / _KV_MAX; when one is unknown, or serve_cmd.txt is
 # missing, or env/offload.env reported an error (unknown profile, no derived bytes), the check FAILS instead of skipping the comparison
 # (MUSE_OFFLOAD_ALLOW_LOG_ONLY=1 accepts a missing serve_cmd.txt for a log-only check; the KV maximum is then not checked).
+# 0.32.0-DERIVED EXPECTATIONS (S1-10R): the expected values come from env/offload.env of the sourcing shell and are all 0.32.0 numbers until S1-10R phase 3
+# re-derives them on the vLLM 0.33.0 line: the per-rank bytes, the bytes per block-id (spec 20,480 / ns 65,536: the blocks = floor(bytes / bpb) comparison below) and the
+# offload-on KV maximum (MUSE_OFFLOAD_KV_BYTES; a boot with the 0.33.0 flag-2 bytes 11,720,212,480 would FAIL the maximum check by design). The log-line formats ("Binding worker
+# subprocess", "SimpleCPUOffloadScheduler: Allocating", "SimpleCPUOffloadWorker [CPU]", "Using LBNHC KV cache layout") were last seen on 0.32.0 and are to be confirmed on the first 0.33.0 boot.
 # Exit 0 = in effect; 1 = a line with other values, no line, a mismatch or an unknown expectation; 2 = usage or unreadable log.
 if [ $# -ne 1 ]; then echo "usage: check_offload_launch.sh <serve.log>" >&2; exit 2; fi
 log=$1

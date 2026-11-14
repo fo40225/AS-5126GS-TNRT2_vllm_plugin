@@ -191,7 +191,7 @@ vLLM 繼續使用 NCCL（不會 crash）。看每個 collective 實際走哪條�
 ### 4.6 NUMA-local KV CPU offload（S1-10，選用；細節 `docs/s110_numa_offload.md`）
 
 `source env/host.env; source env/offload.env; source env/spec_k7.env`（speculative；`offload.env` 必須在 `spec_k7.env` 之前，因為它設定 `MUSE_SPEC_KV_BYTES_OVERRIDE`），再把 `$MUSE_OFFLOAD_SERVE_ARGS`
-（`--numa-bind --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both",...}'`）接在 `vllm serve` 後面，KV bytes 用 `$MUSE_SPEC_KV_BYTES`（11,525,693,440）。開機後跑 `scripts/check_offload_launch.sh <serve.log>`。
+（`--numa-bind --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both",...}'`）接在 `vllm serve` 後面，KV bytes 用 `$MUSE_SPEC_KV_BYTES`（11,525,693,440；0.32.0-derived，尚未在 vLLM 0.33.0 重新量測，S1-10R phase 3 重做；`spec_k7.env` 目前不會自動 source `offload.env`）。開機後跑 `scripts/check_offload_launch.sh <serve.log>`。
 結果（real weights、spec profile）：64k / 118k prompt 的 re-admission TTFT 6.30 / 12.44 s -> 0.29 / 0.47 s；比 GPU pool 大 1.6 倍的 working set 循環讀取時 TTFT p50 5.9 -> 0.24 s、throughput 10.9k -> 217k prompt tokens/s；
 沒有 reuse 時 decode -0.5 %（三次 boot 的 gmean）。需要 vLLM branch 的 `receives_remote_kv` 修正（沒有的話 kv_both connector 會把 text-only launch 切到 multimodal embedding 路徑，多 128 MiB GPU memory）。
 `MUSE_OFFLOAD=0` 回到沒有 offload 的 launch。native `OffloadingConnector` 已量測、不採用（每個 worker pin 整個 region：boot +100 s .. +21 分鐘、GPU page table 8 倍、decode -1.2 .. -2.1 %）。

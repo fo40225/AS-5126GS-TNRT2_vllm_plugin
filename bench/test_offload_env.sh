@@ -10,6 +10,7 @@ t() {
   if [ "$got" = "$want" ]; then echo "ok   $desc"; else echo "FAIL case '$desc'"; echo "    wanted: $want"; echo "    got:    $got"; fails=$((fails+1)); fi
 }
 # Note: `VAR=x source file` restores VAR after the source (bash), so the documented off switch is `export MUSE_OFFLOAD=0` before sourcing.
+# the expected numbers below are the 0.32.0-derived values of env/offload.env (S1-10R phase 3 re-derives them; update both together)
 SPEC=11525693440; NS256=16957243392; PB=48318382080
 t "spec defaults: bytes, bpb, spec override, serve args" "$SPEC 20480 $SPEC 1 1" \
   'source $E/offload.env; echo "$MUSE_OFFLOAD_KV_BYTES $MUSE_OFFLOAD_BPB $MUSE_SPEC_KV_BYTES_OVERRIDE $MUSE_OFFLOAD $(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c -- "--numa-bind --kv-transfer-config")"'

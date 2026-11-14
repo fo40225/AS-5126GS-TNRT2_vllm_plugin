@@ -13,6 +13,8 @@
 # Only a server of ours may be running: workers already up are counted in neither A_N nor W_N here (a second server would make the numbers meaningless).
 # OOM protection (not done here): start the server session with `echo 1000 > /proc/self/oom_score_adj` so that an OOM kill of this launch hits the server and
 # never a foreign process (the S1-10 harness did this for every process of its session).
+# 0.32.0-DERIVED (S1-10R): the default per-rank bytes (45 GiB), the margin M = 6.6 GiB and the W_N process footprints (workers 3.7 GiB anon + 0.3 GiB shmem, EngineCore 1.2 GiB,
+# API server 1.3 GiB) are 2026-11-07 measurements on the 0.32.0 line, before three reboots and the NIC mode change; S1-10R phase 3 re-measures A_N and the footprints on 0.33.0.
 # usage: [MUSE_OFFLOAD_PER_RANK_BYTES=<bytes>] [MUSE_OFFLOAD_MIN_LEFT_MIB=4096] [MUSE_OFFLOAD_NODE_ROOT=/sys/devices/system/node] preflight_offload.sh
 # Exit 0 = every GPU node can take the tier, 1 = a node is short, 2 = unreadable meminfo.
 root=${MUSE_OFFLOAD_NODE_ROOT:-/sys/devices/system/node}
