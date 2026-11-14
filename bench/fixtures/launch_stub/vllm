@@ -5,9 +5,12 @@
 #   STUB_MODE       ok (default) | die (exit 3 right after the log) | hang (never healthy)
 #   STUB_PORT       port to listen on; STUB_READY_DELAY seconds before /health answers 200 (default 0)
 #   STUB_LOG_SED / STUB_CCI_SED  sed scripts applied to the log / to the cache_config_info line
+#   STUB_EXPORT / STUB_UNSET  "NAME=value" exported / NAME unset in the server process (the live environment the launch script must catch)
 here=$(cd "$(dirname "$0")/.." && pwd)
 echo "$$ $*" > "${STUB_MARK:-/dev/null}"
 sed -E "${STUB_LOG_SED:-}" "$here/launch/${STUB_STATE:?}.log"
 [ "${STUB_MODE:-ok}" = die ] && exit 3
+[ -n "${STUB_EXPORT:-}" ] && export "$STUB_EXPORT"
+[ -n "${STUB_UNSET:-}" ] && unset "$STUB_UNSET"
 export STUB_CCI_FILE="$here/launch/$STUB_STATE.cache_config_info.txt"
 exec python3 -I "$(dirname "$0")/vllm_stub_server.py"

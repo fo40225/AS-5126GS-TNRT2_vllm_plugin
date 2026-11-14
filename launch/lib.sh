@@ -2,8 +2,10 @@
 # Shared flow of the production launch scripts (launch/serve_spec.sh, launch/serve_nonspec.sh). Sourced, never run.
 #
 # What a launch script does, in this order:
-#   1. reads its operator inputs (MUSE_OFFLOAD and the MUSE_LAUNCH_* hooks below), then scrubs every inherited MUSE_* / VLLM_MUSE* / SPEC_* export of the
-#      calling shell, so a dirty shell cannot change the launch (the gated boots started from a clean slate the same way; --keep-env opts out);
+#   1. reads its operator inputs (MUSE_OFFLOAD and the MUSE_LAUNCH_* hooks below), then scrubs every inherited MUSE_* / VLLM_* / NCCL_* / SPEC_* export (and
+#      CUDA_VISIBLE_DEVICES) of the calling shell, so a dirty shell cannot change the launch (the gated boots started from a clean slate the same way; --keep-env
+#      opts out). The scrub is backed by a hard post-boot check (check env): the live environment of the server, filtered like the gated boots' pid_environ.txt,
+#      must equal the one a clean `env -i` dry run of the same script derives (with --keep-env: the launching shell's own record);
 #   2. exports the runtime block of the gated boots (venv, caches, PYTHONPATH = host folder + vLLM tree) and sources env/host.env and the profile files;
 #   3. builds the serve line and writes serve_cmd.txt and env.txt exactly like the gated boots (printf %q of every argument; the same env filter);
 #   4. refuses to start when the GPUs are busy or, for a tier-ON launch, scripts/preflight_offload.sh fails;
@@ -14,6 +16,7 @@
 # Exit codes: 0 = READY and every check passed (server left running); 1 = a post-boot check failed (server stopped unless --keep-on-fail);
 #             2 = refused to start (bad input, busy GPUs, failed preflight, env file error): nothing was started; 3 = the server never became READY
 #             (died, timed out or was interrupted; stopped); 64 = usage.
+# Every MUSE_LAUNCH_* hook that is set is logged as a HOOK line in status.txt (a stale export such as a preflight stub is visible in the record).
 # --dry-run builds everything up to the serve line and writes serve_cmd.txt and env.txt, then exits 0 without any GPU, venv, preflight or server step.
 #
 # Inputs read BEFORE the scrub (shell variables of this script, never exported):
@@ -52,6 +55,7 @@ lc_init() {
     esac
   done
   LC_OFFLOAD_IN=${MUSE_OFFLOAD-}
+  LC_HOOKS=$(env | grep -a -E '^MUSE_LAUNCH_' | LC_ALL=C sort | tr '\n' ' ')
   LC_VLLM=${MUSE_LAUNCH_VLLM:-vllm}
   LC_PROBE_PORT=${MUSE_LAUNCH_PORT:-}
   LC_POLL_S=${MUSE_LAUNCH_POLL_S:-5}
@@ -66,12 +70,32 @@ lc_init() {
   case "$LC_OFFLOAD_IN" in ""|0|1) ;; *) echo "launch: MUSE_OFFLOAD must be 0 or 1, got '$LC_OFFLOAD_IN'" >&2; exit 2 ;; esac
   if [ "$LC_KEEP_ENV" = 0 ]; then
     local v
-    for v in $(compgen -e | grep -E '^(_MUSE_|MUSE_|VLLM_MUSE|SPEC_|R2E_|FP8_F|FCSHARD_)'); do unset "$v"; done
-    unset VLLM_SERVER_DEV_MODE PYTORCH_CUDA_ALLOC_CONF VLLM_KV_CACHE_LAYOUT NCCL_P2P_LEVEL NCCL_IB_DISABLE NCCL_GRAPH_FILE VLLM_PLUGINS
+    # every VLLM_* and NCCL_* export goes (the script sets the ones it needs itself, after this point), not only a list of named ones
+    for v in $(compgen -e | grep -E '^(_MUSE_|MUSE_|VLLM_|NCCL_|SPEC_|R2E_|FP8_F|FCSHARD_)'); do unset "$v"; done
+    unset PYTORCH_CUDA_ALLOC_CONF CUDA_VISIBLE_DEVICES
   fi
   # the variables the env files read: a shell variable of ours, never an export
   unset HOST
   HOST=$LC_ROOT
+}
+
+# lc_clean_environ: the environment the server must inherit, derived from the env files in a clean shell (env -i, the operator's MUSE_OFFLOAD only) instead of the launching shell;
+# the dry run of the same script writes pid_environ_expected.txt. Prints the file name; returns 1 when the derivation fails.
+lc_clean_environ() {
+  local script=serve_spec.sh parg=() ref=$LC_OUT/clean_ref
+  if [ "$LC_KIND" = nonspec ]; then script=serve_nonspec.sh; parg=("$LC_PROFILE"); fi
+  rm -rf "$ref"
+  env -i PATH="$PATH" HOME="${HOME:-/}" ${LC_OFFLOAD_IN:+MUSE_OFFLOAD=$LC_OFFLOAD_IN} bash "$LC_ROOT/launch/$script" "${parg[@]}" --dry-run --out "$ref" > "$LC_OUT/clean_ref.stdout" 2>&1 || return 1
+  [ -s "$ref/pid_environ_expected.txt" ] || return 1
+  echo "$ref/pid_environ_expected.txt"
+}
+
+# lc_check_env <reference> <live>: the live environment of the server (filtered) equals the reference exactly; prints the difference otherwise
+lc_check_env() {
+  local d
+  d=$(diff "$1" "$2") && { echo "OK live environ = reference ($(wc -l < "$1") lines)"; return 0; }
+  echo "FAIL live environment of the server differs from the clean-shell derivation (< expected, > live):"; echo "$d"
+  return 1
 }
 
 # lc_log <message>: status line to stdout and to $LC_OUT/status.txt (once the output directory exists)
@@ -236,10 +260,19 @@ lc_main() {
   LC_STATUS=$LC_OUT/status.txt
   lc_records
   lc_log "START profile=$name tier=$LC_TIER bytes=$LC_KVB mns=$LC_MNS tree=$LC_TREE host=$HOST out=$LC_OUT dry_run=$LC_DRY"
+  [ -z "$LC_HOOKS" ] || lc_log "HOOK test hooks set in the calling shell (they replace the real vllm / preflight / nvidia-smi / venv): $LC_HOOKS"
   if [ "$LC_DRY" = 1 ]; then
     lc_log "DRYRUN serve_cmd.txt and env.txt written; no preflight, no GPU, no server"
     echo "RESULT dryrun" >> "$LC_STATUS"
     return 0
+  fi
+  # the reference environment of the server: a clean-shell derivation (a leak of the calling shell cannot hide in it); --keep-env: this shell's own record
+  if [ "$LC_KEEP_ENV" = 0 ]; then
+    LC_ENV_REF=$(lc_clean_environ) || lc_refuse "cannot derive the clean-shell environment (see $LC_OUT/clean_ref.stdout)"
+    cmp -s "$LC_ENV_REF" "$LC_OUT/pid_environ_expected.txt" || lc_refuse "the scrubbed environment of this shell differs from the clean-shell derivation (diff $LC_ENV_REF $LC_OUT/pid_environ_expected.txt)"
+  else
+    LC_ENV_REF=$LC_OUT/pid_environ_expected.txt
+    lc_log "KEEP_ENV the environment check compares with the launching shell's own record, not with a clean shell"
   fi
   # the node-oom protection recommended by preflight_offload.sh: an OOM kill must hit this session first
   echo 1000 > /proc/self/oom_score_adj 2> /dev/null
@@ -316,6 +349,7 @@ lc_ready_facts() {
 # lc_checks: the post-boot checks of the profile (expectations come from this shell's env files)
 lc_checks() {
   local log=$LC_OUT/serve.log
+  lc_check env lc_check_env "$LC_ENV_REF" "$LC_OUT/pid_environ.txt"
   if [ "$LC_KIND" = spec ]; then
     lc_check spec env SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD="$MUSE_OFFLOAD" bash "$LC_ROOT/scripts/check_spec_launch.sh" "$log"
   fi

@@ -82,6 +82,12 @@ expect_ok ns128_on "ns128, MUSE_OFFLOAD=1 opts in: the adoption line" serve_nons
 # a dirty calling shell must not change the launch (the gated boots started from a clean slate)
 expect_ok dirty "spec from a dirty shell (MUSE_SPEC_MNST=0, FUSED_BOUNDARY=0, NCCL_P2P_LEVEL, SPEC_EXPECT_FB=0, an inherited ON override): the adoption line" serve_spec.sh "" spec_1 1 \
   MUSE_SPEC_MNST=0 VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 NCCL_P2P_LEVEL=NVL SPEC_EXPECT_FB=0 MUSE_OFFLOAD_PER_RANK_BYTES=1 MUSE_TOPO_ENABLE=0 VLLM_PLUGINS=x _MUSE_FOO=1
+expect_ok dirty2 "ns256 from a dirty shell with unnamed NCCL_* / VLLM_* exports (NCCL_ALGO, NCCL_DEBUG, VLLM_ATTENTION_BACKEND, VLLM_LOGGING_LEVEL, CUDA_VISIBLE_DEVICES): the adoption line and environment" serve_nonspec.sh ns256 ns256_1 1 \
+  NCCL_ALGO=Ring NCCL_DEBUG=INFO NCCL_PROTO=Simple VLLM_ATTENTION_BACKEND=X VLLM_LOGGING_LEVEL=DEBUG CUDA_VISIBLE_DEVICES=0
+grep -q 'CHK env PASS' "$d/dirty2/status.txt" && pass "  ... and the environment check passed" || bad "  ... and the environment check passed" "$(grep CHK "$d/dirty2/status.txt")"
+
+# the stub hooks are logged as HOOK lines (a stale MUSE_LAUNCH_* export is visible in the record)
+grep -q 'HOOK .*MUSE_LAUNCH_PREFLIGHT=' "$d/spec_def/status.txt" && pass "MUSE_LAUNCH_* hooks are logged as a HOOK line in status.txt" || bad "no HOOK line in status.txt"
 
 # ---- refusals: nothing is started
 expect_fail pf1 "preflight rc 1 refuses the ON launch (spec), nothing started" 2 'REFUSED preflight_offload.sh rc=1' 0 serve_spec.sh "" STUB_STATE=spec_1 STUB_PREFLIGHT_RC=1 --
@@ -135,6 +141,15 @@ expect_fail ck_ns_off "ns128 OFF: check_offload_launch fails (a connector line i
 expect_fail ck_ns_on "ns128 ON: check_offload_launch fails (workers disagree with the scheduler)" 1 'CHK offload FAIL' 0 serve_nonspec.sh ns128 MUSE_OFFLOAD=1 STUB_STATE=ns128_1 'STUB_LOG_SED=0,/790620 CPU blocks/s//790619 CPU blocks/' --
 # the state of the boot must match the launch: the tier-ON fixture under a tier-OFF launch fails (bytes, tokens, connector)
 expect_fail ck_mix "ns256 launched without the tier but the boot logged the tier-ON numbers" 1 'CHK (kv|offload) FAIL' 0 serve_nonspec.sh ns256 STUB_STATE=ns256_1 MUSE_OFFLOAD=0 --
+
+# ---- the live environment of the server is compared with the clean-shell derivation (review B1): an extra, a changed and a missing variable each fail it alone
+expect_fail env1 "spec: the server process carries an extra NCCL_ALGO: only the environment check fails (exit 1, server stopped)" 1 'CHK env FAIL' 0 serve_spec.sh "" STUB_STATE=spec_1 STUB_EXPORT=NCCL_ALGO=Ring --
+grep -q 'CHK spec PASS' "$d/env1/status.txt" && grep -q 'CHK offload PASS' "$d/env1/status.txt" && grep -q 'CHK kv PASS' "$d/env1/status.txt" && grep -q '^> NCCL_ALGO=Ring' "$d/env1/check_env.txt" && pass "  ... and only the environment check failed, naming the variable" || bad "  ... and only the environment check failed" "$(grep CHK "$d/env1/status.txt")"
+expect_fail env2 "ns256: a changed value (VLLM_PLUGINS) in the server process fails the environment check" 1 'CHK env FAIL' 0 serve_nonspec.sh ns256 STUB_STATE=ns256_1 STUB_EXPORT=VLLM_PLUGINS=other --
+expect_fail env3 "ns128: a variable missing in the server process (NCCL_P2P_LEVEL) fails the environment check" 1 'CHK env FAIL' 0 serve_nonspec.sh ns128 STUB_STATE=ns128_0 STUB_UNSET=NCCL_P2P_LEVEL --
+# --keep-env: the reference is the launching shell's own record, so its exports are expected in the server
+expect_ok keepenv "--keep-env: an inherited NCCL_ALGO is part of the launch and of the reference record (the environment check passes)" serve_spec.sh "--keep-env" spec_1 1 NCCL_ALGO=Ring
+grep -q 'KEEP_ENV' "$d/keepenv/status.txt" && grep -q '^NCCL_ALGO=Ring' "$d/keepenv/pid_environ.txt" && pass "  ... and the record says so" || bad "  ... and the record says so"
 
 # ---- --keep-on-fail
 expect_fail keep "--keep-on-fail: a failed check exits 1 and the server keeps running (pid in serve.pid); stop_server.sh stops it" 1 'FAILED 1 post-boot' 1 serve_nonspec.sh ns256 \

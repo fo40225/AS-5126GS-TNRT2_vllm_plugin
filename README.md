@@ -229,7 +229,7 @@ gate 數字（ON vs OFF）：reuse TTFT p50 x0.0481、prompt tok/s x26.19、TTFT
 
 ### 4.7 Production launch scripts（how to launch；S1-11）
 
-三個 production profile 各有一支 script，位於 `launch/`（伺服器上是 `/raid/vllm-runtime/host_topo/launch/`）。一次做完：清掉 calling shell 殘留的 `MUSE_*` / `VLLM_MUSE*` / `SPEC_*` export（`--keep-env` 才保留）、
+三個 production profile 各有一支 script，位於 `launch/`（伺服器上是 `/raid/vllm-runtime/host_topo/launch/`）。一次做完：清掉 calling shell 殘留的 `MUSE_*` / `VLLM_*` / `NCCL_*` / `SPEC_*` export 與 `CUDA_VISIBLE_DEVICES`（`--keep-env` 才保留；scrub 之外的變數，例如 `LD_PRELOAD`、`OMP_*`，不會被清也不在比對範圍）、
 匯出 gated boot 的 runtime（venv、cache、`PYTHONPATH` = 本資料夾 + vLLM tree）、source `env/host.env` 與 profile 的 env 檔、組出 serve line、tier ON 時先跑 `scripts/preflight_offload.sh`（rc != 0 就拒絕啟動）、
 server 在自己的 session 啟動、等 `/health`、存下 READY 當下的資料、跑開機後的檢查。**所有數字只來自 env 檔**：`env/spec_k7.env`（speculative，並 source `env/offload.env`）、`env/offload.env`（tier、ON bytes）、`env/launch.env`（共用 flag、non-speculative 的 no-tier bytes、預期 KV tokens / blocks）。
 
@@ -251,13 +251,13 @@ launch/stop_server.sh /raid/vllm-runtime/work/launch/spec                       
 * 選項：`--out DIR`（輸出目錄，預設 `./launch_<profile>_tier<0|1>_<時間>`）、`--keep-on-fail`（檢查失敗時不停 server）、`--keep-env`（不清 calling shell 的 export，做實驗用）、`--dry-run`（只寫 `serve_cmd.txt` 與 `env.txt`，不碰 GPU / venv / preflight）。
   shared GPU 時把整個指令包在 `flock -w 43200 /raid/vllm-runtime/sm120-dev/gpu.lock ...` 裡：server 會繼承 lock 的 fd，所以 lock 直到 server 結束才釋放。
 * 結束碼：0 = READY 且所有檢查通過（server 留著繼續跑）；1 = 開機後檢查失敗（除非 `--keep-on-fail`，server 已停止）；2 = 拒絕啟動（輸入錯誤、GPU 忙、preflight 失敗、env 檔錯誤，什麼都沒啟動）；3 = server 一直沒有 READY（死掉、逾時或被中斷，已停止）；64 = 用法錯誤。
-* 輸出目錄：`serve_cmd.txt`、`env.txt`（與 gated boot 同樣的寫法與 filter）、`serve.log`、`serve.pid`、`status.txt`（最後一行 `RESULT ...`）、`preflight.txt`、`cache_config_info.txt`（`/metrics` 的 `vllm:cache_config_info`，block 數只在這裡）、`pid_cmdline.txt`、`pid_environ.txt`、`pid_environ_expected.txt`、`gpu_mem_ready.txt`、`check_*.txt`。
+* 輸出目錄：`serve_cmd.txt`、`env.txt`（與 gated boot 同樣的寫法與 filter）、`serve.log`、`serve.pid`、`status.txt`（最後一行 `RESULT ...`）、`preflight.txt`、`cache_config_info.txt`（`/metrics` 的 `vllm:cache_config_info`，block 數只在這裡）、`pid_cmdline.txt`、`pid_environ.txt`、`pid_environ_expected.txt`、`clean_ref/`（clean shell 的 dry run）、`gpu_mem_ready.txt`、`check_*.txt`。
   `status.txt` 有 swap 紀錄（launch / READY 的 swap used、`pswpin` / `pswpout` 差）。
-* 開機後檢查（任何一個失敗都是失敗）：speculative：`SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD=$MUSE_OFFLOAD scripts/check_spec_launch.sh`、`scripts/check_offload_launch.sh`、`scripts/check_kv_launch.sh spec <1|0>`；
+* 開機後檢查（任何一個失敗都是失敗）：`env`（server process 的 live environ 經過與 gated boot 的 `pid_environ.txt` 相同的 filter，必須與 clean shell（`env -i`，只帶 `MUSE_OFFLOAD`）dry run 推導出的 `clean_ref/pid_environ_expected.txt` 逐行相同；`--keep-env` 時改比 calling shell 自己的紀錄，status.txt 有 `KEEP_ENV` 行）、speculative：`SPEC_EXPECT_FB=1 SPEC_EXPECT_OFFLOAD=$MUSE_OFFLOAD scripts/check_spec_launch.sh`、`scripts/check_offload_launch.sh`、`scripts/check_kv_launch.sh spec <1|0>`；
   non-speculative：`scripts/check_offload_launch.sh`（tier OFF 時 `MUSE_OFFLOAD_EXPECT=off`）與 `scripts/check_kv_launch.sh <ns128|ns256> <1|0>`（`--kv-cache-memory-bytes`、`--max-num-seqs`、ns256 的 capture cap 256 / ns128 無 cap、
-  KV tokens、`num_gpu_blocks`、FULL decode graph 的上限）。數字見第 4.6 節與 `env/launch.env` 的表。
+  KV tokens、`num_gpu_blocks`、FULL decode graph 的上限）。數字見第 4.6 節與 `env/launch.env` 的表。測試用的 `MUSE_LAUNCH_*` hook（取代 vllm / preflight / nvidia-smi / venv）只要有設就會在 `status.txt` 記一行 `HOOK ...`；production 啟動前確認 calling shell 沒有殘留這些 export。
 * 等價性：每條路徑的 serve line 與 export 的環境和 gated / adoption boot 逐 byte 相同，由 `bench/test_launch_equiv.sh` 靜態證明（spec ON / OFF、ns256 ON、ns128 ON 對 `muse_wf/s1-10r/adoption_boots/runs`；ns128 / ns256 OFF 對 S1-14 production 與 0.33.0 validation 的 line）。
-  已知差異：0.33.0 validation 的 ns256 OFF boot 沒有 env 紀錄，環境只能對 S1-14 的 ns128 record 與它的 `flags` 行證明；speculative 的 script 會 export `VLLM_SERVER_DEV_MODE=1`（adoption boot 也有），non-speculative 沒有。
+  已知差異：0.33.0 validation 的 ns256 OFF boot 沒有 env 紀錄，環境只能對 S1-14 的 ns128 record 與它的 `flags` 行證明；script 的 ns256 OFF launch 會 export `VLLM_PLUGINS=muse_topo`，而 0.33.0 validation boot（v033s3_ns256_1）沒有（host a26c2be 在它之後才加；S1-10R gate boot s110r_ns256_OFF_1 有，證據只有 0 tracebacks）；ns256 OFF 的 `cache_config_info` fixture（blocks 258,747）是從 VALIDATION.md 合成的（該文件第 204 行），s110r boot 沒存 metrics，smoke boot 會記錄真正的 `cache_config_info` 與 pid environ；speculative 的 script 會 export `VLLM_SERVER_DEV_MODE=1`（adoption boot 也有），non-speculative 沒有。
   不是這些路徑的 line 或環境就是新的 configuration（S1-17：每個 configuration 有 0.4-0.6 % SD 的固定偏移，margin 只有 spec ON 0.4 MiB、ns ON 1.1-1.8 MiB）。
 
 ## 5. 設定一覽與 accuracy class

@@ -60,7 +60,8 @@ for fl in ns256_0 ns256_0b; do
 done
 # the scripts from a dirty calling shell give the same records (the scrub): the operator inputs MUSE_OFFLOAD aside, nothing inherited changes the launch
 dirty=(MUSE_SPEC_MNST=0 MUSE_SPEC_GRAPH_CAP=384 MUSE_TOPO_ENABLE=0 MUSE_OFFLOAD_PER_RANK_BYTES=1 MUSE_OFFLOAD_NUMA_BIND=0 MUSE_SPEC_KV_BYTES_OVERRIDE=1 MUSE_OFFLOAD_KV_BYTES_OVERRIDE=1
-  VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 VLLM_MUSE_SPARK_SM120_DRAFT_FP8=0 VLLM_SERVER_DEV_MODE=0 SPEC_EXPECT_FB=0 NCCL_P2P_LEVEL=NVL NCCL_IB_DISABLE=0 NCCL_GRAPH_FILE=/x VLLM_PLUGINS=other _MUSE_X=1)
+  VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0 VLLM_MUSE_SPARK_SM120_DRAFT_FP8=0 VLLM_SERVER_DEV_MODE=0 SPEC_EXPECT_FB=0 NCCL_P2P_LEVEL=NVL NCCL_IB_DISABLE=0 NCCL_GRAPH_FILE=/x VLLM_PLUGINS=other _MUSE_X=1
+  NCCL_ALGO=Ring NCCL_DEBUG=INFO NCCL_PROTO=Simple NCCL_SOCKET_IFNAME=lo VLLM_ATTENTION_BACKEND=X VLLM_LOGGING_LEVEL=DEBUG VLLM_USE_V1=0 VLLM_TORCH_PROFILER_DIR=/x CUDA_VISIBLE_DEVICES=0)
 prove spec_1 serve_spec.sh "" "spec ON from a dirty shell" "${dirty[@]}"
 prove spec_0 serve_spec.sh "" "spec OFF from a dirty shell" "${dirty[@]}" MUSE_OFFLOAD=0
 prove ns256_1 serve_nonspec.sh ns256 "ns256 ON from a dirty shell" "${dirty[@]}"
@@ -72,6 +73,10 @@ cmp -s "$d/nc_on/serve_cmd.txt" "$d/nc_off/serve_cmd.txt" && bad "negative contr
 cmp -s "$d/nc_on/env.txt" "$d/nc_off/env.txt" && bad "negative control: spec ON and OFF env.txt are equal" || ok "negative control: spec ON and OFF env.txt differ"
 env -i PATH="$PATH" HOME="$HOME" MUSE_SPEC_MNST=0 bash "$here/launch/serve_spec.sh" --keep-env --dry-run --out "$d/nc_keep2" > /dev/null 2>&1
 cmp -s "$d/nc_keep2/serve_cmd.txt" "$ref/spec_1.serve_cmd.txt" && bad "negative control: --keep-env with MUSE_SPEC_MNST=0 gives the adoption line" || ok "negative control: --keep-env lets a dirty shell change the line (the scrub is what protects the default)"
+# the same leak classes are visible in the records when the scrub is off (the unnamed NCCL_* / VLLM_* variables are in env.txt and in the environment the server would inherit)
+env -i PATH="$PATH" HOME="$HOME" NCCL_ALGO=Ring VLLM_ATTENTION_BACKEND=X bash "$here/launch/serve_spec.sh" --keep-env --dry-run --out "$d/nc_keep3" > /dev/null 2>&1
+if grep -q '^NCCL_ALGO=Ring' "$d/nc_keep3/env.txt" && grep -q '^VLLM_ATTENTION_BACKEND=X' "$d/nc_keep3/pid_environ_expected.txt"; then ok "negative control: --keep-env carries an unnamed NCCL_* / VLLM_* export into env.txt and the expected server environment"
+else bad "negative control: --keep-env with NCCL_ALGO / VLLM_ATTENTION_BACKEND"; fi
 dry nc_ns128 serve_nonspec.sh ns128 MUSE_OFFLOAD=0; dry nc_ns256 serve_nonspec.sh ns256 MUSE_OFFLOAD=0
 cmp -s "$d/nc_ns128/serve_cmd.txt" "$d/nc_ns256/serve_cmd.txt" && bad "negative control: ns128 and ns256 serve lines are equal" || ok "negative control: ns128 and ns256 serve lines differ"
 # ---- the env files export exactly what the base commit's did (sourcing order of the gated boots), for every path
