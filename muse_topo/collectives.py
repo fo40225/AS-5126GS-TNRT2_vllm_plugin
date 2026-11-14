@@ -219,6 +219,8 @@ class TopoComm:
         cap = cap // 64 * 64
         self.large_chunk_bytes = max(64, min(cap, 1 << 20 if large_chunk_bytes is None else large_chunk_bytes))
         self.large = os.environ.get("MUSE_TOPO_LARGE", "1") != "0"
+        # fused collective + epilogue kernels (all_reduce_boundary, all_gather_boundary, all_gather_rmsnorm)
+        self.fused = os.environ.get("MUSE_TOPO_FUSED", "1") != "0"
         self.bf16_exchange = (os.environ.get("MUSE_TOPO_LARGE_BF16_EXCHANGE", "0") == "1"
                               if bf16_exchange is None else bool(bf16_exchange))
         self.ar_large_min = _AR_LARGE_MIN
@@ -274,6 +276,11 @@ class TopoComm:
         self._agree(cpu_group, reason, "IPC exchange", exc)
         i = self.info
         self._c.set_pdl(os.environ.get("MUSE_TOPO_PDL", "0") == "1")
+        # Where the fused collectives load the epilogue operands that do not depend on the collective (BndParams::ld_mode in
+        # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (bench_boundary_cold.py,
+        # 2026-10-24: all-reduce + boundary at T = 1 / 4 / 8: 12.1 / 14.6 / 18.8 us vs 12.8 / 15.3 / 19.3 for loading after the
+        # collective and 12.7 / 16.4 / 20.1 for an L2 prefetch at the start plus loads after the collective).
+        self._c.set_ld_mode(int(os.environ.get("MUSE_TOPO_BND_LOADS", "0")))
         self._closed = False
         self._seen: set = set()
         self._stream_ptr = None  # stream of the last eager call
@@ -429,6 +436,142 @@ class TopoComm:
         if grid is None:
             grid = max(1, min(max_grid, _cdiv(items, block * unroll)))
         self._c.all_reduce(x, out, algo, grid, block, unroll)
+        return out
+
+    # ------------------------------------------------------------------------------------------------
+    # all-reduce fused with the residual boundary of the Muse Spark decoder layer (csrc/boundary.cuh, csrc/ar_bnd.cu)
+    # ------------------------------------------------------------------------------------------------
+    BOUNDARY_D = 8192
+    # What the kernels can serve (one CTA per row; slot capacity of the workspace) ...
+    AR_BOUNDARY_MAX_ROWS = 64   # the slice buffers hold 64 rows of a 16 KiB message
+    AG_BOUNDARY_MAX_ROWS = 32   # unpooler shards [T, 1024] bf16 (LL8 slots of 64 KiB shards)
+    AG_RMS_MAX_ROWS = 64        # pooler shards [T, 512] bf16
+    # ... and where they beat the two-step path (bench/bench_boundary.py, 2026-10-24: a single CTA per row serves a few rows well, while
+    # the tuned many-CTA kernels of the plain collectives win from 16 rows on: fused - two-step = -1.0 us at T <= 8 and +3.0 us at T = 16
+    # for the all-reduce, -1.0 / +0.5 for the unpooler gather, -1.3 us up to T = 16 and +0.5 at T = 32 for the pooler gather).
+    DISPATCH_MAX_ROWS = {"all_reduce_boundary": 8, "all_gather_boundary": 8, "all_gather_rmsnorm": 16}
+
+    def _boundary_ok(self, t: torch.Tensor, shape, dtype) -> bool:
+        """Rank-uniform operand gate: device, dtype, shape and contiguity only. The kernels need 16-byte aligned operands, but
+        alignment is rank-local state (a gate must never depend on it, or one rank could run the two-step path while the others
+        run the fused kernel and hang), so misaligned operands are staged through an aligned copy inside the fused calls."""
+        return t.is_cuda and t.device == self.device and t.dtype == dtype and tuple(t.shape) == tuple(shape) and t.is_contiguous()
+
+    @staticmethod
+    def _aligned(t):
+        return t if t.data_ptr() % 16 == 0 else t.clone()
+
+    def supports_boundary_rows(self, kind: str, num_tokens: int) -> bool:
+        """Batch-size gate of the fused kernels that the model asks before it has the tensors: ``kind`` is
+        "all_reduce_boundary", "all_gather_boundary" or "all_gather_rmsnorm". Where the fused kernel is faster than the two-step path
+        (``DISPATCH_MAX_ROWS``). Identical on every rank."""
+        if self._closed or not self.fused or kind not in self.DISPATCH_MAX_ROWS:
+            return False
+        return 1 <= num_tokens <= self.DISPATCH_MAX_ROWS[kind] and self._kernel_rows_ok(kind, num_tokens)
+
+    def _kernel_rows_ok(self, kind: str, num_tokens: int) -> bool:
+        """Whether the kernel can serve ``num_tokens`` rows (a hard limit, see AR_BOUNDARY_MAX_ROWS ...)."""
+        if kind == "all_reduce_boundary":
+            return 1 <= num_tokens <= self.AR_BOUNDARY_MAX_ROWS and num_tokens * 4096 <= _ws_align(self.max_bytes // 4)
+        if kind == "all_gather_boundary":
+            return 1 <= num_tokens <= self.AG_BOUNDARY_MAX_ROWS
+        return kind == "all_gather_rmsnorm" and 1 <= num_tokens <= self.AG_RMS_MAX_ROWS
+
+    def boundary_params_ok(self, alpha, beta, pre_w, post_w=None, out_fp32=None) -> bool:
+        """Whether the per-channel operands of a boundary are what the kernels read: fp32 alpha / beta and bf16 weights of
+        8192 contiguous elements on this device (``out_fp32``: fp32, contiguous)."""
+        D = self.BOUNDARY_D
+        ok = (self._boundary_ok(alpha, (D,), torch.float32) and self._boundary_ok(beta, (D,), torch.float32)
+              and self._boundary_ok(pre_w, (D,), torch.bfloat16))
+        if post_w is not None:
+            ok = ok and self._boundary_ok(post_w, (D,), torch.bfloat16)
+        if out_fp32 is not None:
+            ok = ok and out_fp32.is_cuda and out_fp32.device == self.device and out_fp32.dtype == torch.float32 \
+                and out_fp32.is_contiguous()
+        return ok
+
+    def supports_all_reduce_boundary(self, x: torch.Tensor, stream: torch.Tensor) -> bool:
+        """Whether :meth:`all_reduce_boundary` can serve this call: bf16 ``x`` [T, 8192], 1 <= T <= 64, fp32 ``stream`` of
+        the same shape, both contiguous on this communicator's device (rank-uniform: shapes, dtypes, contiguity)."""
+        if self._closed or x.dim() != 2 or x.shape[1] != self.BOUNDARY_D:
+            return False
+        return (not self._closed and self._kernel_rows_ok("all_reduce_boundary", x.shape[0])
+                and self._boundary_ok(x, x.shape, torch.bfloat16) and self._boundary_ok(stream, x.shape, torch.float32))
+
+    def supports_all_gather_boundary(self, shard: torch.Tensor, stream: torch.Tensor) -> bool:
+        """Whether :meth:`all_gather_boundary` can serve this call: bf16 ``shard`` [T, 1024] (1 <= T <= 32), fp32 ``stream``
+        [T, 8192]."""
+        if self._closed or shard.dim() != 2 or shard.shape[1] != self.BOUNDARY_D // 8:
+            return False
+        T = shard.shape[0]
+        return (self._kernel_rows_ok("all_gather_boundary", T)
+                and self._boundary_ok(shard, shard.shape, torch.bfloat16)
+                and self._boundary_ok(stream, (T, self.BOUNDARY_D), torch.float32))
+
+    def supports_all_gather_rmsnorm(self, shard: torch.Tensor) -> bool:
+        """Whether :meth:`all_gather_rmsnorm` can serve this call: bf16 ``shard`` [T, 512], 1 <= T <= 64."""
+        if self._closed or shard.dim() != 2 or shard.shape[1] != 512:
+            return False
+        return (self._kernel_rows_ok("all_gather_rmsnorm", shard.shape[0])
+                and self._boundary_ok(shard, shard.shape, torch.bfloat16))
+
+    def all_reduce_boundary(self, x, stream, alpha, beta, pre_w, post_w, post_eps, pre_eps, post_gain, pre_gain,
+                            out_fp32=None):
+        """``all_reduce(x)`` followed by the residual boundary, in one kernel; returns ``(out, new_stream)``.
+
+        With ``y = all_reduce(x)`` (bf16, the arithmetic contract of this module, one final rounding) the kernel computes
+        exactly what vLLM's Triton ``_norm_residual_norm_fwd_kernel`` (bT = 1, num_warps = 32, D = 8192, gated residual,
+        per-channel alpha / beta) computes from ``y``: ``new_stream = alpha * stream + beta * norm_post(y)`` (fp32) and
+        ``out = norm_pre(new_stream)`` rounded to bf16, bit for bit (bench/test_boundary.py, bench/test_ar_boundary.py).
+        ``post_w`` None: unweighted post-norm; given: weight-first post-norm (``norm(y * (w + post_gain))``). ``pre_w`` is
+        the weight of the pre-norm applied after the normalization with gain ``pre_gain``. ``out_fp32`` (optional fp32
+        [T, 8192]) receives ``out`` widened.
+        """
+        self._order_stream()
+        x, stream, alpha, beta, pre_w = (self._aligned(t) for t in (x, stream, alpha, beta, pre_w))
+        post_w = None if post_w is None else self._aligned(post_w)
+        user_f32, out_fp32 = self._stage_out(out_fp32)
+        out = torch.empty_like(x)
+        new_stream = torch.empty_like(stream)
+        self._c.all_reduce_boundary(x, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, float(post_eps),
+                                    float(pre_eps), float(post_gain), float(pre_gain))
+        self._unstage_out(user_f32, out_fp32)
+        return out, new_stream
+
+    @staticmethod
+    def _stage_out(out_fp32):
+        """(caller's buffer to copy into or None, buffer the kernel writes): a misaligned ``out_fp32`` goes through a temp."""
+        if out_fp32 is None or out_fp32.data_ptr() % 16 == 0:
+            return None, out_fp32
+        return out_fp32, torch.empty_like(out_fp32)
+
+    @staticmethod
+    def _unstage_out(user_f32, staged):
+        if user_f32 is not None:
+            user_f32.copy_(staged)
+
+    def all_gather_boundary(self, shard, stream, alpha, beta, pre_w, post_w, post_eps, pre_eps, post_gain, pre_gain,
+                            out_fp32=None):
+        """``all_gather(shard, -1)`` (column concatenation of the 8 unpooler shards [T, 1024] into the branch [T, 8192]) followed
+        by the residual boundary, in one kernel; same contract as :meth:`all_reduce_boundary`, returns ``(out, new_stream)``."""
+        self._order_stream()
+        shard, stream, alpha, beta, pre_w = (self._aligned(t) for t in (shard, stream, alpha, beta, pre_w))
+        post_w = None if post_w is None else self._aligned(post_w)
+        user_f32, out_fp32 = self._stage_out(out_fp32)
+        out = torch.empty(stream.shape, dtype=torch.bfloat16, device=stream.device)
+        new_stream = torch.empty_like(stream)
+        self._c.all_gather_boundary(shard, stream, new_stream, out, out_fp32, alpha, beta, post_w, pre_w, float(post_eps),
+                                    float(pre_eps), float(post_gain), float(pre_gain))
+        self._unstage_out(user_f32, out_fp32)
+        return out, new_stream
+
+    def all_gather_rmsnorm(self, shard, weight, eps, gain):
+        """``all_gather(shard, -1)`` of the pooler shards [T, 512] followed by ``pre_expert_norm`` (RMSNorm over 4096, weight
+        applied after the normalization, ``f32(weight) + gain``), bf16 [T, 4096], bit for bit the Triton ``_rmsnorm_fwd_kernel``."""
+        self._order_stream()
+        shard, weight = self._aligned(shard), self._aligned(weight)
+        out = torch.empty((shard.shape[0], 4096), dtype=torch.bfloat16, device=shard.device)
+        self._c.all_gather_rmsnorm(shard, out, weight, float(eps), float(gain))
         return out
 
     def all_gather(self, x: torch.Tensor, dim: int, out: torch.Tensor | None = None) -> torch.Tensor:

@@ -48,7 +48,8 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── collectives.py           TopoComm：supports() 資格判斷、size dispatch 表（附量測日期與 protocol）、stream 規則
 │   ├── ops.py                   extension 的 JIT build（digest 目錄、flock 保護）與 IPC workspace
 │   ├── vllm_plugin.py           register()：patch CudaCommunicator 的 all_reduce / all_gather / reduce_scatter
-│   └── csrc/                    CUDA / C++ 原始碼（ar_sll.cu、flag.cu、ag.cu、large.cu、bindings.cpp ...）
+│   └── csrc/                    CUDA / C++ 原始碼（ar_sll.cu、flag.cu、ag.cu、large.cu、bindings.cpp ...；
+│                                boundary.cuh、ar_bnd.cu、ag_bnd.cu：collective + residual boundary / RMSNorm epilogue 的 fused kernel）
 ├── muse_topo-0.1.dist-info/     entry_points.txt：[vllm.general_plugins] muse_topo = muse_topo.vllm_plugin:register
 │                                （放在 PYTHONPATH 上就會被 vLLM 找到，不需要 pip install）
 ├── env/host.env                 主機環境變數：NCCL_P2P_LEVEL=SYS、MUSE_TOPO_ENABLE=1，opt-in 項目以註解列出
@@ -74,7 +75,8 @@ AS-5126GS-TNRT2_vllm_plugin/
 │   ├── h1a_latency.md           decode-size latency 表（vs NCCL、vs FlashInfer）
 │   ├── h1b_collectives.md       large-message all-reduce / reduce-scatter / all-gather
 │   ├── h1b_latency.md           large-message latency 表
-│   └── h2_vllm_plugin.md        plugin 的 patch 範圍、環境變數、驗證紀錄、benchmark、review fixes、限制
+│   ├── h2_vllm_plugin.md        plugin 的 patch 範圍、環境變數、驗證紀錄、benchmark、review fixes、限制
+│   └── r2d_fused_epilogue.md    decode 的 collective + residual boundary / pre-expert norm 融合（bit-exact 的 CUDA 版 Triton kernel）
 └── tools/                       本機端工具（/tmp/muse_tools 的副本）：deploy.sh、deploy_to.sh
 ```
 
@@ -188,7 +190,8 @@ accuracy class 的定義（對照目前 branch 的輸出）：
 | `MUSE_TOPO_ENABLE=1`（`env/host.env`），all_reduce 與 reduce_scatter | ON | more_accurate | 見第 6 節。算術：`P_I = ((x_a + x_b) + x_c) + x_d`（fp32，island 內 rank 升冪），`out = round(P_0 + P_1)`；每個 size、演算法、rank、run 之間 bitwise 相同（batch invariant） |
 | `MUSE_TOPO_ENABLE=1`，all_gather | ON | identical（純資料搬移） | 直接產生要求的 layout（dim 0 = rank-major；最後一維 = column concatenation），與 NCCL 的結果逐 bit 相同 |
 | `MUSE_TOPO_LARGE=0` | 1（large 演算法 ON） | 不影響數值 | A/B 開關：all-reduce > 8 MiB、reduce_scatter、all-gather shard > 1 MiB 改走 NCCL（即 H2 版行為） |
-| `MUSE_TOPO_OPS` | `all_reduce,all_gather,reduce_scatter` | 視 op 而定 | 指定哪些 op 走 topo |
+| `MUSE_TOPO_OPS` | `all_reduce,all_gather,reduce_scatter,boundary` | 視 op 而定 | 指定哪些 op 走 topo；`boundary` = 下一列的 fused kernel |
+| `MUSE_TOPO_FUSED=0`、`MUSE_TOPO_BND_LOADS` | fused ON、loads 0 | identical | decode（T <= 8，pooler gather T <= 16）時把 attention-out all-reduce / unpooler all-gather 之後的 residual boundary、pooler all-gather 之後的 pre-expert RMSNorm 當作 collective kernel 的 epilogue（`csrc/boundary.cuh` 是 vLLM Triton kernel 的 bit-exact CUDA 版本，已對 Triton SASS 驗證，見 `docs/r2d_fused_epilogue.md`）。vLLM 端的開關是 `VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY`（預設 1）。`MUSE_TOPO_BND_LOADS` 選擇 epilogue 運算元（stream / alpha / beta / weight）的載入位置（0..3，預設 0 最快），不影響數值 |
 | `MUSE_TOPO_MAX_BYTES` | 8 MiB（`TopoComm` 預設） | 不影響數值 | 只限制 decode / medium 演算法的訊息大小並決定 workspace 大小；更大的 all-reduce（到 2 GiB）本來就走 large 演算法，沒有理由調高 |
 | `MUSE_TOPO_TIMEOUT_S` | 600（plugin） | - | kernel 等不到 peer 時 `__trap()` 的秒數（`TopoComm` 單獨使用預設 10 s；vLLM 啟動時各 rank 可能差數十秒，所以 plugin 用 600） |
 | `MUSE_TOPO_LOG_OPS` | 0 | - | 每個 (op, dim, shape, dtype, stream, capturing, path) 第一次呼叫印一行；0 = debug level、1 = rank 0、2 = 每個 rank |

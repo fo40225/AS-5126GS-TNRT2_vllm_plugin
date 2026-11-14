@@ -158,6 +158,61 @@ def main():
     c.large, c.bf16_exchange = True, True
     assert cap(c) is False  # the large algorithms round the partials, the small all-reduce does not
     assert not Cap().__class__.__dict__["reduce_scatter_all_gather_matches_all_reduce"].fget(types.SimpleNamespace())
+    # fused collective + epilogue methods (the optional interface of the model's ops/fused_boundary.py)
+    class FusedFake(FakeComm):
+        def __init__(self, ok, params_ok=True):
+            super().__init__(ok)
+            self.params_ok = params_ok
+
+        def supports_boundary_rows(self, kind, n):
+            return self.ok and 1 <= n <= 64
+
+        def supports_all_reduce_boundary(self, x, stream):
+            return self.ok
+
+        def supports_all_gather_boundary(self, shard, stream):
+            return self.ok
+
+        def supports_all_gather_rmsnorm(self, shard):
+            return self.ok
+
+        def boundary_params_ok(self, *a, **k):
+            return self.params_ok
+
+        def _boundary_ok(self, t, shape, dtype):
+            return self.params_ok
+
+        def all_reduce_boundary(self, *a, **k):
+            return ("topo_arb", k.get("out_fp32"))
+
+        def all_gather_boundary(self, *a, **k):
+            return ("topo_agb", k.get("out_fp32"))
+
+        def all_gather_rmsnorm(self, *a, **k):
+            return "topo_agr"
+
+    kw = dict(alpha=x, beta=x, pre_weight=x, post_weight=None, post_eps=1e-8, pre_eps=1e-6, post_gain_center=0.0,
+              pre_gain_center=1.0)
+
+    def fused_dc(ok=True, params_ok=True, ops=("all_reduce", "all_gather", "reduce_scatter", "boundary")):
+        return types.SimpleNamespace(topo_comm=FusedFake(ok, params_ok), topo_trace=vp._OpTrace(0),
+                                     topo_ops=frozenset(ops))
+
+    dc = fused_dc()
+    assert vp._supports_fused_residual_boundary(dc, "all_reduce_boundary", 8)
+    assert not vp._supports_fused_residual_boundary(dc, "all_reduce_boundary", 65)
+    assert vp._all_reduce_residual_boundary(dc, x, x, **kw) == ("topo_arb", None)
+    assert vp._all_gather_residual_boundary(dc, x, x, out_fp32=x, **kw) == ("topo_agb", x)
+    assert vp._all_gather_rmsnorm(dc, x, x, 1e-6, 1.0) == "topo_agr"
+    assert dc.topo_trace.counts[("all_reduce_boundary", None, (4, 64), torch.bfloat16, 0x1234, False, "topo")] == 1
+    for dc in (fused_dc(ok=False), fused_dc(params_ok=False), fused_dc(ops=("all_reduce", "all_gather")),
+               types.SimpleNamespace(topo_comm=None, topo_trace=None, topo_ops=frozenset()), types.SimpleNamespace()):
+        assert vp._all_reduce_residual_boundary(dc, x, x, **kw) is None
+        assert vp._all_gather_residual_boundary(dc, x, x, **kw) is None
+        assert vp._all_gather_rmsnorm(dc, x, x, 1e-6, 1.0) is None
+    assert not vp._supports_fused_residual_boundary(fused_dc(ops=("all_reduce",)), "all_gather_rmsnorm", 1)
+    assert not vp._supports_fused_residual_boundary(types.SimpleNamespace(), "all_gather_rmsnorm", 1)
+    assert "boundary" in vp._ALL_OPS
     # MUSE_TOPO_OPS parsing and the register() gate
     os.environ["MUSE_TOPO_OPS"] = "all_reduce, bogus"
     assert vp._routed_ops() == frozenset({"all_reduce"})

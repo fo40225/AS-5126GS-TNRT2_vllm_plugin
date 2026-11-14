@@ -20,6 +20,13 @@ group, so putting the host folder on ``PYTHONPATH`` is enough (no pip install). 
   rank-local state like the data pointer (misaligned operands are staged through an aligned copy inside ``TopoComm``), so
   all ranks of a collective take the same path. Teardown must be symmetric: ``destroy`` of one rank while the others
   still issue topo collectives would leave them waiting (until ``MUSE_TOPO_TIMEOUT_S``).
+* ``supports_fused_residual_boundary`` / ``all_reduce_residual_boundary`` / ``all_gather_residual_boundary`` /
+  ``all_gather_rmsnorm`` (new methods, the optional interface of ``vllm/models/muse_spark/nvidia/ops/fused_boundary.py``):
+  the decode all-reduce / all-gathers of the Muse Spark layer with the element-wise kernel that follows them as an
+  epilogue (``csrc/boundary.cuh``: bit-exact CUDA mirror of vLLM's Triton boundary and RMSNorm kernels), see
+  ``docs/r2d_fused_epilogue.md``. Gated by ``MUSE_TOPO_OPS`` containing ``boundary`` (default) and ``MUSE_TOPO_FUSED != 0``;
+  a call the kernels cannot serve (shape, dtype, contiguity: all rank-uniform; misaligned operands are staged through an aligned
+  copy, never a reason to decline) returns ``None`` and the model runs the two steps itself.
 * ``destroy``: dumps the call counters and closes the topo communicator.
 
 Capability ``reduce_scatter_all_gather_matches_all_reduce`` (property of the patched ``CudaCommunicator``, a plain
@@ -42,7 +49,8 @@ the topo path through the fallback; the two hooks are therefore not patched.
 Environment (all optional):
 
 ``MUSE_TOPO_ENABLE=1``       required (checked here and by ``TopoComm``); anything else makes ``register`` a no-op
-``MUSE_TOPO_OPS``            comma list of ops to route, default ``all_reduce,all_gather,reduce_scatter``
+``MUSE_TOPO_OPS``            comma list of ops to route, default ``all_reduce,all_gather,reduce_scatter,boundary``
+                             (``boundary``: the fused collective + boundary / RMSNorm kernels)
 ``MUSE_TOPO_TIMEOUT_S``      spin timeout of the kernels, default 600 s here (TopoComm alone: 10 s). It must exceed
                              the largest start-up skew between ranks (per-rank JIT/Triton compiles run while the
                              other ranks already wait inside a collective); on expiry the kernel traps
@@ -55,6 +63,8 @@ Environment (all optional):
 ``MUSE_TOPO_LARGE_BF16_EXCHANGE``  1 (opt-in, class deterministic_different): the large all-reduce / reduce_scatter
                              exchange both island partials rounded to bf16 (bf16 inputs only; fp16 / fp32 keep the exact
                              exchange); default 0 (exact fp32 partials). Batch invariant only inside the large algorithm
+``MUSE_TOPO_FUSED``          0 disables the fused collective + epilogue kernels (``TopoComm.supports_boundary_rows``
+                             then declines every batch and the model runs the two steps); default 1
 ``MUSE_TOPO_LOG_OPS``        0 (default): the per-op summary goes to the debug log; 1: info log on group rank 0;
                              2: info log on every rank
 
@@ -74,7 +84,7 @@ import os
 logger = logging.getLogger("vllm.muse_topo.plugin")
 
 _PATCH_MARK = "_muse_topo_patched"
-_ALL_OPS = ("all_reduce", "all_gather", "reduce_scatter")
+_ALL_OPS = ("all_reduce", "all_gather", "reduce_scatter", "boundary")
 _DEFAULT_TIMEOUT_S = 600.0
 
 
@@ -267,6 +277,59 @@ def _wrap_reduce_scatter(orig):
     return reduce_scatter
 
 
+def _boundary_comm(self):
+    """The TopoComm of this communicator if the fused kernels are routed, else None."""
+    comm = getattr(self, "topo_comm", None)
+    if comm is None or "boundary" not in self.topo_ops:
+        return None
+    return comm
+
+
+def _supports_fused_residual_boundary(self, kind: str, num_tokens: int) -> bool:
+    comm = _boundary_comm(self)
+    return comm is not None and comm.supports_boundary_rows(kind, int(num_tokens))
+
+
+def _note_boundary(self, kind: str, x, path: str) -> None:
+    self.topo_trace.note(kind, x, None, path)
+
+
+def _all_reduce_residual_boundary(self, branch, stream, *, alpha, beta, pre_weight, post_weight, post_eps, pre_eps,
+                                  post_gain_center, pre_gain_center, out_fp32=None):
+    comm = _boundary_comm(self)
+    if (comm is None or not comm.supports_boundary_rows("all_reduce_boundary", branch.shape[0])
+            or not comm.supports_all_reduce_boundary(branch, stream)
+            or not comm.boundary_params_ok(alpha, beta, pre_weight, post_weight, out_fp32)):
+        return None
+    _note_boundary(self, "all_reduce_boundary", branch, "topo")
+    return comm.all_reduce_boundary(branch, stream, alpha, beta, pre_weight, post_weight, post_eps, pre_eps,
+                                    post_gain_center, pre_gain_center, out_fp32=out_fp32)
+
+
+def _all_gather_residual_boundary(self, shard, stream, *, alpha, beta, pre_weight, post_weight, post_eps, pre_eps,
+                                  post_gain_center, pre_gain_center, out_fp32=None):
+    comm = _boundary_comm(self)
+    if (comm is None or not comm.supports_boundary_rows("all_gather_boundary", shard.shape[0])
+            or not comm.supports_all_gather_boundary(shard, stream)
+            or not comm.boundary_params_ok(alpha, beta, pre_weight, post_weight, out_fp32)):
+        return None
+    _note_boundary(self, "all_gather_boundary", shard, "topo")
+    return comm.all_gather_boundary(shard, stream, alpha, beta, pre_weight, post_weight, post_eps, pre_eps,
+                                    post_gain_center, pre_gain_center, out_fp32=out_fp32)
+
+
+def _all_gather_rmsnorm(self, shard, weight, eps, gain_center):
+    import torch
+
+    comm = _boundary_comm(self)
+    if (comm is None or not comm.supports_boundary_rows("all_gather_rmsnorm", shard.shape[0])
+            or not comm.supports_all_gather_rmsnorm(shard)
+            or not comm._boundary_ok(weight, (4096,), torch.bfloat16)):
+        return None
+    _note_boundary(self, "all_gather_rmsnorm", shard, "topo")
+    return comm.all_gather_rmsnorm(shard, weight, eps, gain_center)
+
+
 def _wrap_destroy(orig):
     def destroy(self):
         comm = getattr(self, "topo_comm", None)
@@ -306,6 +369,10 @@ def register() -> None:
         CudaCommunicator.reduce_scatter = _wrap_reduce_scatter(CudaCommunicator.reduce_scatter)
         CudaCommunicator.destroy = _wrap_destroy(CudaCommunicator.destroy)
         CudaCommunicator.reduce_scatter_all_gather_matches_all_reduce = property(_rs_ag_matches_ar)
+        CudaCommunicator.supports_fused_residual_boundary = _supports_fused_residual_boundary
+        CudaCommunicator.all_reduce_residual_boundary = _all_reduce_residual_boundary
+        CudaCommunicator.all_gather_residual_boundary = _all_gather_residual_boundary
+        CudaCommunicator.all_gather_rmsnorm = _all_gather_rmsnorm
         setattr(CudaCommunicator, _PATCH_MARK, True)
         logger.info("muse_topo plugin registered in pid %d (ops=%s)", os.getpid(), ",".join(sorted(routed)))
     except Exception:
