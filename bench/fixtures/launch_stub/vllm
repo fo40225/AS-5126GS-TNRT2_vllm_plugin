@@ -1,0 +1,13 @@
+#!/bin/bash
+# Stub of `vllm serve` for bench/test_launch_flow.sh: prints the check-relevant log of a real boot (bench/fixtures/launch/$STUB_STATE.log, optionally
+# edited by the sed script $STUB_LOG_SED), then serves /health and /metrics like the API server. No GPU, no vLLM.
+#   STUB_STATE      fixture name (spec_1, spec_0, ns256_1, ns256_0, ns128_1, ns128_0)
+#   STUB_MODE       ok (default) | die (exit 3 right after the log) | hang (never healthy)
+#   STUB_PORT       port to listen on; STUB_READY_DELAY seconds before /health answers 200 (default 0)
+#   STUB_LOG_SED / STUB_CCI_SED  sed scripts applied to the log / to the cache_config_info line
+here=$(cd "$(dirname "$0")/.." && pwd)
+echo "$$ $*" > "${STUB_MARK:-/dev/null}"
+sed -E "${STUB_LOG_SED:-}" "$here/launch/${STUB_STATE:?}.log"
+[ "${STUB_MODE:-ok}" = die ] && exit 3
+export STUB_CCI_FILE="$here/launch/$STUB_STATE.cache_config_info.txt"
+exec python3 -I "$(dirname "$0")/vllm_stub_server.py"
