@@ -1,0 +1,44 @@
+<graphs version="1">
+  <graph id="0" pattern="4" crossnic="0" nchannels="4" speedintra="16" speedinter="16" latencyinter="0" typeintra="SYS" typeinter="SYS" samechannels="0">
+    <channel>
+      <gpu dev="0"/>
+      <gpu dev="1"/>
+      <gpu dev="2"/>
+      <gpu dev="3"/>
+      <gpu dev="4"/>
+      <gpu dev="5"/>
+      <gpu dev="6"/>
+      <gpu dev="7"/>
+    </channel>
+    <channel>
+      <gpu dev="0"/>
+      <gpu dev="1"/>
+      <gpu dev="2"/>
+      <gpu dev="3"/>
+      <gpu dev="4"/>
+      <gpu dev="5"/>
+      <gpu dev="6"/>
+      <gpu dev="7"/>
+    </channel>
+    <channel>
+      <gpu dev="0"/>
+      <gpu dev="1"/>
+      <gpu dev="2"/>
+      <gpu dev="3"/>
+      <gpu dev="4"/>
+      <gpu dev="5"/>
+      <gpu dev="6"/>
+      <gpu dev="7"/>
+    </channel>
+    <channel>
+      <gpu dev="0"/>
+      <gpu dev="1"/>
+      <gpu dev="2"/>
+      <gpu dev="3"/>
+      <gpu dev="4"/>
+      <gpu dev="5"/>
+      <gpu dev="6"/>
+      <gpu dev="7"/>
+    </channel>
+  </graph>
+</graphs>

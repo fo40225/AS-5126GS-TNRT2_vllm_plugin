@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+muse_topo = muse_topo.vllm_plugin:register

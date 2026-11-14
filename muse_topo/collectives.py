@@ -1,0 +1,533 @@
+"""TopoComm: P2P collectives specialized for the 8-GPU PCIe box (2 sockets x 4 GPUs, see topology.py).
+
+Public API (stable; the vLLM plugin and the large-message algorithms build on it)::
+
+    comm = TopoComm(cpu_group, device, rank, world_size, *, max_bytes=8 << 20, check_env=True)
+    comm.supports(op, tensor, dim=None) -> bool   # op in {"all_reduce", "all_gather", "reduce_scatter"}
+    comm.all_reduce(x, out=None)       -> tensor, same shape/dtype as x (new unless ``out`` is given)
+    comm.all_gather(x, dim, out=None)  -> new tensor; dim=-1 (last): out[..., o*w:(o+1)*w] = x_o (column
+                                          concatenation), dim=0: cat([x_0 .. x_7], 0) (rank-major, NCCL layout)
+    comm.reduce_scatter(x, out=None)   -> rows block r of the reduced [T, ...] tensor (T % 8 == 0), r = my rank
+    comm.close()
+
+Construction is collective (every rank of the TP group must call it with the same ``max_bytes``): it derives the
+topology (``TopoUnavailable`` if the host does not match or ``MUSE_TOPO_ENABLE != 1`` and ``check_env``),
+allocates the IPC workspace once (about 59 MiB per GPU for ``max_bytes=8 MiB``) and exchanges the handles over
+``cpu_group`` (a gloo group).
+
+``supports`` is the only eligibility check; callers fall back to NCCL when it returns False. It depends on the call's
+dtype/shape/contiguity/device only, never on rank-local state such as the data pointer, so every rank of a collective
+takes the same path (a topo rank waiting for an NCCL rank would deadlock). Operands whose data pointer is not 16-byte
+aligned (views with odd offsets) are staged through an aligned copy inside the ops. Conditions: CUDA tensor on
+the communicator's device, contiguous; all_reduce: bf16/fp16/fp32 and a size that is a
+multiple of 64 B and at most ``max_bytes`` (decode/medium algorithms), or a multiple of 128 B of any size up to 2 GiB
+(large algorithm, chunked reduce-scatter + all-gather through the same workspace); all_gather: any dtype, dim = last or
+0 (any other dim: ValueError), shard bytes a multiple of 4, and for dim = last the row bytes too (16 for shards
+above 64 KiB), shards of any size (above 1 MiB: chunked large algorithm, 16 B multiples); reduce_scatter: bf16/fp16/fp32, dim-0 row blocks, T % 8 == 0, block bytes a multiple
+of 16 and at least ``rs_min_bytes`` of message. The large algorithms and the size thresholds are described below.
+
+Large messages (prefill): the message is 8 equal blocks (block r = rows block r of a [T, H] tensor), processed in chunks
+of ``large_chunk_bytes`` (1 MiB) per block. reduce_scatter(chunk) leaves the reduced chunk of block r on rank r (the
+fp32 partial of the partner's block crosses the socket cut once: S/4 bytes per GPU); all_gather(chunk) distributes it.
+all_reduce = both, fused into one pipelined launch per chunk. Bitwise identical to the small algorithms, and
+all_gather(reduce_scatter(x), dim 0) == all_reduce(x) bitwise. ``out`` of all_reduce may alias ``x``.
+Opt-in ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (or ``bf16_exchange=True``): the two island partials are rounded to bf16 before
+the final add (half the cut bytes, class deterministic_different, still rank-identical and run-to-run deterministic). It
+applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm (fp16 and fp32 keep the exact exchange: an
+fp16 partial above 65504 would overflow) and must be the same on all ranks. It is batch invariant only inside the large
+algorithm: all_reduce messages below 2 MiB (and reduce_scatter vs all_reduce between 128 KiB and 2 MiB) use the exact small
+algorithms, so with the flag on an element can get different bits depending on which algorithm its message size selects.
+``MUSE_TOPO_LARGE=0`` disables the large algorithms (supports() then keeps the H1a limits).
+
+Calls are asynchronous on the current CUDA stream, CUDA-graph safe (no host state per call), and must be issued
+in the same order with the same shapes on all ranks.
+
+Stream rule: the double-buffered receive slots and the per-GPU call counter are only safe if the collectives of one
+communicator execute in stream order, one at a time. Eager calls therefore must stay on ONE stream. If a call
+arrives on another stream, the new stream first waits for everything enqueued so far on the previous stream (an
+event is recorded on it), which keeps the collectives totally ordered; with MUSE_TOPO_STRICT_STREAM=1 it raises
+instead. Calls issued while a CUDA graph is being captured are not checked (the kernels are replayed later): graph
+replays of one communicator must be launched on the same stream as the eager calls (vLLM: the main stream).
+
+Arithmetic contract of all_reduce (every size and algorithm; bitwise identical on all ranks and runs)::
+
+    P_I = ((x_{m0} + x_{m1}) + x_{m2}) + x_{m3}   in fp32, m0..m3 = ranks of island I ascending
+    out = round_to_dtype(P_0 + P_1)               in fp32, single final rounding
+
+Islands are the two sockets ({0,1,2,3} and {4,5,6,7} on this host); partner(r) = r ^ 4. Words of the exchanged
+payload that equal 0xFFFFFFFF (a NaN pattern) are replaced by 0xFFFFFFFE, so NaN payloads may change (NaN stays NaN).
+all_gather is bit exact for any payload.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+import torch
+
+from . import ops
+from .topology import TopoInfo, TopoUnavailable, derive, env_enabled, local_descriptor
+
+logger = logging.getLogger("vllm.muse_topo")
+
+_AR_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_OPS = ("all_reduce", "all_gather", "reduce_scatter")
+MAX_GRID = 128
+WORLD = 8
+
+# Size dispatch tables: (largest nbytes covered, algorithm, grid, block threads, unroll).
+# Measured on the AS-5126GS-TNRT2 box on 2026-10-23 with bench/bench_h1a.py --sweep (8 processes, CUDA graph of
+# back-to-back calls, bf16, NCCL_P2P_LEVEL=SYS baseline): the winning configuration of every measured size is applied
+# to the bucket that ends at that size (bench/make_table.py generates these literals; sizes up to 512 KiB (all_reduce)
+# and 64 KiB (all_gather) come from the final kernels' sweep, larger sizes from the sweep before the store-on-arrival
+# change, whose best configurations are equivalent). Algorithm ids: all_reduce 1 = 2-phase sentinel, 2 = 3-phase
+# sentinel, 3 = 3-phase flag; all_gather 1 = LL8, 2 = flag. Algorithms 1 and 3 of all_reduce never won at any size
+# (they stay available through TopoComm._all_reduce for tests and experiments).
+# NOTE (H1b): rows from 2 MiB on are only reached by explicit _all_reduce(...) calls (tests, benchmarks): the default dispatch sends messages
+# >= _AR_LARGE_MIN (2 MiB) to _AR_LARGE_TABLE below.
+_AR_TABLE = [
+    (8192, 2, 4, 32, 1),
+    (16384, 2, 4, 64, 1),
+    (32768, 2, 8, 64, 1),
+    (65536, 2, 32, 32, 1),
+    (131072, 2, 64, 32, 1),
+    (262144, 2, 64, 32, 1),
+    (524288, 2, 8, 256, 1),
+    (1048576, 2, 8, 256, 1),
+    (2097152, 2, 8, 256, 1),
+    (4194304, 2, 8, 256, 1),
+    (1 << 62, 2, 4, 256, 2),
+]
+_AG_TABLES = {
+    0: [  # layout 0: dim = -1 (column concatenation)
+        (1024, 1, 2, 128, 1),
+        (2048, 1, 4, 128, 1),
+        (4096, 1, 8, 128, 1),
+        (8192, 1, 64, 32, 1),
+        (16384, 1, 128, 32, 1),
+        (32768, 2, 32, 128, 1),
+        (50512, 2, 24, 256, 1),
+        (65536, 2, 16, 256, 1),
+        (131072, 2, 32, 1024, 1),
+        (262144, 2, 32, 1024, 1),
+        (1 << 62, 2, 32, 256, 1),
+    ],
+    1: [  # layout 1: dim = 0 (rank-major)
+        (1024, 1, 2, 128, 1),
+        (2048, 1, 4, 128, 1),
+        (4096, 1, 8, 128, 1),
+        (8192, 1, 64, 32, 1),
+        (16384, 1, 128, 32, 1),
+        (32768, 2, 16, 256, 1),
+        (50512, 2, 24, 256, 1),
+        (65536, 2, 16, 256, 1),
+        (131072, 2, 32, 1024, 1),
+        (262144, 2, 32, 1024, 1),
+        (1 << 62, 2, 32, 256, 1),
+    ],
+}
+
+
+# Large-message configurations (bench/bench_h1b.py --search, coordinate descent per size, verified bitwise; AS-5126GS-TNRT2,
+# 8 processes, CUDA graph of back-to-back calls, bf16 [T, 8192], NCCL_P2P_LEVEL=SYS baseline; 2026-10-23, details and the
+# measured tables in docs/h1b_latency.md). Rows end at the largest size they were measured at; larger sizes use the last.
+# all_reduce: (largest nbytes covered, mode, chunk bytes, reduce-scatter blocks, all-gather blocks, block threads,
+# unroll, cut_rs, cut_ag); mode 1 = fused pipeline step, 0 = two launches per chunk; cut_x = 1: the socket-cut pushes of
+# the all-gather role come from one dedicated block (cut_rs = 1 / cut_ag = 2 variants were never faster: the cut is
+# shared by both roles and a single staged block cannot feed it better than the workers).
+_AR_LARGE_TABLE = [
+    (2 << 20, 1, 1 << 20, 4, 32, 512, 1, 0, 1),  # 2 MiB: 117 us (H1a 121, NCCL 134)
+    (3 << 20, 0, 1 << 20, 4, 32, 256, 1, 0, 1),  # 2.5 MiB 143 us, 3 MiB 170 us (H1a 182, NCCL 218)
+    (6 << 20, 0, 1 << 20, 4, 32, 256, 1, 0, 1),  # 4 MiB 221 us, 6 MiB 329 us (H1a 241 / 356)
+    (8 << 20, 1, 1 << 20, 4, 32, 512, 1, 0, 1),  # 8 MiB 449 us (H1a 477, NCCL 579)
+    (1 << 62, 1, 1 << 20, 4, 8, 512, 2, 0, 1),  # 16 MiB 906 us, 64 MiB 3561 us, 128 MiB 7130 us (NCCL 1158 / 4611 / 9177)
+]
+# reduce_scatter: (largest nbytes of the message, chunk bytes, blocks, block threads, unroll, cut)
+_RS_TABLE = [
+    (1 << 20, 1 << 20, 8, 256, 1, 0),  # 128 KiB 7.7 us (NCCL 27.7), 512 KiB 20 us (38), 1 MiB 36.6 us (49)
+    (4 << 20, 1 << 20, 4, 256, 1, 0),  # 2 MiB 66 us (73), 4 MiB 126 us (150)
+    (1 << 62, 1 << 20, 8, 256, 1, 0),  # 16 MiB 496 us (598), 64 MiB 1973 us (2373), 128 MiB 4024 us (4790)
+]
+# large all_gather: (largest shard bytes, chunk bytes, blocks, block threads, cut); used from _AG_LARGE_MIN bytes of shard
+_AGL_TABLE = [
+    (1 << 62, 1 << 19, 8, 1024, 1),  # out 2 MiB 52 us (H1a 56, NCCL 72), 16 MiB 416 us (479 / 588), 128 MiB 3315 us (3890 / 4660)
+]
+# Thresholds re-checked in H2b against the raw bench_h1b rows (b2b us, H1a table vs the searched large configuration): 1 MiB 61.3 vs 63.6, 1.5 MiB 91.2 vs
+# 90.2 (a tie), 2 MiB 120.4 vs 115.8, 2.5 MiB 150.9 vs 143.0, 3 MiB 179.3 vs 169.2: the crossover is at 2 MiB. The full-model EP8 runs
+# (docs/h2_vllm_plugin.md) confirm the tables end to end.
+_AR_LARGE_MIN = 2 << 20  # messages below use the H1a algorithms (up to max_bytes): they win at 1 MiB (61.3 vs 63.6 us)
+_RS_MIN_BYTES = 128 << 10
+_AG_LARGE_MIN = 256 << 10  # shards from this size on use the large engine instead of the H1a flag path (10.4 vs 11.4 us at 128 KiB)
+_LARGE_MAX_BYTES = 2 << 30
+
+
+def _ws_align(v: int) -> int:
+    return (v + 255) & ~255
+
+
+def _cdiv(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _ag_layout(x: torch.Tensor, dim: int):
+    """(layout, row bytes) of an all_gather of ``x`` along ``dim``, or None if the topo path does not gather that dim.
+
+    layout 0 = column concatenation (dim = last dim of a >= 2-D tensor), layout 1 = rank-major (dim 0 and every 1-D
+    tensor, NCCL layout). The row of layout 1 is the whole shard: the kernels only use the row of layout 0.
+    """
+    nd = x.dim()
+    if nd == 0:
+        return None
+    d = dim + nd if dim < 0 else dim
+    if d < 0 or d >= nd:
+        return None
+    if nd == 1 or d == 0:
+        return 1, x.numel() * x.element_size()
+    if d == nd - 1:
+        return 0, x.shape[-1] * x.element_size()
+    return None
+
+
+def _pick(table, nbytes):
+    for row in table:
+        if nbytes <= row[0]:
+            return row
+    return table[-1]
+
+
+class TopoComm:
+    __doc__ = __doc__
+
+    def __init__(self, cpu_group, device, rank: int, world_size: int, *, max_bytes: int = 8 << 20,
+                 ar1_max_bytes: int = 256 << 10, ag_ll_max_bytes: int = 64 << 10, ag_flag_max_bytes: int = 1 << 20,
+                 check_env: bool = True, timeout_s: float | None = None, large_chunk_bytes: int | None = None,
+                 bf16_exchange: bool | None = None):
+        if timeout_s is None:
+            timeout_s = float(os.environ.get("MUSE_TOPO_TIMEOUT_S", "10"))
+        if check_env and not env_enabled():
+            raise TopoUnavailable("MUSE_TOPO_ENABLE != 1")
+        import torch.distributed as dist
+
+        self.device = torch.device(device)
+        self.rank, self.world_size = rank, world_size
+        self.max_bytes, self.ar1_max_bytes, self.ag_ll_max_bytes = max_bytes, ar1_max_bytes, ag_ll_max_bytes
+        self.ag_flag_max_bytes = ag_flag_max_bytes
+        # The large algorithms reuse the small workspace: a chunk of one block must fit twice in a phase-a source slot
+        # (two sub-blocks), as fp32 partials in the partial region and once in an all-gather slot.
+        cap = min(_ws_align(max_bytes // 4) // 2, _ws_align(max_bytes // 2) // 2, _ws_align(ag_flag_max_bytes))
+        cap = cap // 64 * 64
+        self.large_chunk_bytes = max(64, min(cap, 1 << 20 if large_chunk_bytes is None else large_chunk_bytes))
+        self.large = os.environ.get("MUSE_TOPO_LARGE", "1") != "0"
+        self.bf16_exchange = (os.environ.get("MUSE_TOPO_LARGE_BF16_EXCHANGE", "0") == "1"
+                              if bf16_exchange is None else bool(bf16_exchange))
+        self.ar_large_min = _AR_LARGE_MIN
+        self.ag_large_min = _AG_LARGE_MIN
+        self.rs_min_bytes = _RS_MIN_BYTES
+        self._closed = True
+        self._ws = None
+        if world_size != 8:
+            raise TopoUnavailable(f"world size {world_size} != 8")
+        if self.device.type != "cuda":
+            raise TopoUnavailable("not a CUDA device")
+        torch.cuda.set_device(self.device)
+        # Every stage ends with an all-rank agreement, so a failure on one rank (missing nvcc, IPC error, ...) makes all
+        # ranks raise TopoUnavailable instead of leaving the others blocked in the next collective step.
+        # ---- stage 1: topology signature: gather descriptors, derive islands/partners, check P2P -----------------
+        try:
+            desc = local_descriptor(self.device)
+        except Exception as e:  # reported to all ranks through the descriptor
+            desc = {"error": repr(e)}
+        descs = [None] * world_size
+        dist.all_gather_object(descs, desc, group=cpu_group)
+        reason = ""
+        try:
+            self.info: TopoInfo = derive(descs, rank)
+            if not self._p2p_ok(descs):
+                raise TopoUnavailable("P2P access missing between some GPUs")
+        except TopoUnavailable as e:
+            reason = str(e)
+        except Exception as e:  # e.g. an unparsable sysfs file: report it like any other mismatch, on all ranks
+            reason = f"topology derivation failed: {e!r}"
+        self._agree(cpu_group, reason, "topology check")
+        # ---- stage 2: JIT build/load, workspace allocation -----------------------------------------------------------
+        reason, exc = "", None
+        try:
+            self.ext = ops.load()
+            lay = self.ext.layout(max_bytes, ar1_max_bytes, ag_ll_max_bytes, ag_flag_max_bytes)
+            self.workspace_bytes = int(lay["total"])
+            self._ws = ops.Workspace(self.ext, self.device, self.workspace_bytes)
+        except Exception as e:
+            reason, exc = repr(e), e
+        self._agree(cpu_group, reason, "extension build / workspace allocation", exc)
+        # ---- stage 3: IPC handle exchange and communicator object ------------------------------------------------
+        reason, exc = "", None
+        try:
+            bases = self._ws.exchange(cpu_group, rank, world_size)
+            i = self.info
+            self._c = self.ext.Comm(rank, i.island, i.ipos, i.opos, i.partner, i.members, i.owners, i.partner_of, bases,
+                                    max_bytes, ar1_max_bytes, ag_ll_max_bytes, ag_flag_max_bytes, timeout_s,
+                                    self.device.index)
+            torch.cuda.synchronize(self.device)
+        except Exception as e:
+            reason, exc = repr(e), e
+        self._agree(cpu_group, reason, "IPC exchange", exc)
+        i = self.info
+        self._c.set_pdl(os.environ.get("MUSE_TOPO_PDL", "0") == "1")
+        self._closed = False
+        self._seen: set = set()
+        self._stream_ptr = None  # stream of the last eager call
+        self._warned_stream = False
+        self._strict_stream = os.environ.get("MUSE_TOPO_STRICT_STREAM", "0") == "1"
+        logger.info("muse_topo active on rank %d (island %d, partner %d, workspace %.1f MiB): %s", rank, i.island,
+                    i.partner, self.workspace_bytes / 2**20, i.summary)
+
+    # ------------------------------------------------------------------------------------------------
+    def _agree(self, cpu_group, reason: str, what: str, exc: BaseException | None = None) -> None:
+        """All ranks report ``reason`` ('' = success); if any rank failed, every rank raises TopoUnavailable."""
+        import torch.distributed as dist
+
+        reasons = [None] * self.world_size
+        dist.all_gather_object(reasons, reason, group=cpu_group)
+        bad = [(r, m) for r, m in enumerate(reasons) if m]
+        if not bad:
+            return
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        msg = f"{what} failed on rank(s) {[r for r, _ in bad]}: {bad[0][1]}"
+        logger.info("muse_topo disabled on rank %d: %s", self.rank, msg)
+        raise TopoUnavailable(msg) from exc
+
+    def _p2p_ok(self, descs) -> bool:
+        by_bdf = {}
+        for idx in range(torch.cuda.device_count()):
+            p = torch.cuda.get_device_properties(idx)
+            by_bdf[f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"] = idx
+        me = self.device.index
+        for r, d in enumerate(descs):
+            if r == self.rank:
+                continue
+            idx = by_bdf.get(d["bdf"])
+            if idx is None or not torch.cuda.can_device_access_peer(me, idx):
+                return False
+        return True
+
+    # ------------------------------------------------------------------------------------------------
+    def supports(self, op: str, tensor: torch.Tensor, dim: int | None = None) -> bool:
+        if self._closed or op not in _OPS:
+            return False
+        t = tensor
+        if not (t.is_cuda and t.device == self.device and t.is_contiguous() and t.numel() > 0):
+            return False
+        nbytes = t.numel() * t.element_size()
+        if op == "all_reduce":
+            if t.dtype not in _AR_DTYPES:
+                return False
+            return (nbytes % 64 == 0 and nbytes <= self.max_bytes) or self._large_ok(nbytes)
+        if op == "reduce_scatter":
+            return (t.dtype in _AR_DTYPES and t.dim() >= 1 and t.shape[0] % WORLD == 0 and nbytes >= self.rs_min_bytes
+                    and self._large_ok(nbytes))
+        # all_gather: bit exact data movement, any dtype
+        lay = None if dim is None else _ag_layout(t, dim)
+        if lay is None:
+            return False
+        layout, row = lay
+        if nbytes % 4 or row % 4:
+            return False
+        if self._ag_plan(nbytes, layout, row) is not None:
+            return True
+        return self.large and nbytes % 16 == 0 and (layout == 1 or row % 16 == 0) and nbytes <= _LARGE_MAX_BYTES // 8
+
+    def _large_ok(self, nbytes: int) -> bool:
+        """Size conditions of the large all_reduce / reduce_scatter (8 blocks of whole 16-byte packs)."""
+        return self.large and nbytes % 128 == 0 and nbytes <= _LARGE_MAX_BYTES
+
+    def _ag_plan(self, shard_bytes: int, layout: int, row_bytes: int = 0):
+        """Dispatch row (upto, algorithm, grid, block, unroll) for this shard, or None if the topo path cannot take it."""
+        row = _pick(_AG_TABLES[layout], shard_bytes)
+        flag_ok = (shard_bytes % 16 == 0 and (layout == 1 or row_bytes % 16 == 0)
+                   and shard_bytes <= self.ag_flag_max_bytes)
+        ll_ok = shard_bytes <= self.ag_ll_max_bytes
+        if (row[1] == 2 and flag_ok) or (row[1] == 1 and ll_ok):
+            return row
+        if flag_ok:
+            return (0, 2, 0, 256, 1)
+        if ll_ok:
+            return (0, 1, 0, 128, 1)
+        return None
+
+    # ------------------------------------------------------------------------------------------------
+    def _order_stream(self) -> None:
+        """Keep the collectives of this communicator totally ordered (see the stream rule in the docstring)."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        cur = torch.cuda.current_stream(self.device)
+        if self._stream_ptr is None:
+            self._stream_ptr, self._stream = cur.cuda_stream, cur
+            return
+        if cur.cuda_stream == self._stream_ptr:
+            return
+        if self._strict_stream:
+            raise RuntimeError("muse_topo: collectives of one TopoComm must be issued on a single CUDA stream")
+        if not self._warned_stream:
+            self._warned_stream = True
+            logger.warning("muse_topo: collective issued on a second stream; serializing it behind the previous stream "
+                           "(logged once)")
+        ev = torch.cuda.Event()
+        ev.record(self._stream)
+        cur.wait_event(ev)
+        self._stream_ptr, self._stream = cur.cuda_stream, cur
+
+    def _note(self, op, x, algo):
+        """One-time debug summary line per (op, shape, dtype)."""
+        key = (op, tuple(x.shape), x.dtype)
+        if key not in self._seen and logger.isEnabledFor(logging.DEBUG):
+            self._seen.add(key)
+            logger.debug("muse_topo rank %d: %s %s %s -> algorithm %s", self.rank, op, tuple(x.shape), x.dtype, algo)
+
+    @staticmethod
+    def _stage(x, out):
+        """Rank-uniform eligibility: the kernels need 16-byte aligned operands, but alignment is rank-local state, so a
+        misaligned input (or a misaligned caller-provided ``out``) is staged through an aligned copy instead of being
+        rejected by supports(). Returns (x, out, user_out): ``user_out`` is the caller's ``out`` that must receive a copy."""
+        if x.data_ptr() % 16:
+            x = x.clone()
+        if out is not None and out.data_ptr() % 16:
+            return x, None, out
+        return x, out, None
+
+    @staticmethod
+    def _unstage(res, user_out):
+        if user_out is None:
+            return res
+        user_out.copy_(res)
+        return user_out
+
+    def all_reduce(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        self._order_stream()
+        x, out, user_out = self._stage(x, out)
+        nbytes = x.numel() * x.element_size()
+        if self._large_ok(nbytes) and (nbytes > self.max_bytes or nbytes >= self.ar_large_min):
+            self._note("all_reduce", x, "large")
+            _, mode, ch, rg, ag, blk, un, crs, cag = _pick(_AR_LARGE_TABLE, nbytes)
+            return self._unstage(self._all_reduce_large(x, out, mode, ch, rg, ag, blk, un, None, crs, cag), user_out)
+        algo, grid, block, unroll = _pick(_AR_TABLE, nbytes)[1:]
+        self._note("all_reduce", x, algo)
+        return self._unstage(self._all_reduce(x, algo, block, unroll, MAX_GRID, grid or None, out), user_out)
+
+    def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None):
+        if out is None:
+            out = torch.empty_like(x)
+        nbytes = x.numel() * x.element_size()
+        items = nbytes // 16 if algo == 1 else nbytes // 64
+        if grid is None and algo == 3:
+            grid = max(1, min(max_grid, items))
+        if grid is None:
+            grid = max(1, min(max_grid, _cdiv(items, block * unroll)))
+        self._c.all_reduce(x, out, algo, grid, block, unroll)
+        return out
+
+    def all_gather(self, x: torch.Tensor, dim: int, out: torch.Tensor | None = None) -> torch.Tensor:
+        self._order_stream()
+        lay = _ag_layout(x, dim)
+        if lay is None:
+            raise ValueError(f"all_gather: dim {dim} of a {x.dim()}-D tensor is not supported by the topo path "
+                             "(only dim 0 and the last dim; use supports() as the gate)")
+        layout, row = lay
+        d = dim if dim >= 0 else dim + x.dim()
+        x, out, user_out = self._stage(x, out)
+        nbytes = x.numel() * x.element_size()
+        large_ok = self.large and nbytes % 16 == 0 and (layout == 1 or row % 16 == 0)
+        plan = None if (large_ok and nbytes >= self.ag_large_min) else self._ag_plan(nbytes, layout, row)
+        if plan is None:
+            if not large_ok:
+                raise ValueError("all_gather: shard not supported by the topo path")
+            self._note("all_gather" if layout == 0 else "all_gather(dim0)", x, "large")
+            return self._unstage(self._all_gather_large(x, layout, out, *_pick(_AGL_TABLE, nbytes)[1:]), user_out)
+        self._note("all_gather" if layout == 0 else "all_gather(dim0)", x, plan[1])
+        return self._unstage(self._all_gather(x, d, layout, plan[1], plan[3], plan[4], MAX_GRID, plan[2] or None, out),
+                             user_out)
+
+    def _all_gather(self, x, d, layout, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None):
+        if out is None:
+            shape = list(x.shape)
+            shape[-1 if layout == 0 else 0] *= self.world_size
+            out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        nbytes = x.numel() * x.element_size()
+        if grid is None:
+            if algo == 1:
+                grid = max(1, min(max_grid, _cdiv(nbytes // 4, block * unroll)))
+            else:  # flag protocol: one chunk of 16 B packs per block
+                grid = max(1, min(max_grid, nbytes // 16))
+        self._c.all_gather(x, out, layout, algo, grid, block, unroll)
+        return out
+
+    def reduce_scatter(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Rows block r of the reduced tensor on rank r: [T, ...] -> [T // 8, ...] (T % 8 == 0)."""
+        self._order_stream()
+        x, out, user_out = self._stage(x, out)
+        nbytes = x.numel() * x.element_size()
+        self._note("reduce_scatter", x, "large")
+        _, ch, g, blk, un, cut = _pick(_RS_TABLE, nbytes)
+        return self._unstage(self._reduce_scatter_large(x, out, ch, g, blk, un, None, cut), user_out)
+
+    # ------------------------------------------------------------------------------------------------
+    # large messages (chunked; see the module docstring)
+    # ------------------------------------------------------------------------------------------------
+    def _chunk(self, chunk_bytes: int) -> int:
+        return max(64, min(chunk_bytes, self.large_chunk_bytes))
+
+    def _all_reduce_large(self, x, out=None, mode=1, chunk_bytes=1 << 20, rs_grid=8, ag_grid=24, block=512,
+                          unroll=1, bx=None, cut_rs=0, cut_ag=0, ramp=0, pdl=None):
+        if out is None:
+            out = torch.empty_like(x)
+        bx = self.bf16_exchange if bx is None else bx
+        if pdl is not None:
+            self._c.set_pdl(bool(pdl))
+        self._c.all_reduce_large(x, out, self._chunk(chunk_bytes), mode, rs_grid, ag_grid, block, unroll,
+                                 int(bool(bx) and x.dtype == torch.bfloat16), int(cut_rs), int(cut_ag), int(ramp))
+        if pdl is not None:
+            self._c.set_pdl(os.environ.get("MUSE_TOPO_PDL", "0") == "1")
+        return out
+
+    def _reduce_scatter_large(self, x, out=None, chunk_bytes=1 << 20, grid=8, block=256, unroll=1, bx=None, cut=0):
+        if out is None:
+            out = torch.empty((x.shape[0] // WORLD,) + tuple(x.shape[1:]), dtype=x.dtype, device=x.device)
+        bx = self.bf16_exchange if bx is None else bx
+        self._c.reduce_scatter(x, out, self._chunk(chunk_bytes), grid, block, unroll,
+                               int(bool(bx) and x.dtype == torch.bfloat16), int(cut))
+        return out
+
+    def _all_gather_large(self, x, layout, out=None, chunk_bytes=1 << 20, grid=32, block=256, cut=0):
+        if out is None:
+            shape = list(x.shape)
+            shape[-1 if layout == 0 else 0] *= self.world_size
+            out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        self._c.all_gather_large(x, out, layout, self._chunk(chunk_bytes), grid, block, int(cut))
+        return out
+
+    # ------------------------------------------------------------------------------------------------
+    def error(self) -> int:
+        """Nonzero after a spin timeout (code << 8 | rank + 1); the CUDA context is dead by then."""
+        return self._c.error()
+
+    def set_timeout(self, seconds: float) -> None:
+        self._c.set_timeout(seconds)
+
+    def set_pdl(self, on: bool) -> None:
+        """Launch the kernels with programmatic stream serialization (must be the same on all ranks)."""
+        self._c.set_pdl(on)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        torch.cuda.synchronize(self.device)
+        self._c.close()
+        if self._ws is not None:
+            self._ws.close()
+            self._ws = None

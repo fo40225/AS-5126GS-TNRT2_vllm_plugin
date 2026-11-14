@@ -1,0 +1,5 @@
+Metadata-Version: 2.1
+Name: muse_topo
+Version: 0.1
+Summary: Topology-specialized P2P collectives for the 8x RTX PRO 6000 (AS-5126GS-TNRT2) host, with a vLLM plugin
+Requires-Python: >=3.10
