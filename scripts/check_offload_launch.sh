@@ -64,6 +64,10 @@ if [ "$want" = simple ]; then
   [ -n "${MUSE_OFFLOAD_EXPECT_KV_MAX:-${MUSE_OFFLOAD_KV_BYTES:-}}" ] || fail "offload-on KV bytes maximum unknown (MUSE_OFFLOAD_KV_BYTES / MUSE_OFFLOAD_EXPECT_KV_MAX unset: source env/offload.env of the launch's profile in the checking shell)"
 fi
 if [ "$want" = off ]; then
+  # the offload-on bytes of the three profiles, read from env/offload.env in a clean shell (one source of the numbers; fail-closed when they cannot be read)
+  croot=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+  on_all=$(for pr in spec ns128 ns256; do env -i PATH="$PATH" bash -c "MUSE_OFFLOAD=1; MUSE_OFFLOAD_PROFILE=$pr; source '$croot/env/offload.env' && echo \$MUSE_OFFLOAD_KV_BYTES" 2> /dev/null; done | tr '\n' ' ')
+  [ "$(echo $on_all | wc -w)" = 3 ] || fail "cannot read the offload-on bytes of the three profiles from $croot/env/offload.env (got '$on_all')"
   grep -a -q "SimpleCPUOffload" "$log" && fail "offload expected off but the log has SimpleCPUOffload lines"
   # S1-10R adoption: the offload-on bytes are an offload property. A launch without the tier must not carry them (a line that left $MUSE_OFFLOAD_SERVE_ARGS out after the default switched to ON),
   # nor the connector or --numa-bind in serve_cmd.txt. The offload-on bytes: this shell's (MUSE_OFFLOAD_EXPECT_KV_MAX / MUSE_OFFLOAD_KV_BYTES) and those of the three profiles of env/offload.env.
@@ -72,7 +76,7 @@ if [ "$want" = off ]; then
     if [ "$bind" = 0 ] && grep -q -E -e '(^|[[:space:]])--numa-bind([[:space:]]|$)' "$cmd"; then fail "offload expected off but serve_cmd.txt has --numa-bind"; fi
     kvb=$(grep -o -E -e "--kv-cache-memory-bytes[ =][0-9]+" "$cmd" | head -1 | grep -o -E "[0-9]+$")
     if [ -n "$kvb" ]; then
-      for onb in ${MUSE_OFFLOAD_EXPECT_KV_MAX:-} ${MUSE_OFFLOAD_KV_BYTES:-} 11645337600 16854810624 17257267200; do
+      for onb in ${MUSE_OFFLOAD_EXPECT_KV_MAX:-} ${MUSE_OFFLOAD_KV_BYTES:-} $on_all; do
         [ "$kvb" = "$onb" ] && fail "offload expected off but --kv-cache-memory-bytes $kvb are the offload-on bytes of a profile (the bytes and the tier travel together: put \$MUSE_OFFLOAD_SERVE_ARGS on the line, or use the no-tier bytes)"
       done
     fi
@@ -80,7 +84,7 @@ if [ "$want" = off ]; then
   # the same bytes in the startup log (S1-11, review m2): a log whose parsed arguments carry the offload-on bytes is a tier-less launch with tier bytes also
   # when serve_cmd.txt is missing (the launch scripts and the harness always write it; a log-only check must not pass it)
   for kvb in $(grep -a 'non-default args' "$log" | grep -a -o -E "'kv_cache_memory_bytes': [0-9]+" | sed -E 's/.*: //' | sort -u); do
-    for onb in ${MUSE_OFFLOAD_EXPECT_KV_MAX:-} ${MUSE_OFFLOAD_KV_BYTES:-} 11645337600 16854810624 17257267200; do
+    for onb in ${MUSE_OFFLOAD_EXPECT_KV_MAX:-} ${MUSE_OFFLOAD_KV_BYTES:-} $on_all; do
       [ "$kvb" = "$onb" ] && fail "offload expected off but the startup log's non-default args carry kv_cache_memory_bytes $kvb, the offload-on bytes of a profile (the bytes and the tier travel together)"
     done
   done

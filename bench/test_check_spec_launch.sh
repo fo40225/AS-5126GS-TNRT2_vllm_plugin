@@ -221,9 +221,9 @@ mkoff nocmd_on $ON 1 1 1; rm "$d/nocmd_on/serve_cmd.txt"; sed -i "s/'kv_cache_me
 run nocmd_on 0 "A2: no serve_cmd.txt, connector and binding lines in the log, offload-on bytes in the args line" -- "$d/nocmd_on/serve.log"
 mkoff nocmd_nc $ON 0 0 0; rm "$d/nocmd_nc/serve_cmd.txt"; sed -i "s/'kv_cache_memory_bytes': 11720212480/'kv_cache_memory_bytes': $ON/" "$d/nocmd_nc/serve.log"
 MSG='no SimpleCPUOffloadConnector' run nocmd_nc 1 "A2: no serve_cmd.txt, offload-on bytes in the args line, no connector in the log FAILS" -- "$d/nocmd_nc/serve.log"
-# the constants of the check equal the values of env/offload.env (spec profile)
-got=$(env -i PATH="$PATH" bash -c "source $here/env/offload.env; echo \$MUSE_OFFLOAD_KV_BYTES"); want=$(grep -o -E 'SPEC_OFFLOAD_ON_BYTES:-[0-9]+' "$check" | head -1 | grep -o -E '[0-9]+$')
-if [ "$got" = "$want" ] && [ "$got" = "$ON" ]; then echo "ok   A2: the offload-on bytes constant of the check equals MUSE_OFFLOAD_KV_BYTES of env/offload.env ($got)"; else echo "FAIL A2: check constant '$want' vs env/offload.env '$got' vs test $ON"; fails=$((fails+1)); fi
+# the check holds no byte literal: the default of SPEC_OFFLOAD_ON_BYTES is the spec value of env/offload.env (the A2 cases above run without the variable)
+got=$(env -i PATH="$PATH" bash -c "MUSE_OFFLOAD=1; MUSE_OFFLOAD_PROFILE=spec; source $here/env/offload.env; echo \$MUSE_OFFLOAD_KV_BYTES")
+if [ "$got" = "$ON" ] && ! grep -q -E '11645337600' "$check"; then echo "ok   A2: no offload-on byte literal in the check; env/offload.env gives the test's value ($got)"; else echo "FAIL A2: env/offload.env '$got' vs test $ON, or a literal in the check"; fails=$((fails+1)); fi
 # S1-10R Phase 0: the fused boundary state comes from an env.txt snapshot next to the log (the model logs nothing about it)
 fbenv() { mkdir -p "$d/$1"; cp "$d/prod/serve.log" "$d/prod/serve_cmd.txt" "$d/$1/"; printf '%s\n' "${@:2}" > "$d/$1/env.txt"; }
 fbenv fb0 'MUSE_SPEC_KV_BYTES=11720212480' 'VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2' 'VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY=0'

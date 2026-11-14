@@ -231,11 +231,13 @@ if [ -r "$cmd" ]; then
 fi
 # S1-10R adoption (offload is part of the speculative launch profile): the exact KV bytes and the offload state are ONE launch property (env/offload.env). The state is read from serve_cmd.txt
 # (the connector, --numa-bind, --kv-cache-memory-bytes) and from the boot log (SimpleCPUOffload lines, "Binding worker subprocess" lines, the "kv_cache_memory_bytes" of the non-default args line when there is no
-# serve_cmd.txt), never from this shell's variables alone. FAIL: the offload-on bytes (SPEC_OFFLOAD_ON_BYTES, default 11,645,337,600) without the connector; the connector with more bytes than the offload-on
+# serve_cmd.txt), never from this shell's variables alone. FAIL: the offload-on bytes (SPEC_OFFLOAD_ON_BYTES, default: the spec bytes of env/offload.env, 11,645,337,600) without the connector; the connector with more bytes than the offload-on
 # bytes (the no-tier bytes 11,720,212,480 leave the S_live of the stress below its floor); the connector without --numa-bind (unless the bind is expected off: SPEC_EXPECT_BIND=0 or MUSE_OFFLOAD_NUMA_BIND=0 /
 # MUSE_OFFLOAD_EXPECT_BIND=0); serve_cmd.txt and the log disagreeing about the connector. SPEC_EXPECT_OFFLOAD=0|1 (default: this shell's MUSE_OFFLOAD if set) demands the state, so MUSE_OFFLOAD=1 FAILS a
 # boot without the tier and MUSE_OFFLOAD=0 FAILS a boot with the connector or --numa-bind. Without an expectation a launch with fewer bytes than the offload-on bytes and no connector (the older A/B arms) still passes.
-ON_BYTES=${SPEC_OFFLOAD_ON_BYTES:-11645337600}
+# the default is the spec value of env/offload.env, read in a clean shell (one source of the numbers)
+ON_BYTES=${SPEC_OFFLOAD_ON_BYTES:-$(env -i PATH="$PATH" bash -c "MUSE_OFFLOAD=1; MUSE_OFFLOAD_PROFILE=spec; source '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/env/offload.env' && echo \$MUSE_OFFLOAD_KV_BYTES" 2> /dev/null)}
+[ -n "$ON_BYTES" ] || { echo "check_spec_launch: cannot read the offload-on bytes from env/offload.env (set SPEC_OFFLOAD_ON_BYTES)" >&2; exit 2; }
 want_off=${SPEC_EXPECT_OFFLOAD:-${MUSE_OFFLOAD:-}}
 case "$want_off" in ""|0|1) ;; *) echo "check_spec_launch: SPEC_EXPECT_OFFLOAD / MUSE_OFFLOAD must be 0 or 1, got '$want_off'" >&2; exit 2 ;; esac
 want_bind=${SPEC_EXPECT_BIND:-${MUSE_OFFLOAD_EXPECT_BIND:-${MUSE_OFFLOAD_NUMA_BIND:-1}}}

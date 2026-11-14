@@ -138,9 +138,7 @@ echo "(APIServer pid=1) INFO 11-12 02:17:16 [startup.py:96] non-default args: {'
 run m2 0 "m2: the no-tier bytes in the log pass without serve_cmd.txt" MUSE_OFFLOAD=0 -- "$d/m2/serve.log"
 echo "(APIServer pid=1) INFO 11-12 02:17:16 [startup.py:96] non-default args: {'model_tag': 'm'}" > "$d/m2/serve.log"
 run m2 0 "m2: a log without kv_cache_memory_bytes still passes (nothing to compare)" MUSE_OFFLOAD=0 -- "$d/m2/serve.log"
-# the offload-on bytes hard-coded as the fallback list equal the three profiles of env/offload.env
-got=$(for pr in spec ns256 ns128; do env -i PATH="$PATH" bash -c "MUSE_OFFLOAD_PROFILE=$pr source $here/env/offload.env; echo \$MUSE_OFFLOAD_KV_BYTES"; done | tr '\n' ' ')
-want=$(grep -o -E '11645337600 16854810624 17257267200' "$check" | head -1)
-if [ "$got" = "$want " ]; then echo "ok   A2: the fallback list of offload-on bytes equals spec / ns256 / ns128 of env/offload.env"; else echo "FAIL A2: list '$want' vs env/offload.env '$got'"; fails=$((fails+1)); fi
+# the check holds no byte literal: the list of offload-on bytes comes from env/offload.env (a profile's bytes in the log fail the OFF check, for the three profiles)
+if grep -q -E '11645337600|16854810624|17257267200' "$check"; then echo "FAIL A2: $check still holds an offload-on byte literal"; fails=$((fails+1)); else echo "ok   A2: no offload-on byte literal in the check (read from env/offload.env)"; fi
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))
