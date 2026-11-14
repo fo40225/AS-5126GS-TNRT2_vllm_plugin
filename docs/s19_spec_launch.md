@@ -12,6 +12,9 @@ Launch-scoped, no vLLM code change: `env/spec_k7.env` (sourced after `env/host.e
 
 **S1-9 L5 (2026-11-02) adds `--max-num-batched-tokens 8199` to the profile** (`MUSE_SPEC_SERVE_ARGS`, aligned prefill chunks; the KV bytes stay 11,134,914,560). The SP floor stays 384 (floors 264 / 320 lost the A/B) and the router aux-stream overlap in the SP stream was not adopted. See the section "S1-9 L5" at the end of this file.
 
+**S1-9 L7 (2026-11-04) puts the DFlash2 draft's weights in FP8 (`VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2`, kernel cutlass, the vLLM default) and moves the bytes to 11,573,411,840** (1,629,269 KV tokens per rank, +61,731 = +3.94 %):
+`env/spec_k7.env` exports the flag and the kernel and derives `MUSE_SPEC_KV_BYTES` from (aux projection, FP8 flag); `scripts/check_spec_launch.sh` reads the FP8 state from the boot log and keys the bytes on it. See the section "S1-9 L7" at the end of this file.
+
 ## What it changes
 
 Speculative decoding with RadixArk DFlash2, K = 7, `--max-num-seqs 128` verifies 8 tokens per request, so a batch of c requests is
@@ -259,3 +262,41 @@ Gate tier (valid without `prompt_logprobs` / `echo`; the prompt_logprobs-safe ti
 
 Not merged: vLLM branches `muse/s19-bundle` (B1: the SP router overlap knob, review fixes folded in, a fault-injected bitwise test whose two mutants without the join / the fork fail it) and `muse/s19-l4guard` (B5: the level-4 plan guard), both kept in
 `/home/user/vllm`; the production vLLM tree is unchanged (1eb639f807).
+
+## S1-9 L7: the DFlash2 draft in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8 = 2, kernel cutlass)
+
+**What.** The RadixArk DFlash2 draft's GEMMs are weight-streaming bound at 8 .. 128 rows (gate_up, down, QKV, O, the ten kernel projections and the candidate head: 1.40 ms of a 17.2 ms c1 step at 1.17-1.40 TB/s). The vLLM branch quantizes them at load, from the
+bf16 checkpoint, to e4m3 with one fp32 scale per output channel of each rank's shard (a row-parallel layer scales its own partial, the all-reduce sums them) and runs them W8A8 (dynamic per-token e4m3 activations + `cutlass_scaled_mm`; graph-capturable, no split-K,
+bitwise repeatable). Flag 1 = the 30 draft linears (5 layers x QKV / O / gate_up / down + 2 kernel projections); flag 2 (the default) = also an FP8 copy of the target's lm_head shard for the draft's candidate top-k (+197 MiB per rank: the draft shares the target's bf16
+head, which the target keeps). The context K/V precompute (a fused bf16 weight, prefill-sized GEMM) and the aux fc (FC_SHARD=2) stay bf16. The verification is exact: the draft is a proposal, the rejection sampler keeps the output distribution; the price is
+acceptance length. `VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL=marlin` (weight-only FP8, lower error, no faster) is not gated.
+
+**The flag, the kernel and the bytes are ONE property.** The idle memory at identical bytes differs per state (against the bf16 draft: cutlass flag 2 -418 MiB, cutlass flag 1 -616, marlin flag 2 -542, marlin flag 1 -740), and the hook's "670 MiB freed" is numel arithmetic, not the
+allocator delta (the probe of the flag-2 cutlass stress boot: torch allocated -443.5 MiB = -641 weights - (-197) head, reserved -420, non-torch +2 MiB, so no persistent workspace; the CUDA graph pool is 0.95 GiB in every boot, flag 0 included, and the loaded weights are the
+same for both kernels: the Marlin / cutlass gap is not in the captured allocations and does not move with the capture list). `scripts/check_spec_launch.sh` reads the state from the success lines of the vLLM branch, "DFlash2 draft weights in FP8 (...DRAFT_FP8=<n>, kernel <k>):
+30 linear layers quantized" (one per worker) and, for flag 2, "DFlash2 candidate head in FP8": a boot that carries more than the maximum of its state (`FP8_F2_MAX_BYTES` 11,573,411,840, `FP8_F1_MAX_BYTES` 11,781,017,600, flag 0: 11,134,914,560; Marlin is checked against the cutlass value
+of its flag), a flag set in the shell with no success line, a flag-2 boot without the head line (a silent fall back to flag 1), or any "DRAFT_FP8=<n> does not apply" warning FAILS. `SPEC_EXPECT_FP8=off|1|2` and `SPEC_EXPECT_FP8_KERNEL` demand a state (the flag exported by
+`env/spec_k7.env` is the default expectation).
+
+**Bytes (S1-7 procedure, probe tree, REPS = 2, stress A1 B C1 C2 D H I L M X, MNBT 8199).** Flag 2: at 11,134,914,560 clean, idle free 3,505.4 MiB (production 3,087.4), live growth 1,808.8 (1,809.0), **S_live 1,696.6 MiB**; rule: step up by (S_live - 1,278.4) MiB to
+**11,573,411,840** (565,108 blocks) clean, **S_live 1,278.5 MiB** (floor 1,256 = production's own S_live), **1,629,269 KV tokens per rank** (+61,731, +3.94 %), idle 94,165 MiB (= production). Flag 1 (one stress boot at the flag-2 bytes + 198 MiB): 11,781,017,600 (575,245 blocks), clean,
+S_live 1,278.4 MiB, 1,658,495 KV tokens per rank (+90,957, +5.80 %).
+
+**Gate (two lock holds 2026-11-04: exact bytes + determinism, then the A/B; rule frozen before the first gate boot, `ADOPTION_RULE.txt` md5 2db75a8141f3 in the L7 scratch).** Ten speculative boots OFF x3 (flag 0 at 11,134,914,560), F1 x3, F2 x3, one production-tree control, ~31 min
+each, all healthy (cfgcheck OK, 0 preemptions, launch check + arm check OK, KV tokens per arm identical), real mix320 prompts, closed loop; non-speculative guard 3 + 3 boots. Pooled primary score (real greedy and default c1 / c16 / c32, Welch 3 v 3, t 2.78): **F2 +1.50 % SIG**
+(greedy c1 +2.02 % SIG, default c1 +2.94 % SIG, c16 +0.69 / +1.64 %, c32 +0.64 / +1.08 %); STEADY step ms OFF -> F2 c1 17.467 -> 16.934 (**-3.15 %**), c16 -1.03 %, c32 -1.03 %, c40 -1.06 %, c48 +0.66 % (noise), c64 -0.74 %, c128 -1.51 %; guards all passed (greedy c40 / c48 /
+c64 / c128 +0.50 / -0.59 / +0.37 / +1.30 %, default c64 / c128 +1.06 / +0.15 %, churn c64 +0.51 %, natural 8192-token c16 +0.21 % and c1 +1.68 % SIG, TTFT 8k / 16k / 32k within +-0.3 %); control F2 / CTL +1.77 %, OFF / CTL +0.27 %. Flag 1 (layers only): pooled +1.36 % but not beyond
+noise (se 0.0053 needs 1.47 %), so it is not adopted; F2 against F1 is +0.14 % pooled (noise; default c1 ratio 0.9994): the head copy is a wash at c1 on the point estimates and the rule chose F2 because F1 did not clear it. Acceptance length (request-level paired resampling,
+Bonferroni over 15 cells, z_crit 2.94): every cell inside it (worst: greedy c128 -0.029, z -2.86, with its tok/s +1.30 %), natural 8192 / 32768-token decode cells -0.006 / +0.006 / -0.022, draft-weighted mean dAL **-0.010**.
+Non-speculative guard (ON = the feature tree, no draft model, vs the production tree, 3 + 3 boots at 17,357,799,424): greedy / default c1 +0.21 / +0.25 %, c64 +0.15 / +0.09 %, STEADY c1 / c64 -0.04 % / +0.22 % (all noise).
+
+**Accuracy / determinism.** GSM8K 200x2 at c64 with speculation (forward + reverse passes, 0 request errors; ON = flag 2 at 11,573,411,840, CTL = the production tree at 11,134,914,560, one boot each in the same hold): greedy 196 + 195 = **391/400 = 97.75 %** (band 95.5-98.0 %; CTL
+193 + 192 = 385 = 96.25 %; 2 + 2 answers hit the 16,384-token cap against 4 + 4: the repetition-loop tail), default sampling 198 + 198 = **396/400 = 99.0 %** (CTL 393), top_p 0.95 on every request 392 (392), top_p 0.95 on every 4th item 394 (392); GSM8K_GATE PASS. Determinism (offline
+TP8 + EP8, production profile at 11,573,411,840, 85 prompts of 9 .. 23,000 tokens, 128 new tokens, the 12-pass protocol: greedy, seeded t1k64 / top_p 0.95 / T 0.7 top_p 0.9 / T 1.5 top_p 0.95 / top_p 0.99, mixed and mixed-G (seeded t1k64, top_p and penalty requests interleaved), then mixed, mixed-G, top_p 0.95 and
+greedy again): two cold processes identical 85/85 in all 12 passes (token ids, top-5 logprobs, prompt logprobs, exact), pass 1 = pass 2 inside both processes, 0 OOM (E2E_GATE PASS). Diagnostic only: the production tree against the FP8 draft is identical in 37 / 85 requests
+(greedy), 15 (t1k64), 18 (top_p 0.95), 27 (mixed): the draft numerics differ at rounding level, so accept lengths, verify-batch composition and the target's roundings differ. Rank identity: an 8-rank test (NCCL and the host plugin's muse_topo collectives) on the real per-rank
+shapes: the row-parallel o_proj / down (per-rank weight scale, per-token activation scale, all-reduce) stay within 4.7 % max error of the fp32 reference (a single-rank bound of 6 %), the replicated kernel projection and every output are bitwise identical on all ranks, a CUDA graph replays
+the eager bits, the FP8 head's cross-rank top-k returns the aimed token of every one of the 8 vocabulary shards (value error 0.7 %, top-16 overlap 0.94). Accuracy class: rounding level, draft only (the rejection sampler keeps the output distribution), deterministic, rank-identical.
+
+**Not done / limits.** The eager rows above 256 draft rows (c33 and up) gain a fraction of the microbench prediction (two Python-wrapped ops per FP8 linear, ~40-55 us of CPU per layer; measured +0.7 .. 1.5 % STEADY at c40 .. c128 against -1.5 % predicted at c64);
+a fused act-quant or one composite custom op is the follow-up. Marlin and the per-M torch rowwise GEMM switching were not built into the default.
