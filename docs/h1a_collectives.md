@@ -30,7 +30,7 @@ comm.close()
   operands, but a misaligned view (or a misaligned caller-provided `out`) is staged through an aligned copy inside the
   op instead of being rejected, because a rank that fell back to NCCL while the others run topo kernels would deadlock
   the group (review fix).
-* Construction is staged (topology check, JIT build + allocation, IPC exchange) and every stage ends with an all-rank
+* Construction is staged (topology and tuning check, JIT build + allocation, IPC exchange) and every stage ends with an all-rank
   agreement, so a failure on one rank (missing nvcc, IPC error) makes every rank raise `TopoUnavailable` instead of
   blocking the others (`bench/test_init_failure.py`).
 * All calls are asynchronous on the current stream, CUDA-graph safe and must be issued in the same order with the

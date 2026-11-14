@@ -258,10 +258,17 @@ class TopoComm:
                               if bf16_exchange is None else bool(bf16_exchange))
         self.ar_large_min = _AR_LARGE_MIN
         self.medium_bx = os.environ.get("MUSE_TOPO_MEDIUM_BX", "1") != "0"
-        self.ar_bx_min = int(os.environ.get("MUSE_TOPO_MEDIUM_BX_MIN_BYTES", _AR_BX_MIN))
+        self.ar_bx_min = _AR_BX_MIN
         self.ar_large_min_bx = _AR_LARGE_MIN_BX
         self.ar_bx_table = _AR_BX_TABLE
-        self._load_tuning_file(os.environ.get("MUSE_TOPO_AR_TUNING_FILE", ""))
+        # A bad integer or an unreadable tuning file on one rank must not leave the others blocked in the stage-1
+        # all_gather_object: the failure is reported through the stage-1 agreement below.
+        tuning_error = ""
+        try:
+            self.ar_bx_min = int(os.environ.get("MUSE_TOPO_MEDIUM_BX_MIN_BYTES", _AR_BX_MIN))
+            self._load_tuning_file(os.environ.get("MUSE_TOPO_AR_TUNING_FILE", ""))
+        except Exception as e:
+            tuning_error = f"medium all_reduce tuning (MUSE_TOPO_MEDIUM_BX_MIN_BYTES / MUSE_TOPO_AR_TUNING_FILE): {e!r}"
         self.ag_large_min = _AG_LARGE_MIN
         self.rs_min_bytes = _RS_MIN_BYTES
         self._closed = True
@@ -289,7 +296,7 @@ class TopoComm:
             reason = str(e)
         except Exception as e:  # e.g. an unparsable sysfs file: report it like any other mismatch, on all ranks
             reason = f"topology derivation failed: {e!r}"
-        self._agree(cpu_group, reason, "topology check")
+        self._agree(cpu_group, reason or tuning_error, "topology and tuning check")
         # ---- stage 2: JIT build/load, workspace allocation -----------------------------------------------------------
         reason, exc = "", None
         try:
@@ -329,7 +336,8 @@ class TopoComm:
 
     def _load_tuning_file(self, path: str) -> None:
         """Experiment hook (bench/make_table_medium.py writes the file): JSON with optional keys ``bx_table`` (rows of
-        _AR_BX_TABLE), ``bx_min`` (bytes) and ``large_min_bx`` (bytes). Must be the same on every rank."""
+        _AR_BX_TABLE), ``bx_min`` (bytes) and ``large_min_bx`` (bytes). Must be the same on every rank (a file that cannot
+        be read or parsed on some rank makes every rank raise TopoUnavailable, see ``__init__``)."""
         if not path:
             return
         import json
