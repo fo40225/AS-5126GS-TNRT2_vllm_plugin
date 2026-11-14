@@ -309,7 +309,7 @@ def run(rank, args):
     # ---- 4. dispatch -----------------------------------------------------------------------------------------------
     if "disp" in groups:
         # (label, nbytes, shape): the KiB sizes plus the max_bytes edge: exactly max_bytes (a full phase-a slot) is the
-        # last message of algorithm 2, one 128-byte pack more is the first one of the large algorithm
+        # last message of algorithm 2, one 128-byte pack more is the first one of the large algorithm (2bx slabs with the medium exchange on)
         cases = [(f"{kib} KiB", kib * KIB, shape_for(kib * KIB)) for kib in [32, 64, 128, 512, 1024, 2048, 4096, 8192]]
         edge = comm.max_bytes + 128
         assert comm.max_bytes == 8192 * KIB, comm.max_bytes
@@ -319,7 +319,8 @@ def run(rank, args):
 
         def want_path(nb, medium, bx):
             if nb > comm.max_bytes:
-                return "large"
+                # S1-9 L9 A1: a bf16-exchange message above max_bytes (up to 64 MiB) runs as row slabs of algorithm 2 (bitwise equal)
+                return "2bx slabs" if bx and medium and nb <= C._AR_BX_SLABS_MAX_BYTES else "large"
             if bx and medium and nb >= comm.ar_bx_min:
                 return "2bx"
             return "large" if nb >= comm.ar_large_min else 2

@@ -36,7 +36,9 @@ before the final add (half the cut bytes, class deterministic_different, still r
 deterministic). It applies to bf16 all_reduce/reduce_scatter calls served by the large algorithm and, unless
 ``MUSE_TOPO_MEDIUM_BX=0``, to the bf16 all_reduce calls of the medium algorithm (algorithm 2, ``BX`` kernel variant)
 from ``ar_bx_min`` (64 KiB) up to ``max_bytes``, with the same arithmetic as the large algorithm, so every bf16
-all_reduce of at least 64 KiB gets the same bits whichever algorithm its size selects (docs/r3c_medium_ar.md); fp16
+all_reduce of at least 64 KiB gets the same bits whichever algorithm its size selects (docs/r3c_medium_ar.md); a bf16 message above
+``max_bytes`` and up to 64 MiB runs as row slabs of at most 4 MiB through algorithm 2 (``_AR_BX_SLAB_BYTES``, faster than one call of the
+large algorithm, same bits, docs/a1_table_retune.md); fp16
 and fp32 keep the exact exchange (an fp16 partial above 65504 would overflow) and the flag and the medium-exchange
 settings (``MUSE_TOPO_MEDIUM_BX``, ``MUSE_TOPO_MEDIUM_BX_MIN_BYTES``, the tuning file) must be the same on all ranks.
 reduce_scatter always runs the large algorithm with the exchange when the flag is on (it needs at least
@@ -207,6 +209,14 @@ _AR_BX_MIN = 64 << 10  # bf16 all-reduces from this size on use the bf16 exchang
 # algorithm only takes the messages above max_bytes.
 _AR_LARGE_MIN_BX = 1 << 62
 _RS_MIN_BYTES = 128 << 10
+# bf16-exchange all-reduce above max_bytes (S1-9 L9 A1): row slabs of at most _AR_BX_SLAB_BYTES, each through the 2bx table, instead of one call of the
+# large algorithm. The slabs are bitwise identical to the large algorithm with the bf16 exchange (same arithmetic per element, rows are independent) and
+# faster per MiB: algorithm 2 moves the island partials once, the large algorithm also all-gathers the result across the cut (warm us per call, large
+# algorithm -> slabs: 12 MiB 566 -> 494, 16 MiB 741 -> 656, 24 MiB 1097 -> 988, 32 MiB 1452 -> 1314, 64 MiB 2915 -> 2617; docs/a1_table_retune.md).
+# Measured up to 64 MiB, which is the cap (each slab is one more kernel launch of CPU time; the 128 MiB prefill embedding all-reduce stays on
+# the large algorithm).
+_AR_BX_SLAB_BYTES = 4 << 20
+_AR_BX_SLABS_MAX_BYTES = 64 << 20
 _AG_LARGE_MIN = 256 << 10  # shards from this size on use the large engine instead of the H1a flag path (10.4 vs 11.4 us at 128 KiB)
 _LARGE_MAX_BYTES = 2 << 30
 
@@ -535,6 +545,10 @@ class TopoComm:
         nbytes = x.numel() * x.element_size()
         trigger = self._trigger_stage(x.shape[0]) if self._unpooler_input(x) else 0  # the all-reduce in front of the unpooler GEMV
         large_ar = self.ar_large_min_bx if self._medium_bx(x, nbytes) else self.ar_large_min
+        slab = self._bx_slab_rows(x, nbytes) if nbytes > self.max_bytes else 0
+        if slab:
+            self._note("all_reduce", x, "2bx slabs")
+            return self._unstage(self._all_reduce_slabs(x, out, slab), user_out)
         if self._large_ok(nbytes) and (nbytes > self.max_bytes or nbytes >= large_ar):
             self._note("all_reduce", x, "large")
             _, mode, ch, rg, ag, blk, un, crs, cag = _pick(_AR_LARGE_TABLE, nbytes)
@@ -552,6 +566,29 @@ class TopoComm:
         ``ar_bx_min`` and up); a function of dtype, size and the construction-time settings only, so it is the same on
         every rank as long as those settings are (see the module docstring)."""
         return self.bf16_exchange and self.medium_bx and x.dtype == torch.bfloat16 and nbytes >= self.ar_bx_min
+
+    def _bx_slab_rows(self, x: torch.Tensor, nbytes: int) -> int:
+        """Rows per slab when this all_reduce is served as 2bx slabs (see _AR_BX_SLAB_BYTES), else 0: a bf16 message above ``max_bytes`` and up
+        to _AR_BX_SLABS_MAX_BYTES that the large algorithm would take with the bf16 exchange, 2-D or more, rows of whole 64-byte packs, every slab
+        within ``max_bytes``. A function of dtype, shape and the construction-time settings only, so the same on every rank."""
+        if not (self._medium_bx(x, nbytes) and self.max_bytes < nbytes <= _AR_BX_SLABS_MAX_BYTES and nbytes < self.ar_large_min_bx
+                and x.dim() >= 2 and x.shape[0] > 1 and self._large_ok(nbytes)):
+            return 0
+        row = nbytes // x.shape[0]
+        if row % 64:
+            return 0
+        per = _cdiv(x.shape[0], _cdiv(nbytes, min(_AR_BX_SLAB_BYTES, self.max_bytes)))
+        return per if per * row <= self.max_bytes else 0
+
+    def _all_reduce_slabs(self, x, out, per):
+        """The bf16-exchange all-reduce of ``x`` as row slabs of ``per`` rows, each through the 2bx table at its own size."""
+        if out is None:
+            out = torch.empty_like(x)
+        for r0 in range(0, x.shape[0], per):
+            xs, os_ = x[r0:r0 + per], out[r0:r0 + per]
+            algo, grid, block, unroll = _pick(self.ar_bx_table, xs.numel() * xs.element_size())[1:]
+            self._all_reduce(xs, algo, block, unroll, MAX_GRID, grid or None, os_, bx=True)
+        return out
 
     def _all_reduce(self, x, algo, block, unroll, max_grid=MAX_GRID, grid=None, out=None, bx=False, trigger=0):
         if out is None:
