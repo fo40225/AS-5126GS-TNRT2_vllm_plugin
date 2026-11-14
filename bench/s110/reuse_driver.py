@@ -95,9 +95,9 @@ def gen_tokens(seed, n):
     return [rng.randrange(1000, 150000) for _ in range(n)]
 
 
-def send(port, model, prompt, max_tokens=16, timeout=7200):
+def send(port, model, prompt, max_tokens=16, timeout=7200, ignore_eos=False):
     body = json.dumps({"model": model, "prompt": prompt, "max_tokens": max_tokens, "temperature": 0, "stream": True,
-                       "logprobs": 1})
+                       "logprobs": 1, **({"ignore_eos": True} if ignore_eos else {})})
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     t0 = time.perf_counter()
     try:

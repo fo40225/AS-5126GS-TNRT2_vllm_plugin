@@ -16,7 +16,11 @@ Phases (all prompts are random token ids, greedy, logprobs=1):
           (tokens and logprob values): a block that a preemption flush corrupted or stored stale would show here.
 Verdict line REUSE_PREEMPT: PASS needs health 200 afterwards, 0 failed requests, every request complete, preemptions > 0 (proof that the path ran:
 without them the result is INCONCLUSIVE, not a pass), pending stores drained, >= --min-pairs comparable pairs, all equal.
-usage: preempt_smoke.py --port 8100 --model M --out FILE.json [--n 24] [--prompt-len 12000] [--max-tokens 300] [--check 8] [--min-pairs 4]
+usage: preempt_smoke.py --port 8100 --model M --out FILE.json [--n 32] [--prompt-len 2500] [--max-tokens 2000] [--check 8] [--min-pairs 4]
+(AMENDMENT 1 of ADOPTION_RULE_FINAL, after the first smoke boot: 24 prompts of 12,000 tokens with 300 output tokens never preempted (admission-limited: the scheduler admits ~2 such prompts into the pool and the
+decode growth is small) and three outputs ended early on an EOS token; now 32 prompts of 2,500 tokens with 600 output tokens and ignore_eos, so that the running set outgrows the pool during decode.
+AMENDMENT 2 (second inconclusive boot: 600 output tokens still did not preempt, the free blocks left by the admission cover the decode growth): 2,000 output tokens and a pool of 14,000 blocks (spec, --max-model-len 8192)
+or 4,000 blocks (ns256).)
 """
 import argparse
 import http.client
@@ -35,7 +39,7 @@ def storm(port, model, prompts, max_tokens, label):
     recs = [None] * len(prompts)
 
     def one(i):
-        r = rd.send(port, model, prompts[i], max_tokens=max_tokens, timeout=3600)
+        r = rd.send(port, model, prompts[i], max_tokens=max_tokens, timeout=3600, ignore_eos=True)
         recs[i] = {"i": i, "status": r["status"], "ntok": len(r["toks"]), "ttft_s": r["ttft_s"], "total_s": round(r["total_s"], 2),
                    "error": r.get("error")}
 
@@ -59,9 +63,9 @@ def main():
     ap.add_argument("--port", type=int, default=8100)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--n", type=int, default=24)
-    ap.add_argument("--prompt-len", type=int, default=12000)
-    ap.add_argument("--max-tokens", type=int, default=300)
+    ap.add_argument("--n", type=int, default=32)
+    ap.add_argument("--prompt-len", type=int, default=2500)
+    ap.add_argument("--max-tokens", type=int, default=2000)
     ap.add_argument("--check", type=int, default=8)
     ap.add_argument("--min-pairs", type=int, default=4)
     ap.add_argument("--seed-base", type=int, default=4_400_000)

@@ -4,7 +4,8 @@ Launch-scoped plus two generic vLLM commits (branch `muse/s110-offload` on `sm12
 359cdc74aa "Add a NUMA memory policy option (bind | preferred)" (optional, section 8). Host side: `env/offload.env` (sourced after `env/host.env`, before `env/spec_k7.env`), `scripts/check_offload_launch.sh` (the boot check), `bench/s110/` (the tools).
 Measured on `sm120-muse-spark-open` 268c64b0e2 + 9388ed1133 and host 6f47eb1790, real weights, EP8 + TP8, fp8 KV, max-model-len 131072. The pre-registered adoption rule and its amendments are in `bench/s110/rules/`.
 
-**Result in one paragraph.** Offload gives a large benefit on revisited long prefixes and costs nothing measurable without reuse. With the tier on, the 64k / 118k re-admission TTFT falls from 6.30 / 12.44 s to 0.29 / 0.47 s
+**Result in one paragraph.** Offload gives a large benefit on revisited long prefixes and costs nothing measurable without reuse (the reuse numbers below are the BEST CASE of a tier: whole stored prompts re-sent cyclically over a working set 1.6x the GPU pool, 4 clients, no background decode, an upper bound of what mixed
+traffic gains; the final gate of section 10 adds Zipf-popular documents with fresh question suffixes next to 64 background decoders). With the tier on, the 64k / 118k re-admission TTFT falls from 6.30 / 12.44 s to 0.29 / 0.47 s
 (speculative profile; non-speculative 6.20 / 12.27 s -> 0.20 / 0.32 s), a working set 1.6x the GPU pool that cycles through the pool is served at 217k instead of 10.9k prompt tokens/s (non-speculative 286k instead of 11.3k; TTFT p50 0.24 s against 5.9 s,
 p99 0.50 s against 12.0 s), a multi-turn chat whose histories overflow the pool finishes in 322 s instead of 760 s. Decode without reuse stays within -0.5 % (speculative: pooled gmean over c1 / c16 / c64 / c128, three boots against three; non-speculative -0.1 %).
 The tier is one `torch.zeros` + `cudaHostRegister` per rank (SimpleCPUOffloadConnector), 45 GiB per rank (48,318,382,080 B; node 7 binds it), placed 100 % on the GPU's own node by `--numa-bind`; the exact GPU KV bytes move to 11,525,693,440 (speculative, -0.41 %;
@@ -44,12 +45,14 @@ output tok/s; baseline = the OFF arm of the same bind policy (2 boots for OFF_B)
 | OFF, bound (reference; 3 boots decode, 1 reuse) | 1 | 5.36 / 11.98 | 10.87 k | 6.30 / 12.44 | 80-100 | 94,141 |
 | **Simple, bound** (3 boots decode, 1 reuse) | **0.9949 (0.9886)** | **0.244 / 0.498** | **217.1 k** | **0.287 / 0.466** | 90 | 94,189 |
 | Simple, not bound | 0.9985 (0.9869) | 0.239 / 0.520 | 216.2 k | 0.300 / 0.519 | 100 | 94,189 |
-| native, bound, blocks_per_chunk 1 | 0.9794 (0.9676) | 0.333 / 1.483 | 160.6 k | 0.253 / 0.421 | 210 .. 1,271 | 94,527 |
+| native, bound, blocks_per_chunk 1 | 0.9795 (0.9663) | 0.333 / 1.483 | 160.6 k | 0.253 / 0.421 | 210 .. 1,271 | 94,527 |
 | native, not bound, blocks_per_chunk 1 | 0.9819 (0.9742) | 0.326 / 1.297 | 165.7 k | 0.245 / 0.408 | 181 | 94,527 |
-| native, bound, blocks_per_chunk 16 | 0.9879 (0.9737) | 0.270 / 0.415 | 220.7 k | 0.192 / 0.270 | 240 | 94,527 |
+| native, bound, blocks_per_chunk 16 | 0.9880 (0.9724) | 0.270 / 0.415 | 220.7 k | 0.192 / 0.270 | 240 | 94,527 |
 | Simple, bound, `lazy_offload` (2 boots decode, 1 reuse) | 0.9933 (0.9876) | 0.237 / 6.673 | 58.9 k | 0.309 / 12.4 (not stored) | 120 | 94,189 |
 
-Reading the table:
+Reading the table (the native bound rows are recomputed here against the same three pooled OFF_B boots as the Simple rows, `compare_s110.py`; the running notes had used the first OFF_B boot only, 0.9796 (0.9714) and 0.9881 (0.9775), and the first version of this table
+carried two rounding slips; the not-bound native row is against its single OFF_N boot):
+
 
 * **Benefit.** Every connector arm turns the re-admission of a 64k / 118k prompt from a 6.3 / 12.4 s recompute into a 0.2 .. 0.5 s load, and the cycling working set (80 x 32,768 tokens, 1.6x the GPU pool, the
   GPU LRU hits nothing) into an almost pure load workload: 99.95 % of the prompt tokens of passes 2 and 3 come from the tier (`external_prefix_cache_hits_total`). The multi-turn chat (96 conversations, 5 turns of 6,000 new tokens,
@@ -84,6 +87,26 @@ at the ns256 headroom (S_live 508.9 against the floor 500 with the Simple tier) 
 the later passes 0.23-0.25 s). The 3 % clause was calibrated for multi-second TTFTs; at 0.2 s absolute a gap of this size is a few client scheduling slots of a 4-client closed loop, but it is consistently on the bound side, so it is reported, not explained away. The bind stays adopted
 because the production profile passes the clause, it keeps the per-node arithmetic of section 4 valid (100 % local, no spill onto the GPU-less nodes) and it costs nothing in decode; a non-speculative deployment that values the last 25 ms of a reused prefix over placement can run `MUSE_OFFLOAD_NUMA_BIND=0`
 (the tier is then 15-33 % off-node and spreads over all nodes).
+**Rule conformance, stated plainly.** (a) On ns256 the pre-registered clause "B not worse than N by more than 3 % on REU p50" FAILS (9-12 %, confirmed by the repeat pair), so the rule-conformant ns256 default is the unbound twin (`MUSE_OFFLOAD_NUMA_BIND=0`); keeping the bind there
+is a judgement override recorded above (on the speculative profile the clause holds). (b) The G1 clause grants a failing arm one retry boot; the native arms did not use it: native blocks_per_chunk 16 reads 0.9880 against the 0.990 line, inside the 1.2 % OFF-to-OFF spread of the c128 cell, with
+G5 evidence from the bpc 1 boot only, so "native fails G1 / G5" is established for bpc 1 (0.9795, min cell 0.9663) and for the speculative CPU-hit output of the 65k smoke (bpc 1), not for bpc 16. The choice does not rest on it: Simple's reuse TTFT p50 is 10.7 % better than native bpc 16 (0.244 against 0.270 s,
+above the 5 % tie band), its READY is 90 s against 240 s and its GPU cost 48 MiB against 386 MiB. (c) The pre-registered rule was amended three times before the boots it governs (md5 of each file in `bench/s110/rules`); the final gate of section 10 is a separate, fourth rule.
+
+### 3c. Cold prefill with eager stores (study measurement, single boots; the final gate repeats it in 3 sessions, guard G2)
+
+Eager mode stores every completed block while the prompt is still being prefilled (about 6 KB per token per rank, 197 MB per 32k prompt per rank) next to the sequence-parallel collectives; the cold passes of the study boots show what that costs. Pass 1 of the reuse cycle (80 / 143 documents of 32,768 tokens, 4 clients, nothing to hit) and the cold 64k / 118k singles:
+
+| profile / arm | pass 1 prompt tok/s | cold 64k TTFT (s) | cold 118k TTFT (s) |
+|---|---|---|---|
+| spec, OFF bound | 10,876 | 6.277 | 12.431 |
+| spec, Simple bound | 10,827 (-0.45 %) | 6.299 (+0.35 %) | 12.466 (+0.28 %) |
+| spec, Simple not bound | 10,812 (-0.35 % against OFF not bound 10,850) | 6.369 | 12.499 |
+| spec, native bound bpc 1 / bpc 16 | 10,821 / 10,851 | 6.334 / 6.301 | 12.504 / 12.456 |
+| ns256, OFF bound | 11,271 | 6.185 | 12.260 |
+| ns256, Simple bound | 11,212 (-0.53 %) | 6.196 (+0.18 %) | 12.308 (+0.39 %) |
+| ns256, Simple not bound | 11,201 (-0.17 % against OFF not bound 11,220) | 6.206 | 12.329 |
+
+A consistent 0.2-0.5 % on cold long prompts with the tier on; Chat turns 1-2 (cold) were equal within noise in the study (turn tables `chat_table_s110.py`).
 
 ## 4. Sizing (step 3)
 
@@ -101,7 +124,7 @@ Pass 2 (the formula). Host memory is not specific to a profile, so one formula s
 Measured A_N (MiB, OFF bound, after 3 reuse passes and the chat run; `numa_end.txt`): node 0 117,738, node 3 117,205, node 4 118,063, **node 7 98,892** (node 7 carries 13.3 GiB of foreign memory, section 1).
 The margin M is what the node must keep for the processes that are not the tier: EngineCore 1.2 GiB anon (1.6 GiB RSS) and the API server 1.3 GiB (1.7 GiB RSS) are already inside A (both sit on nodes 3 / 7), worker growth over the whole
 workload +0.03 .. 0.09 GiB per node, the kernel's high watermark 0.28 GiB, the mapped library pages of the workers (0.9 GiB per node: evicting them makes the workers fault their code back in), page cache of the tools and logs (about 1 GiB),
-growth of the foreign allocation and of the `/dev/shm` leftovers (0.3 GiB seen); together about 4.5 GiB, taken as **M = 6.6 GiB** so that node 7 never drops below 6.6 GiB of reclaimable memory:
+growth of the foreign allocation and of the `/dev/shm` leftovers (0.3 GiB seen); together about 4.5 GiB, taken as **M = 6.6 GiB** (not itemised: the scheduler-side CPU pool of the connector, 2.36 M `KVCacheBlock` objects, about 0.3 GiB of EngineCore memory on node 3 plus a hash map that grows as the tier fills, sits inside the slack) so that node 7 never drops below 6.6 GiB of reclaimable memory:
 
 | node | A_N (MiB) | largest rank size with M = 6.6 GiB | left unused at P* = 45 GiB (both ranks) |
 |---|---|---|---|
@@ -110,7 +133,8 @@ growth of the foreign allocation and of the `/dev/shm` leftovers (0.3 GiB seen);
 | 4 | 118,063 | 54.4 GiB | 18.8 GiB |
 | 7 | 98,892 | **45.0 GiB** | 0 |
 
-The tier is therefore limited by node 7: **P* = 45 GiB = 48,318,382,080 B per rank** (a multiple of L; 2,359,296 CPU blocks in the speculative profile, 737,280 in the non-speculative ones; 360 GiB, 35.7 % of the RAM, in total).
+The tier is therefore limited by node 7: **P* = 45 GiB = 48,318,382,080 B per rank** (the literal formula with A_7 = 98,892 MiB and M = 6.6 GiB gives 46,066.8 MiB = 44.99 GiB, i.e. 43 blocks of L fewer; the shipped 45 GiB is the largest clean boot of section 4 rounded to
+the GiB, which leaves M = 6.57 GiB on node 7 by the formula and 10.4 GiB measured at READY) (a multiple of L; 2,359,296 CPU blocks in the speculative profile, 737,280 in the non-speculative ones; 360 GiB, 35.7 % of the RAM, in total).
 (The 18 GiB per node that nodes 0 / 3 / 4 could still give is the price of equal block counts per rank and of the foreign memory on node 7; `--numa-membind-policy preferred`, section 8, is the option that uses it.)
 
 Verification by boot (SIM bound, speculative profile, strict membind, watchdog at 1,024 MiB of MemFree + file cache per node, oom_score_adj 1000 on every process of the session):
@@ -127,11 +151,15 @@ No OOM, no watchdog trip, no populate stall up to 47 GiB; the tier is `torch.zer
 12-40 times more pages than at 45 GiB and the workers refault 0.26-0.45 M pages (their mapped libraries). The 44 GiB boot shows that this is state dependent (32,648 faults after a boot that had left a different page-cache state): the knee is 45-46 GiB,
 and 45 GiB keeps its predicted margin of 6.6 GiB on node 7 (measured 10.4 GiB at READY).
 A boot right after the 47 GiB run (the weight page cache of the nodes was evicted): READY 130 s against 80-90 s warm (G2 holds: the cold-weight penalty of the maximum tier is +40 s).
+**Limits of the margin (what the sizing does not prove).** The 45 GiB boot is one boot; the knee is state dependent (the 44 GiB boot had 32.6 k major faults, the 45 GiB boot 336, READY avail 7.9 against 10.4 GiB, non-monotonic) and node 7's 13.3 GiB of foreign memory and the `/dev/shm` tenants
+can change at any time. A populate that runs out of memory under strict membind ends in a constrained OOM kill whose victim is the largest eligible RSS task: one of our workers (about 49 GiB), or a bigger foreign process. Therefore (i) `scripts/preflight_offload.sh` checks MemFree + file cache of the four GPU nodes
+against 2 x per-rank bytes + what the server itself puts on the node (fail below 4 GiB left, warn below M = 6.6 GiB; the final gate runs it before every ON boot), and (ii) the server session should run with `oom_score_adj` 1000 (`echo 1000 > /proc/self/oom_score_adj` in the launching shell: children inherit it, an OOM kill then
+hits this server and never another user's process; the study harness did that for every process of its sessions). The final gate boots the 45 GiB tier on every ON boot (3 + 3 sessions plus the stress and smoke boots, in different page-cache states).
 Not bound, the same 46 GiB boot (SIM_N) takes 100 s with almost no reclaim, because the tier spreads over all eight nodes (peaks n0 88, n3 50, n4 53, n7 83, n1 33, n2 38, n5 29, n6 37 GiB): an unbound tier could be 2-3x larger but is 15-30 % off-node.
 
 CPU bytes per token (speculative profile, per rank; SG2 reuses them): 15 KV groups = 4 full-attention groups (16 target layers + 4 padding layers = 4 x 5 layers) + 11 sliding-window groups (46 + 4 padding target layers = 10 groups, the DFlash2 draft = 1 group), each GPU block-id = 20,480 B (5 layers x 4 KiB):
 **5,120 B per token** of prompt (4 x 20,480 B per 16 tokens) plus a fixed **28.8 MB per stored prefix** (11 groups x 128 window blocks x 20,480 B); measured: a 32,832-token document loads 9,612 blocks per rank = 196.9 MB = 6.0 KB per token, a 65,584-token prompt 17,804 blocks (4 x 4,099 + 11 x 128).
-Non-speculative profiles: 4,096 B per token (1 full group x 65,536 B per 16 tokens) plus 25.2 MB (3 x 128 x 65,536 B); a 65,584-token prompt loads 4,483 blocks. The 45 GiB tier holds about 245 documents of 32k tokens (7.9 M tokens), 76 prompts of 118k, 9 prefixes of 1M tokens (5.15 GB each, fp8).
+Non-speculative profiles: 4,096 B per token (1 full group x 65,536 B per 16 tokens) plus 25.2 MB (3 x 128 x 65,536 B); a 65,584-token prompt loads 4,483 blocks. The 45 GiB tier holds about 245 documents of 32k tokens (7.9 M tokens), 76 prompts of 118k, 8 prefixes of 2^20 tokens (5.40 GB each, fp8; 9 only with 10^6-token prefixes).
 
 
 ## 5. GPU bytes with the tier on (S1-7 procedure)
@@ -191,7 +219,10 @@ no `cudaHostRegister failed`, no `enable_mm_embeds is True` (a vLLM tree without
 The restart cost of the maximum tier: the tier evicts the weight page cache of the four nodes, the next boot reads part of the weights cold (130 s READY against 80-90 s; the stress boot with its debug logging 140-160 s READY).
 
 
-## 8. The `preferred` memory policy (option, `--numa-membind-policy preferred`)
+## 8. The `preferred` memory policy (option, `--numa-membind-policy preferred`; NOT merged)
+
+Decision of the S1-10 gate: the commit 359cdc74aa stays on the branch `muse/s110-offload` and is NOT merged into `sm120-muse-spark-open` (its own trigger, a strict-membind populate that stalls, never fired; it adds a CLI and config option that is silently ignored without `--numa-bind` and it logs its policy line once per worker call).
+Only the `receives_remote_kv` commit 9388ed1133 is merged. If the option is ever merged it should warn when `--numa-membind-policy` is set without `--numa-bind` and log once.
 
 `--numa-membind-policy preferred` (vLLM branch, `numa_utils`: `numactl --preferred=N` instead of `--membind=N`; default `bind`) was built to use the 18 GiB per node that nodes 0 / 3 / 4 could still give (section 4) and the memory of the GPU-less nodes. It works as designed
 and is **not recommended**: one boot at 64 GiB per rank (SIM, bound CPUs, speculative profile; 512 GiB of tier in total) reached READY after 170 s with 559,173 major faults and 1.10 M pages scanned by direct reclaim, and only **35.6 %** of the pinned tier landed on its GPU's own node
@@ -202,9 +233,15 @@ The boots at 80 GiB and the OFF boot after them were not run (decision after the
 
 ## 9. For S1-11 and SG2
 
+* **THE TIER SURVIVES `POST /reset_prefix_cache`.** That endpoint (and `llm.reset_prefix_cache()`) empties the GPU pool only; every prompt that was prefilled with the tier on stays in the tier. A benchmark that re-sends a prompt after such a reset therefore HITS THE TIER and reads as a speed-up: the first unsalted
+  decode sweep of this study (`bench_sd.sh` rows resend the same 160 real prompts across cells and repetitions and reset only the GPU cache) read 2,142 tok/s at c128 against 1,340 without the tier, which was reuse, not overhead. S1-11's final matrix (real prompts re-sent across cells and repetitions, repeated TTFT
+  8k / 32k / 118k prompts, random 512 / 128 rows with fixed seeds) must therefore either give every request its own `cache_salt` (the S1-9 L7 driver `--cycle`, `conc_driver_s110.py`) or reset the tier too: `POST /reset_prefix_cache?reset_external=true` (offline: `llm.reset_prefix_cache(reset_connector=True)`; a no-op without a connector).
+  The sd harness is guarded since S1-10 (`/raid/vllm-runtime/work/sd/harness`: `bench_sd.sh`, `acceptance.py` and the mock server send `reset_external=true`, originals kept as `*.before_s110`, patch in `bench/s110/harness_reset_external.patch`); `scripts/conc_sweep.sh` does not reset at all (its repeated fixed-seed prompts hit the GPU cache
+  with and without the tier alike, so its rows are symmetric). Any other row that resets only the GPU cache is invalid with the tier on. Tier-on numbers next to tier-off numbers of the same matrix must say which rows were salted.
 * S1-11: the launch line of section 7 is the production speculative line plus `--numa-bind` and the connector; the exact GPU bytes are 11,525,693,440 (speculative, stepped by the rule; the stress of the stepped value is in section 5) and 16,957,243,392 (ns256, unchanged).
   Boots to check: `check_spec_launch.sh` and `check_offload_launch.sh`. A restart after a tier run reads part of the weights cold (+40 s).
-* SG2 (1M context, NVFP4 KV): reuse the formula of section 4 unchanged (host memory does not depend on the context length, so P* = 45 GiB per rank holds at 1M), recompute `bpb` from the new `Allocating N offload blocks` line and the CPU bytes per token from the new group layout
-  (token cost = full groups x bpb / block tokens, fixed cost = sliding-window groups x window blocks x bpb); the 1M prefix costs about 5.2 GB per rank at fp8 in the current layout, so the tier holds ~9 of them, and the GPU side must carry the page-table cost of
+* SG2 (1M context, NVFP4 KV): reuse the formula of section 4 unchanged (host memory is NOT independent of the context length: the model runner keeps a pinned UVA `all_token_ids` of [max_num_reqs, max_model_len] int32 per worker, 64 MiB at 128k with mns 128, 512 MiB at 1M, about 1 GiB at mns 256 and 1M,
+  i.e. +0.9 .. 1.8 GiB per node at 1M against the 2.1 GiB of slack of M: P* = 45 GiB at 1M is unproven, re-derive A_N with the 1M launch), recompute `bpb` from the new `Allocating N offload blocks` line and the CPU bytes per token from the new group layout
+  (token cost = full groups x bpb / block tokens, fixed cost = sliding-window groups x window blocks x bpb); a prefix of 2^20 tokens costs about 5.4 GB per rank at fp8 in the current layout, so the tier holds 8 of them, and the GPU side must carry the page-table cost of
   2 MiB per GiB of tier in its S1-7 bytes. The tier only serves the waiting (admission) path: a running 1M request keeps its full-attention KV on the GPU. If the NVFP4 block scales live in a separate tensor, the Simple connector (which copies the per-layer regions of the KV allocation) must be checked to copy them too.
 * Open: the native connector would need three fixes to compete (pin only the rank's own region, e.g. a rank-major layout; annotate the Muse draft group as a drafter group; one pinned registration per node instead of eight), none is needed for the chosen configuration.

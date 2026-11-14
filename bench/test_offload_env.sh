@@ -37,11 +37,11 @@ t "numa bind off: no --numa-bind, connector kept" "0 1" \
   'MUSE_OFFLOAD_NUMA_BIND=0 source $E/offload.env; echo "$(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c -- "--numa-bind") $(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c SimpleCPUOffloadConnector)"'
 t "per-rank bytes override reaches the JSON (a multiple of the block lcm stays the caller's duty)" "1" \
   'MUSE_OFFLOAD_PER_RANK_BYTES=26214400000 source $E/offload.env; echo "$(echo "$MUSE_OFFLOAD_SERVE_ARGS" | grep -c "cpu_bytes_to_use_per_rank\":26214400000}")"'
-t "ns128 has no derived bytes: error, no tier (stress with the tier not run) unless the operator gives them" "rc=1 off=0 err=1" \
-  'MUSE_OFFLOAD_PROFILE=ns128 source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD err=$([ -n "$MUSE_OFFLOAD_ERROR" ] && echo 1)"'
-t "ns128 with an explicit MUSE_OFFLOAD_KV_BYTES_OVERRIDE is accepted" "rc=0 off=1 kv=17000000000 bpb=65536" \
+t "ns128 profile: confirmed bytes and block size" "rc=0 off=1 kv=17357799424 bpb=65536" \
+  'MUSE_OFFLOAD_PROFILE=ns128 source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD kv=$MUSE_OFFLOAD_KV_BYTES bpb=$MUSE_OFFLOAD_BPB"'
+t "ns128 with an explicit MUSE_OFFLOAD_KV_BYTES_OVERRIDE replaces the bytes" "rc=0 off=1 kv=17000000000 bpb=65536" \
   'MUSE_OFFLOAD_PROFILE=ns128 MUSE_OFFLOAD_KV_BYTES_OVERRIDE=17000000000 source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD kv=$MUSE_OFFLOAD_KV_BYTES bpb=$MUSE_OFFLOAD_BPB"'
-t "ns128 with the tier off needs no derived bytes (the OFF arm of the stress / gate boots)" "rc=0 off=0 err=[]" \
+t "ns128 with the tier off (the OFF arm of the stress / gate boots)" "rc=0 off=0 err=[]" \
   'export MUSE_OFFLOAD=0 MUSE_OFFLOAD_PROFILE=ns128; source $E/offload.env 2>/dev/null; rc=$?; echo "rc=$rc off=$MUSE_OFFLOAD err=[${MUSE_OFFLOAD_ERROR:-}]"'
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))
