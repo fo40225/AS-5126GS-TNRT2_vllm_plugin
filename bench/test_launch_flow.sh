@@ -113,18 +113,20 @@ expect_fail pair3 "--keep-env, ns128 without the tier but MUSE_OFFLOAD_SERVE_ARG
 expect_fail die "the server dies before READY: exit 3, nothing left" 3 'DIED' 0 serve_spec.sh "" STUB_STATE=spec_1 STUB_MODE=die --
 expect_fail hang "the server never becomes healthy: timeout, exit 3, stopped" 3 'TIMEOUT' 0 serve_nonspec.sh ns256 STUB_STATE=ns256_1 STUB_MODE=hang MUSE_LAUNCH_READY_S=2 --
 
-# a signal while waiting for READY stops the server (own session) and exits 3
-rm -rf "${d:?}/sig"
-(env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
-  MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/sig" > "$d/sig.stdout" 2>&1; echo $? > "$d/sig.rc") &
-bgpid=$!
-for _ in $(seq 1 50); do [ -s "$d/sig/serve.pid" ] && break; sleep 0.2; done
-sigpid=$(cat "$d/sig/serve.pid" 2> /dev/null)
-launcher=$(ps -eo pid,args | awk -v o="$d/sig" 'index($0, "serve_spec.sh") && index($0, o) && !index($0, "awk") {print $1; exit}')
-[ -n "$launcher" ] && kill -TERM "$launcher"
-wait $bgpid
-if [ "$(cat "$d/sig.rc" 2> /dev/null)" = 3 ] && ! kill -0 "$sigpid" 2> /dev/null && grep -q 'SIGNAL received' "$d/sig/status.txt"; then pass "SIGTERM to the launcher while waiting: server stopped, exit 3"
-else bad "SIGTERM to the launcher while waiting" "rc=$(cat "$d/sig.rc" 2> /dev/null) launcher=$launcher server alive=$(kill -0 "$sigpid" 2> /dev/null && echo yes || echo no)"; fi
+# a signal (TERM, INT, HUP) while waiting for READY stops the server (own session) and exits 3 (review r2 m3: HUP like TERM / INT)
+for sig in TERM INT HUP; do
+  rm -rf "${d:?}/sig_$sig"
+  (env -i PATH="$PATH" HOME="$HOME" MUSE_LAUNCH_VLLM="$stub/vllm" MUSE_LAUNCH_SMI="$stub/nvidia-smi" MUSE_LAUNCH_PREFLIGHT="$stub/preflight.sh" MUSE_LAUNCH_VENV=none MUSE_LAUNCH_PORT=$port \
+    MUSE_LAUNCH_POLL_S=0.2 MUSE_LAUNCH_READY_S=60 MUSE_LAUNCH_STOP_POLL_S=0.2 STUB_PORT=$port STUB_STATE=spec_1 STUB_MODE=hang bash "$here/launch/serve_spec.sh" --out "$d/sig_$sig" > "$d/sig_$sig.stdout" 2>&1; echo $? > "$d/sig_$sig.rc") &
+  bgpid=$!
+  for _ in $(seq 1 50); do [ -s "$d/sig_$sig/serve.pid" ] && break; sleep 0.2; done
+  sigpid=$(cat "$d/sig_$sig/serve.pid" 2> /dev/null)
+  launcher=$(ps -eo pid,args | awk -v o="$d/sig_$sig" 'index($0, "serve_spec.sh") && index($0, o) && !index($0, "awk") {print $1; exit}')
+  [ -n "$launcher" ] && kill -$sig "$launcher"
+  wait $bgpid
+  if [ "$(cat "$d/sig_$sig.rc" 2> /dev/null)" = 3 ] && ! kill -0 "$sigpid" 2> /dev/null && grep -q 'SIGNAL received' "$d/sig_$sig/status.txt"; then pass "SIG$sig to the launcher while waiting: server stopped, exit 3"
+  else bad "SIG$sig to the launcher while waiting" "rc=$(cat "$d/sig_$sig.rc" 2> /dev/null) launcher=$launcher server alive=$(kill -0 "$sigpid" 2> /dev/null && echo yes || echo no)"; fi
+done
 
 # ---- every post-boot check fails on its own (a mutated real log): the server is stopped and the exit is 1
 expect_fail ck_kv "spec: the KV check fails (tokens differ): exit 1, server stopped" 1 'CHK kv FAIL' 0 serve_spec.sh "" STUB_STATE=spec_1 'STUB_LOG_SED=s/1,639,394/1,639,395/' --

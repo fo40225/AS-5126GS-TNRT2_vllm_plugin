@@ -293,7 +293,7 @@ lc_main() {
   t0=$(date +%s)
   LC_STOPPED=0; LC_ARMED=1; LC_NFAIL=0
   trap lc_on_exit EXIT
-  trap 'lc_log "SIGNAL received"; lc_stop; echo "RESULT aborted signal" >> "$LC_STATUS"; exit 3' TERM INT
+  trap 'lc_log "SIGNAL received"; lc_stop; echo "RESULT aborted signal" >> "$LC_STATUS"; exit 3' TERM INT HUP
   (cd "$LC_OUT" && exec setsid "$LC_VLLM" "${LC_SERVE[@]:1}" > "$LC_OUT/serve.log" 2>&1 < /dev/null) &
   LC_SPID=$!
   echo "$LC_SPID" > "$LC_OUT/serve.pid"
@@ -331,7 +331,7 @@ lc_main() {
     exit 1
   fi
   LC_ARMED=0
-  trap - EXIT TERM INT
+  trap - EXIT TERM INT HUP
   lc_log "READY and every post-boot check passed: $name tier=$LC_TIER, server pid $LC_SPID (own session), out $LC_OUT; stop with launch/stop_server.sh $LC_OUT"
   echo "RESULT pass" >> "$LC_STATUS"
 }
