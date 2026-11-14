@@ -40,6 +40,13 @@ the three ops, ``MUSE_TOPO_LARGE=0`` (reduce_scatter and the large all-reduce go
 ``MUSE_TOPO_LARGE_BF16_EXCHANGE=1`` (the large algorithms round the island partials, the small all-reduce does not) turn
 it off.
 
+Microbatched prefill (vLLM ``VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP``): the microbatch threads run their TP collectives on a
+comm stream, all of them on the one stream in a rank-uniform order, so the single TopoComm needs no second workspace (its
+call counter lives in device memory and the stream rule below is met by the hand-off events). The result of such a
+collective is allocated on the compute stream (``_output_stream``): a result allocated on the comm stream would live in a
+second allocator pool that grows next to the compute pool and, on a GPU that is nearly full, makes the allocator free and
+re-allocate its blocks over and over (about 200 cudaMalloc/cudaFree and 400 event syncs per prefill step).
+
 The sequence-parallel helpers of the Muse model (``sp_all_gather`` / ``sp_reduce_scatter``) first ask the device
 communicator's ``custom_all_gather`` / ``custom_reduce_scatter`` (vLLM's CustomAllreduce) and then fall back to
 ``tensor_model_parallel_all_gather`` / ``_reduce_scatter``, which end in the patched methods above. On this box the
@@ -226,6 +233,28 @@ def _attach(self, routed: frozenset[str]) -> None:
 # ------------------------------------------------------------------------------------------------
 # wrappers
 # ------------------------------------------------------------------------------------------------
+def _output_stream():
+    """The compute stream on which the result of this collective is to be allocated, or None.
+
+    Set by vLLM's microbatched prefill (VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP) while a collective runs on its comm
+    stream: the result is then allocated on the compute stream (the pool the model allocates from) instead of the
+    comm stream, which would grow a second pool next to it. The topo kernels write it from the comm stream; the
+    compute stream only reads it after the collective and reuses it after those reads, so no extra ordering is needed.
+    """
+    try:
+        from vllm.v1.worker.ubatching import dbo_collective_output_stream
+    except ImportError:  # a vLLM without microbatching
+        return None
+    return dbo_collective_output_stream()
+
+
+def _alloc(stream, shape, like):
+    import torch
+
+    with torch.cuda.stream(stream):
+        return torch.empty(shape, dtype=like.dtype, device=like.device)
+
+
 def _wrap_init(orig, routed):
     def __init__(self, *args, **kwargs):
         orig(self, *args, **kwargs)
@@ -240,6 +269,9 @@ def _wrap_all_reduce(orig):
         if comm is not None and "all_reduce" in self.topo_ops:
             if comm.supports("all_reduce", input_):
                 self.topo_trace.note("all_reduce", input_, None, "topo")
+                stream = _output_stream()
+                if stream is not None:
+                    return comm.all_reduce(input_, out=_alloc(stream, input_.shape, input_))
                 return comm.all_reduce(input_)
             self.topo_trace.note("all_reduce", input_, None, "nccl", lambda: _why_not(comm, "all_reduce", input_, None))
         return orig(self, input_)
@@ -254,6 +286,12 @@ def _wrap_all_gather(orig):
             d = dim + input_.dim() if dim < 0 else dim
             if comm.supports("all_gather", input_, d):
                 self.topo_trace.note("all_gather", input_, d, "topo")
+                stream = _output_stream()
+                if stream is not None:
+                    # column concatenation for the last dim of a >= 2-D tensor, rank-major otherwise (TopoComm layouts)
+                    shape = list(input_.shape)
+                    shape[-1 if (input_.dim() > 1 and d == input_.dim() - 1) else 0] *= comm.world_size
+                    return comm.all_gather(input_, d, out=_alloc(stream, shape, input_))
                 return comm.all_gather(input_, d)
             self.topo_trace.note("all_gather", input_, d, "nccl", lambda: _why_not(comm, "all_gather", input_, d))
         return orig(self, input_, dim)
@@ -269,6 +307,10 @@ def _wrap_reduce_scatter(orig):
             # TopoComm.reduce_scatter hands out row blocks (dim 0); other dims keep the NCCL path.
             if d == 0 and comm.supports("reduce_scatter", input_, 0):
                 self.topo_trace.note("reduce_scatter", input_, 0, "topo")
+                stream = _output_stream()
+                if stream is not None:
+                    shape = [input_.shape[0] // comm.world_size, *input_.shape[1:]]
+                    return comm.reduce_scatter(input_, out=_alloc(stream, shape, input_))
                 return comm.reduce_scatter(input_)
             self.topo_trace.note("reduce_scatter", input_, d, "nccl",
                                  lambda: "dim != 0" if d != 0 else _why_not(comm, "reduce_scatter", input_, 0))
