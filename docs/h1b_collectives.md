@@ -169,7 +169,7 @@ timeout (error word set), no hang (3 x PASS). Run: `bash scripts/locked_job.sh <
 * `all_reduce` of an odd number of bytes (not a multiple of 128 B) above `max_bytes`, reduce_scatter with T % 8 != 0 or below 128 KiB and other dtypes
   go to NCCL through `supports()`.
 * `supports("all_reduce")` is True for multiples of 128 B up to 2 GiB; the plugin's `_why_not` fallback reasons were updated for this in H2b
-  (`docs/h2_vllm_plugin.md`).
+  (`muse_topo/vllm_plugin.py`).
 
 ## Follow-ups
 

@@ -121,7 +121,7 @@ back-to-back / behind a 50 us kernel, bf16): all_reduce [1,8192] 5.4 / 5.4 us (N
 (NCCL 41.2 / 41.5), [8,8192] 11.5 / 11.3 (NCCL 47.3 / 47.6), [64,8192] 61 / 61 (NCCL 86), [512,8192] 477 / 480 (NCCL
 580 / 573); all_gather [1,512]->[1,4096] 3.6 us (NCCL 24.6), [1,1024]->[1,8192] 3.8 us (NCCL 25.9), logits
 [1,25256]->[1,202048] 13.3 us (NCCL 35.3) (these tables are the pre-64-bit-counter measurements; the re-measured decode
-numbers after the review fix are in `docs/h2_vllm_plugin.md`, section "Review fixes"). Accuracy (bf16, fp64 reference,
+numbers after the review fix are in README section 9.1, "Microbenchmark"). Accuracy (bf16, fp64 reference,
 16x8192): correctly rounded in 100% of the elements against a single-rounding reference (`bench/common.py: round_single`;
 the fp32 chain followed by one bf16 rounding is the correctly rounded sum whenever the fp32 partial sums are exact, i.e. for
 activation-like data whose exponents differ by at most ~16 bits; for pathological data with a very wide exponent range an

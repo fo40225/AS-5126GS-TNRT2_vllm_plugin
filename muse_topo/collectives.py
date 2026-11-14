@@ -201,7 +201,7 @@ _AGL_TABLE = [
 ]
 # Thresholds re-checked in H2b against the measured benchmark rows (b2b us, H1a table vs the searched large configuration): 1 MiB 61.3 vs 63.6, 1.5 MiB 91.2 vs
 # 90.2 (a tie), 2 MiB 120.4 vs 115.8, 2.5 MiB 150.9 vs 143.0, 3 MiB 179.3 vs 169.2: the crossover is at 2 MiB. The full-model EP8 runs
-# (docs/h2_vllm_plugin.md) confirm the tables end to end.
+# (README section 9.2) confirm the tables end to end.
 _AR_LARGE_MIN = 2 << 20  # messages below use the H1a algorithms (up to max_bytes): they win at 1 MiB (61.3 vs 63.6 us)
 _AR_BX_MIN = 64 << 10  # bf16 all-reduces from this size on use the bf16 exchange of algorithm 2 (when it is on): 6.7 vs 8.1 us at 64 KiB
 # With the bf16 exchange algorithm 2 beats the large algorithm at every size up to its workspace limit (1 MiB 43.1 vs 64.3 us,
