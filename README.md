@@ -1,7 +1,7 @@
 # AS-5126GS-TNRT2_vllm_plugin
 
 針對 **10.19.209.74（Supermicro AS-5126GS-TNRT2，8x NVIDIA RTX PRO 6000 Blackwell Server）** 這台主機的 PCIe / NUMA 拓樸所做的最佳化，
-用來加速 `unsloth/Muse-Spark-Open-816B-A42B-NVFP4`（vLLM branch `sm120-muse-spark-open`，目前 production 為 v0.33.0 + Muse Spark backport（`f6a60ab9d7`），
+用來加速 `unsloth/Muse-Spark-Open-816B-A42B-NVFP4`（vLLM branch `sm120-muse-spark-open`，目前 production 為 v0.33.0 + Muse Spark backport（`124f8e028a`），
 TP8 + EP8）的推論。
 
 這個資料夾只放「只對這台機器的拓樸才有意義」的東西：topology-specialized 的 P2P collectives（`muse_topo` 套件與 vLLM plugin）、NCCL 環境變數與
@@ -22,7 +22,7 @@ plugin 的 microbenchmark（第 9 節）、驗證方式（第 10 節）、已知
 | prefill（pp） | c1（512 tokens）+7 %、13k / 65k / 118k tokens 的 context 約 +13 .. +14 %；real weights +8 .. +12 % |
 | 額外記憶體 | 每張 GPU 61.1 MiB（large-message 演算法不再增加） |
 | accuracy class（預設） | `more_accurate`：fp32 加總、單次最終 rounding，所有 size / 演算法 / rank / run 之間 bitwise 相同 |
-| production 最終結果（S1-11，vLLM 0.33.0、host `f540ce1b37`，2026-11-13） | spec ON c1 / c16 / c64 / c128 的 DEC greedy 221.4 / 756.6 / 1252.2 / 1479.1 tok/s（AL 4.64 .. 4.88）；ns256 ON 115.2 / 535.5 / 980.9 / 1212.2（c256 1432.2）；ns128 OFF 116.1 / 540.5 / 980.4 / 1232.8；9 / 9 gates PASS；表格、exact bytes、已知限制見第 5、6、11 節 |
+| production 最終結果（S1-11，vLLM 0.33.0、host `ae9d46abb2`，2026-11-13） | spec ON c1 / c16 / c64 / c128 的 DEC greedy 221.4 / 756.6 / 1252.2 / 1479.1 tok/s（AL 4.64 .. 4.88）；ns256 ON 115.2 / 535.5 / 980.9 / 1212.2（c256 1432.2）；ns128 OFF 116.1 / 540.5 / 980.4 / 1232.8；9 / 9 gates PASS；表格、exact bytes、已知限制見第 5、6、11 節 |
 | 啟用條件 | `MUSE_TOPO_ENABLE=1`，且拓樸簽章（2 sockets x 2 virtual switches x 2 GPUs，cc 12.0，56 組 P2P 全通）吻合，否則自動退回 NCCL |
 
 ## 1. 為什麼需要（背景與 topology）
@@ -127,11 +127,11 @@ scripts/deploy_host.sh                               # rsync -a --delete 到 use
 
 ### 3.2 部署 vLLM tree（branch `sm120-muse-spark-open`）
 
-伺服器的 vLLM tree `/raid/vllm-runtime/sm120-dev/src/` 是 `/home/user/vllm` 的 branch `sm120-muse-spark-open`（production：v0.33.0 + Muse Spark backport，`f6a60ab9d7`）的 source，
+伺服器的 vLLM tree `/raid/vllm-runtime/sm120-dev/src/` 是 `/home/user/vllm` 的 branch `sm120-muse-spark-open`（production：v0.33.0 + Muse Spark backport，`124f8e028a`）的 source，
 疊在 venv 內 pip 安裝的 vllm 0.33.0 之上（`PYTHONPATH` = 本資料夾 + 這個 tree；tree 裡預先編譯的 artifacts 留在伺服器上，deploy 不動它們）：
 
 ```bash
-cd /home/user/vllm && git checkout sm120-muse-spark-open      # 確認 working tree 乾淨、HEAD = f6a60ab9d7
+cd /home/user/vllm && git checkout sm120-muse-spark-open      # 確認 working tree 乾淨、HEAD = 124f8e028a
 /home/user/trivial/AS-5126GS-TNRT2_vllm_plugin/tools/deploy.sh      # 印出 "deployed <short sha>"；有未 commit 的修改會加 "+dirty"
 ```
 
@@ -196,7 +196,7 @@ server 在自己的 session 啟動、等 `/health`、存下 READY 當下的資�
 * 結束碼：0 = READY 且所有檢查通過（server 留著繼續跑）；1 = 開機後檢查失敗（除非 `--keep-on-fail`，server 已停止）；2 = 拒絕啟動（輸入錯誤、GPU 忙、preflight 失敗、env 檔錯誤，什麼都沒啟動）；3 = server 一直沒有 READY（死掉、逾時或被中斷，已停止；若同時記 `NOT_STOPPED`，server 可能還在跑，見停止路徑）；64 = 用法錯誤。
 * 輸出目錄：`serve_cmd.txt`、`env.txt`（與 gated boot 同樣的寫法與 filter）、`serve.log`、`serve.pid`、`server.sess`（`<pid> <sid> <pgrp> <start time> <boot_id>`，由 server 自己的 child process 在 setsid 之後寫入；leader 已消失時，`stop_server.sh` 只會處理 boot_id 相同、cwd 為此輸出目錄、start time 不早於 leader 的成員，其餘只列出不送 signal，exit 3）、`status.txt`（最後一行 `RESULT ...`，另有 swap 紀錄：launch / READY 的 swap used、`pswpin` / `pswpout` 差）、`preflight.txt`、`cache_config_info.txt`（`/metrics` 的 `vllm:cache_config_info`，block 數只在這裡）、`pid_cmdline.txt`、`pid_environ.txt`、`pid_environ_expected.txt`、`clean_ref/`、`clean_check/`（clean shell 的 dry run：啟動前與開機後各一次）、`gpu_mem_ready.txt`、`check_*.txt`。
 * 等價性：每條路徑的 serve line 與 export 的環境和 gated / adoption boot 逐 byte 相同，由 `bench/test_launch_equiv.sh` 靜態證明（spec ON / OFF、ns256 ON、ns128 ON 對各自的 adoption boot 紀錄；ns128 / ns256 OFF 對 production 與 0.33.0 validation 的 line）。
-  已知差異：0.33.0 validation 的 ns256 OFF boot 沒有 env 紀錄，環境只能對 ns128 的 production record 與它的 `flags` 行證明；script 的 ns256 OFF launch 會 export `VLLM_PLUGINS=muse_topo`，而那次 validation boot 沒有（host `a26c2be` 在它之後才加；之後的 gate boot 有，證據只有 0 tracebacks）；
+  已知差異：0.33.0 validation 的 ns256 OFF boot 沒有 env 紀錄，環境只能對 ns128 的 production record 與它的 `flags` 行證明；script 的 ns256 OFF launch 會 export `VLLM_PLUGINS=muse_topo`，而那次 validation boot 沒有（host `c938590` 在它之後才加；之後的 gate boot 有，證據只有 0 tracebacks）；
   ns256 OFF 的 `cache_config_info` fixture（blocks 258,747）是由 validation 紀錄合成的（該 boot 沒存 metrics），smoke boot 會記錄真正的 `cache_config_info` 與 pid environ；speculative 的 script 會 export `VLLM_SERVER_DEV_MODE=1`（adoption boot 也有），non-speculative 沒有。
 * 停止（`launch/stop_server.sh <out dir>`）：TERM 記錄下來的 session，再 KILL；leader 的 pid + start time 必須與記錄相同，包含 launcher 或其 parent 的 session 永遠不送 signal。
   launcher 在收到 TERM / INT / HUP 或開機檢查失敗時停止 server，使用 `server.sess`；該檔案消失或無法讀取時，改用 launcher 接受 session 當下記在記憶體裡的 tuple（pid、session、process group、start time、boot id），並通過同樣的 guard。
@@ -345,8 +345,8 @@ P* 只在 node 7 的 reclaimable slab 低於約 0.3 GiB 時有效（量測時為
 
 ## 6. 最終結果（final matrix、tier 成本、gates）
 
-**範圍與出處。** matrix 與 gates 跑在 production tree 上：host main `f540ce1b37` + vLLM `sm120-muse-spark-open` `f6a60ab9d7`，2026-11-13 02:36:49 -> 07:11:47（4 h 35 min、13 個 hold、7 次 boot、216 個 cell）。
-每次 boot 都經 `launch/serve_*.sh` 啟動，並通過 `f540ce1b37` 的開機後檢查（第 4.3 節；不含之後才加入的停止路徑 fallback 與 `kv_connector` / `kv_role` / `kv_connector_extra_config` 的 serve-line 檢查）。數字由分析 script 逐行複製、經獨立重算驗證（216 個 cell、4237 個數值比較、0 個差異）。
+**範圍與出處。** matrix 與 gates 跑在 production tree 上：host main `ae9d46abb2` + vLLM `sm120-muse-spark-open` `124f8e028a`，2026-11-13 02:36:49 -> 07:11:47（4 h 35 min、13 個 hold、7 次 boot、216 個 cell）。
+每次 boot 都經 `launch/serve_*.sh` 啟動，並通過 `ae9d46abb2` 的開機後檢查（第 4.3 節；不含之後才加入的停止路徑 fallback 與 `kv_connector` / `kv_role` / `kv_connector_extra_config` 的 serve-line 檢查）。數字由分析 script 逐行複製、經獨立重算驗證（216 個 cell、4237 個數值比較、0 個差異）。
 這是量測，不是 adoption 決定。matrix 跑完之後的 commit 只改 launcher 的停止路徑、serve line 檢查、測試與文件，不改任何 export、serve line 或預設值。
 每個 cell 的完整 grid（default sampling、top_p 0.95、rand / nat8k 的 TTFT 與 TPOT、churn 的 TTFT、各 cell 的 AL、cache source、swap）不在 repo 裡保留；這裡只有下面四張主表、冷 TTFT、reuse 與 gates。
 
@@ -645,10 +645,10 @@ for t in test_launch_equiv test_launch_flow test_check_kv_launch test_check_spec
   echo "== $t"; bash bench/$t.sh | tail -n 1; done
 ```
 
-* `test_launch_equiv.sh`：六個 launch 狀態（含 dirty shell）的 `--dry-run` 與 `bench/fixtures/launch_ref` 逐 byte 相同（serve_cmd.txt、env.txt、server 預期的環境），並與 base commit 的 env 檔 export 比較（`da1bdad519`，需要 git history）。
+* `test_launch_equiv.sh`：六個 launch 狀態（含 dirty shell）的 `--dry-run` 與 `bench/fixtures/launch_ref` 逐 byte 相同（serve_cmd.txt、env.txt、server 預期的環境），並與 base commit 的 env 檔 export 比較（`8fa110ff4e`，需要 git history）。
 * `test_launch_flow.sh`：用 stub server 跑完整流程（READY、各種失敗與停止路徑、exit code）。
-* `test_check_*.sh`、`test_offload_env.sh`、`test_preflight_offload.sh`：檢查 script 與 env 檔的行為（`test_offload_env.sh` 以 `942acddc48` 比較 `MUSE_OFFLOAD=0` 的 export）。
-* **這兩個測試需要 repo 的 git history**（`da1bdad519`、`942acddc48` 要留在 main 的歷史裡；沒有時它們印 `skip:`，不算通過）。
+* `test_check_*.sh`、`test_offload_env.sh`、`test_preflight_offload.sh`：檢查 script 與 env 檔的行為（`test_offload_env.sh` 以 `2d54c1a2d7` 比較 `MUSE_OFFLOAD=0` 的 export）。
+* **這兩個測試需要 repo 的 git history**（`8fa110ff4e`、`2d54c1a2d7` 要留在 main 的歷史裡；沒有時它們印 `skip:`，不算通過）。
 
 plugin 的 CPU 單元測試（mock TopoComm；需要 torch，不需要 GPU）：
 
@@ -739,7 +739,7 @@ python3 nccl/compare.py REF.json OTHER.json [...]          # 比較 e2e_bitwise.
 
 * **只適用這台主機**：拓樸簽章要求 TP world size 8、同一個 node、全是 RTX PRO 6000 Blackwell（cc 12.0）、56 組 P2P 全通、PCI layout 為 2 sockets x 2 virtual switches x 2 GPUs，不吻合就用 NCCL。
   script 內的路徑寫死為 `/raid/vllm-runtime/...`。
-* **版本**：第 8、9 節的 H1 / H2 / r3 microbenchmark 與 end-to-end 數字是 vLLM v0.32.0 + branch `sm120-muse-spark-open`、torch 2.13 cu130、NCCL 2.29.7 時期量的，沒有重跑。目前 production 是 v0.33.0 線（vLLM `f6a60ab9d7`、torch 2.14.0+cu130、flashinfer 0.7.2.post1、NCCL 2.30.7、triton 3.8.0）+ host `f540ce1b37`；它的最終 matrix 與 gates 見第 6 節（2026-11-13）。plugin 是在 runtime patch `CudaCommunicator`，換 vLLM 版本要重新驗證。
+* **版本**：第 8、9 節的 H1 / H2 / r3 microbenchmark 與 end-to-end 數字是 vLLM v0.32.0 + branch `sm120-muse-spark-open`、torch 2.13 cu130、NCCL 2.29.7 時期量的，沒有重跑。目前 production 是 v0.33.0 線（vLLM `124f8e028a`、torch 2.14.0+cu130、flashinfer 0.7.2.post1、NCCL 2.30.7、triton 3.8.0）+ host `ae9d46abb2`；它的最終 matrix 與 gates 見第 6 節（2026-11-13）。plugin 是在 runtime patch `CudaCommunicator`，換 vLLM 版本要重新驗證。
 * 只涵蓋 TP group（名稱以 `tp` 開頭、8 ranks）的 `all_reduce` / `all_gather` / `reduce_scatter`；EP group、`gather`、`reduce_scatterv`、`all_gatherv`、send / recv 仍走原本的路徑。
   不在 envelope 的呼叫（其他 dtype、non-contiguous、不是 128 B 倍數的大訊息、reduce_scatter dim != 0、all-gather 的中間維度）由 `supports()` 退回 NCCL。
 * 本節的 H2 效能數字都是 **concurrency 1**；decode graph size 1..128 都有走 topo（正確性已驗證，128 requests 的 decode batch 重跑 128/128 相同）。高 concurrency（c4 .. c128，
@@ -788,8 +788,8 @@ S1-10R 的 STEADY c1 pass（0.9859 對門檻 0.985，餘裕 0.0009）落在它�
 
 ## 13. 出處
 
-* final matrix 與 gates 的量測：vLLM `sm120-muse-spark-open` `f6a60ab9d7` + 本 repo `main` 的 `f540ce1b37`（2026-11-13 02:36:49 -> 07:11:47；13 個 hold、7 次 boot、216 個 cell）。
-* `f540ce1b37` 之後的 commit 只改 launcher 的停止路徑（server.sess 消失時改用記憶體裡的 tuple）、serve line 檢查（log 的 connector / role 要與 line 一致）、測試與文件，以及這次整理（移除實驗與歷史檔案、重寫本檔）：
+* final matrix 與 gates 的量測：vLLM `sm120-muse-spark-open` `124f8e028a` + 本 repo `main` 的 `ae9d46abb2`（2026-11-13 02:36:49 -> 07:11:47；13 個 hold、7 次 boot、216 個 cell）。
+* `ae9d46abb2` 之後的 commit 只改 launcher 的停止路徑（server.sess 消失時改用記憶體裡的 tuple）、serve line 檢查（log 的 connector / role 要與 line 一致）、測試與文件，以及這次整理（移除實驗與歷史檔案、重寫本檔）：
   **沒有改任何 export、serve line 或預設值**（`--dry-run` 的 serve_cmd.txt、env.txt、pid_environ_expected.txt 在整理前後逐 byte 相同）。
 * 伺服器的 mirror 要重新用 `scripts/deploy_host.sh` 同步才會有這些變更（先 `-n`，且只在沒有 server 佔著 GPU lock 時）。
-* 歷史要求：`bench/test_launch_equiv.sh` 需要 `da1bdad519`、`bench/test_offload_env.sh` 需要 `942acddc48` 留在 `main` 的 git history 裡（不要 squash、不要改寫歷史）。
+* 歷史要求：`bench/test_launch_equiv.sh` 需要 `8fa110ff4e`、`bench/test_offload_env.sh` 需要 `2d54c1a2d7` 留在 `main` 的 git history 裡（不要 squash、不要改寫歷史）。

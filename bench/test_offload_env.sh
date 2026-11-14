@@ -111,7 +111,7 @@ t "m3 (closed by test): an explicit operator override equal to the ON bytes with
   'export MUSE_OFFLOAD=0 MUSE_SPEC_KV_BYTES_OVERRIDE=11645337600; source $E/spec_k7.env 2>/dev/null; echo "off=$MUSE_OFFLOAD args=[${MUSE_OFFLOAD_SERVE_ARGS:-}] kv=$MUSE_SPEC_KV_BYTES"'
 t "m4 (closed by test): MUSE_OFFLOAD=0 with MUSE_OFFLOAD_PROFILE=ns256 exported: the launch-relevant values equal the plain OFF launch (extra MUSE_OFFLOAD_* exports are not launch-relevant)" "kv=11720212480 args=[] sargs=--max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192" \
   'export MUSE_OFFLOAD=0 MUSE_OFFLOAD_PROFILE=ns256; source $E/host.env; source $E/spec_k7.env 2>/dev/null; echo "kv=$MUSE_SPEC_KV_BYTES args=[${MUSE_OFFLOAD_SERVE_ARGS:-}] sargs=$MUSE_SPEC_SERVE_ARGS"'
-# A3 literal proofs: every exported variable (export -p, sorted) of the default launch equals the gated order's; the OFF launch equals main 942acddc48's
+# A3 literal proofs: every exported variable (export -p, sorted) of the default launch equals the gated order's; the OFF launch equals main 2d54c1a2d7's
 exps() { env -i PATH="$PATH" "${@:2}" bash -c "$1" 2>/dev/null | sort; }
 if [ "$(exps "source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "source $here/env/host.env; source $here/env/offload.env; source $here/env/spec_k7.env; export -p")" ]; then
   echo "ok   A3: every exported variable of host.env + spec_k7.env (default) equals the gated host.env + offload.env + spec_k7.env"
@@ -120,11 +120,11 @@ if [ "$(exps "export MUSE_OFFLOAD_PROFILE=ns256; source $here/env/host.env; sour
   echo "ok   A3: same with a shell that exports MUSE_OFFLOAD_PROFILE=ns256"
 else echo "FAIL A3: ns256 shell and gated exports differ"; fails=$((fails+1)); fi
 mt=$(mktemp -d)
-if git -C "$here" cat-file -e 942acddc48^{commit} 2>/dev/null && git -C "$here" archive 942acddc48 env | tar -x -C "$mt"; then
+if git -C "$here" cat-file -e 2d54c1a2d7^{commit} 2>/dev/null && git -C "$here" archive 2d54c1a2d7 env | tar -x -C "$mt"; then
   if [ "$(exps "export MUSE_OFFLOAD=0; source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "export MUSE_OFFLOAD=0; source $mt/env/host.env; source $mt/env/spec_k7.env; export -p")" ]; then
-    echo "ok   A3: MUSE_OFFLOAD=0 exports exactly what main 942acddc48 exports (host.env + spec_k7.env)"
-  else echo "FAIL A3: MUSE_OFFLOAD=0 exports differ from main 942acddc48"; fails=$((fails+1)); fi
-else echo "skip A3: main 942acddc48 not available in this checkout (the main history must stay reachable for this proof)"; fi
+    echo "ok   A3: MUSE_OFFLOAD=0 exports exactly what main 2d54c1a2d7 exports (host.env + spec_k7.env)"
+  else echo "FAIL A3: MUSE_OFFLOAD=0 exports differ from main 2d54c1a2d7"; fails=$((fails+1)); fi
+else echo "skip A3: main 2d54c1a2d7 not available in this checkout (the main history must stay reachable for this proof)"; fi
 rm -rf "$mt"
 echo "$fails case(s) failed"
 exit $(( fails > 0 ))

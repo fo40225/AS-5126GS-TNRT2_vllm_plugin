@@ -43,17 +43,17 @@ prove ns128_1 serve_nonspec.sh ns128 "ns128, MUSE_OFFLOAD=1 = adopt_ns128" MUSE_
 prove ns128_0 serve_nonspec.sh ns128 "ns128, no tier (default) = S1-14 production pb_ns128"
 prove ns128_0 serve_nonspec.sh ns128 "ns128, MUSE_OFFLOAD=0 = S1-14 production pb_ns128" MUSE_OFFLOAD=0
 # ns256 OFF: the serve line is byte-equal to the 0.33.0 validation boot; that boot recorded no env.txt, so its environment is proved against the S1-14 host.env-only record
-# (same launch: host.env, no profile file) and against the flags line of its status.txt; the one difference is VLLM_PLUGINS=muse_topo (host a26c2be, after that boot)
+# (same launch: host.env, no profile file) and against the flags line of its status.txt; the one difference is VLLM_PLUGINS=muse_topo (host c938590, after that boot)
 prove ns256_0 serve_nonspec.sh ns256 "ns256, MUSE_OFFLOAD=0 = 0.33.0 validation boot v033s3_ns256_1 (serve line)" MUSE_OFFLOAD=0
 dry ns256_off serve_nonspec.sh ns256 MUSE_OFFLOAD=0
 if norm "$d/ns256_off/env.txt" | cmp -s - "$ref/ns128_0.env.txt"; then ok "ns256 no tier: env.txt byte-equal to the S1-14 host.env-only record (ns128_0)"; else bad "ns256 no tier: env.txt vs the S1-14 record" "$(diff <(norm "$d/ns256_off/env.txt") "$ref/ns128_0.env.txt" | head -4)"; fi
-# the serve line of the newer S1-10R gate boot s110r_ns256_OFF_1 (host a26c2be+) is the same line
+# the serve line of the newer S1-10R gate boot s110r_ns256_OFF_1 (host c938590+) is the same line
 if cmp -s "$d/ns256_off/serve_cmd.txt" "$ref/ns256_0b.serve_cmd.txt"; then ok "ns256 no tier: serve line byte-equal to the S1-10R gate boot s110r_ns256_OFF_1 too"; else bad "ns256 no tier: serve line vs s110r_ns256_OFF_1"; fi
 for fl in ns256_0 ns256_0b; do
   flags=$(sed -E 's/^[^ ]+ [^ ]+ flags //; s#host_topo_v033#host_topo#; s#host_topo_s110r#host_topo#' "$ref/$fl.flags_line.txt")
   miss=0; for kv in $flags; do norm "$d/ns256_off/env.txt" | grep -q -x -F -- "$kv" || { miss=1; echo "    flags-line entry not in the script environment: $kv"; }; done
   extra=$(norm "$d/ns256_off/env.txt" | grep -v -x -F -f <(echo "$flags" | tr ' ' '\n') | tr '\n' ' ')
-  # the extras: PYTHONPATH is outside the filter of that boot's flags line; VLLM_PLUGINS is outside it too (set since host a26c2be, so not set in v033s3_ns256_1, set in s110r_ns256_OFF_1)
+  # the extras: PYTHONPATH is outside the filter of that boot's flags line; VLLM_PLUGINS is outside it too (set since host c938590, so not set in v033s3_ns256_1, set in s110r_ns256_OFF_1)
   if [ $miss = 0 ] && [ "$extra" = "PYTHONPATH=/raid/vllm-runtime/host_topo:/raid/vllm-runtime/sm120-dev/src VLLM_PLUGINS=muse_topo " ]; then
     ok "ns256 no tier: every entry of the flags line of $fl is in the environment; the extras are PYTHONPATH and VLLM_PLUGINS=muse_topo (not in that line's filter)"
   else bad "ns256 no tier vs the flags line of $fl" "extra: '$extra'"; fi
@@ -80,7 +80,7 @@ else bad "negative control: --keep-env with NCCL_ALGO / VLLM_ATTENTION_BACKEND";
 dry nc_ns128 serve_nonspec.sh ns128 MUSE_OFFLOAD=0; dry nc_ns256 serve_nonspec.sh ns256 MUSE_OFFLOAD=0
 cmp -s "$d/nc_ns128/serve_cmd.txt" "$d/nc_ns256/serve_cmd.txt" && bad "negative control: ns128 and ns256 serve lines are equal" || ok "negative control: ns128 and ns256 serve lines differ"
 # ---- the env files export exactly what the base commit's did (sourcing order of the gated boots), for every path
-base=da1bdad519
+base=8fa110ff4e
 if git -C "$here" cat-file -e "$base^{commit}" 2> /dev/null && mkdir -p "$d/base" && git -C "$here" archive "$base" env nccl | tar -x -C "$d/base"; then
   exps() { env -i PATH="$PATH" "${@:2}" bash -c "$1" 2> /dev/null | grep -v -E '^declare -x (PWD|OLDPWD|SHLVL|_)=' | sort; }
   cmpexp() { # <desc> <env assignments...> -- <shell code with $E>

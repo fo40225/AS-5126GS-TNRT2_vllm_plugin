@@ -8,15 +8,15 @@ ns256_1 S1-10R adoption boot adopt_ns256    (ns256, tier ON)                    
 ns128_1 S1-10R adoption boot adopt_ns128    (ns128, tier ON)                         muse_wf/s1-10r/adoption_boots/runs/adopt_ns128/...
 ns128_0 S1-14 production boot pb_ns128      (ns128, no tier)                         server /raid/vllm-runtime/work/s1-14/merge/runs/pb_ns128/{serve_cmd,env}.txt
 ns256_0 0.33.0 validation boot v033s3_ns256_1 (ns256, no tier; serve line only)       server /raid/vllm-runtime/musetest/results/v033s3_ns256_1/serve_cmd.txt
-ns256_0b S1-10R gate boot s110r_ns256_OFF_1 (ns256, no tier, 2026-11-11, host a26c2be+) server /raid/vllm-runtime/musetest/results/s110r_ns256_OFF_1/{serve_cmd.txt,status.txt line 3}
+ns256_0b S1-10R gate boot s110r_ns256_OFF_1 (ns256, no tier, 2026-11-11, host c938590+) server /raid/vllm-runtime/musetest/results/s110r_ns256_OFF_1/{serve_cmd.txt,status.txt line 3}
 
 NAMED DIFFERENCES of the references (nothing else differs):
  - the host folder: every record names /raid/vllm-runtime/host_topo (PYTHONPATH, NCCL_GRAPH_FILE); a test runs the scripts from a checkout, so exactly one
    normalization is applied to the script output: the checkout path -> /raid/vllm-runtime/host_topo. The smoke boots on the server repeat the comparison without it.
  - ns256_0 has NO env record (the 0.33.0 validation harness wrote none). Its only environment evidence is the `flags` line of its status.txt (ns256_0.flags_line.txt):
-   MUSE_TOPO_*, NCCL_GRAPH_FILE (mirror host_topo_v033), NCCL_IB_DISABLE=1, NCCL_P2P_LEVEL=SYS, the L2 prefetch CTAs; that boot predates VLLM_PLUGINS=muse_topo (host a26c2be:
-   its log carries the b12x plugin tracebacks, VALIDATION.md), so the script environment of ns256 OFF has TWO entries that the flags line does not list: VLLM_PLUGINS=muse_topo (new since host a26c2be) and PYTHONPATH (outside the filter of that line).
-   A second, newer ns256 no-tier boot exists: s110r_ns256_OFF_1 (S1-10R gate, after a26c2be: its serve.log has 0 b12x tracebacks, i.e. the VLLM_PLUGINS=muse_topo allowlist was
+   MUSE_TOPO_*, NCCL_GRAPH_FILE (mirror host_topo_v033), NCCL_IB_DISABLE=1, NCCL_P2P_LEVEL=SYS, the L2 prefetch CTAs; that boot predates VLLM_PLUGINS=muse_topo (host c938590:
+   its log carries the b12x plugin tracebacks, VALIDATION.md), so the script environment of ns256 OFF has TWO entries that the flags line does not list: VLLM_PLUGINS=muse_topo (new since host c938590) and PYTHONPATH (outside the filter of that line).
+   A second, newer ns256 no-tier boot exists: s110r_ns256_OFF_1 (S1-10R gate, after c938590: its serve.log has 0 b12x tracebacks, i.e. the VLLM_PLUGINS=muse_topo allowlist was
    set; its serve_cmd.txt is byte-equal to ns256_0.serve_cmd.txt, ns256_0b.* here). It too wrote only a `flags` line (ns256_0b.flags_line.txt, mirror host_topo_s110r), no env.txt, so
    VLLM_PLUGINS is evidenced there only indirectly (0 tracebacks). The environment of the ns256 OFF script is therefore proved against ns128_0.env.txt (the same host.env-only launch, S1-14) and against the flags line, not against a record.
  - the logs bench/fixtures/launch/<state>.log are the check-relevant lines of the real serve.log of the same boot (grep of the patterns the checks read); ns256_0.cache_config_info.txt
