@@ -164,6 +164,12 @@ def eval_nc(nc):
     return not why, why
 
 
+def a_kv_groups(D):
+    """Restored-block counts per KV group from the (a) compare, or None when there is no compare result."""
+    kv = D.get("a")
+    return kv.get("groups_loaded") if kv else None
+
+
 def final_verdict(D):
     """D: {profile, spec, n_groups, errors, tracer_errors, a, a_uncovered_requests, nc, b}; any error or missing piece -> ARTIFACT, a real difference -> FAIL."""
     art, fail, warn = [], [], []
@@ -182,26 +188,36 @@ def final_verdict(D):
             fail.append(f"(a) restored KV bytes differ from the tier copy ({bad['xc']} block-ranks) or the pass-H GPU copy ({bad['hx']} block-ranks): connector bug")
         else:
             art.append("(a) KV bytes differ but the negative control is not valid")
+    dg_ = D.get("draft_groups")
+    if D.get("spec") and a_kv_groups(D) is not None:
+        if not dg_:
+            warn.append("(a) spec profile but no draft KV group detected (detection may be wrong; not an artifact)")
+        else:
+            warn.append(f"(a) draft KV groups {dg_}: restored blocks per group {{{', '.join(f'{g}: {a_kv_groups(D).get(g, 0)}' for g in dg_)}}}")
     recs = D.get("b") or []
     good = [r for r in recs if not r.get("error")]
     seen = {}
     for r in good:
         seen[(r["req"], r["kind"])] = r
+    if D.get("n_det") != N_DET:
+        art.append(f"(b) the fixed request list has {D.get('n_det')} requests, not {N_DET}")
     want = {(i, k) for i in range(D.get("n_det", N_DET)) for k in B_KINDS}
     if want - set(seen):
         art.append(f"(b) {len(want - set(seen))} of {len(want)} single-stream records missing or failed, e.g. {sorted(want - set(seen))[:5]}")
     if len(good) != len(seen):
         art.append("(b) duplicate single-stream records")
     for (i, k), r in sorted(seen.items()):
+        if r["cached"]["H"] > 0 and r["cached"]["X"] == 0:
+            # A recompute proves nothing about the tier: ARTIFACT, and the equality checks of this record are skipped (cold-vs-hit chunk shapes can change tokens).
+            art.append(f"(b) request {i} {k}: pass X was a recompute (0 cached tokens, H cached {r['cached']['H']}), not a tier hit")
+            continue
         if not r["tokens_equal"]:
             fail.append(f"(b) request {i} {k}: token ids differ H vs X (first diff at {r['first_diff']})")
         if r.get("lp_requested") and not r["lp_equal"]:
             fail.append(f"(b) request {i} {k}: logprobs differ H vs X (max abs {r['lp_max_abs']})")
         if D.get("spec") and not r["spec_equal"]:
             fail.append(f"(b) request {i} {k}: accepted/drafted counts differ H vs X ({r['spec']['H']} vs {r['spec']['X']})")
-        if r["cached"]["H"] > 0 and r["cached"]["X"] == 0:
-            art.append(f"(b) request {i} {k}: pass X was a recompute (0 cached tokens, H cached {r['cached']['H']}), not a tier hit")
-        elif r["cached"]["H"] != r["cached"]["X"]:
+        if r["cached"]["H"] != r["cached"]["X"]:
             warn.append(f"(b) request {i} {k}: cached tokens H {r['cached']['H']} != X {r['cached']['X']}")
     if seen and not any(r["cached"]["X"] > 0 for r in seen.values()):
         art.append("(b) no single-stream pass X was a tier hit")
@@ -863,7 +879,7 @@ def main():
         def group_info(gr):
             ksp = gr.kv_cache_spec
             subs = getattr(ksp, "kv_cache_specs", None)
-            draft = bool(getattr(ksp, "is_draft", False)) or (isinstance(subs, dict) and any(getattr(x, "is_draft", False) for x in subs.values()))
+            draft = bool(getattr(gr, "is_eagle_group", False)) or bool(getattr(ksp, "is_draft", False)) or (isinstance(subs, dict) and any(getattr(x, "is_draft", False) for x in subs.values()))
             return {"n_layers": len(gr.layer_names), "first_layer": gr.layer_names[0] if gr.layer_names else None, "spec_type": type(ksp).__name__, "is_draft": draft}
 
         D = {"profile": profile, "spec": spec_profile, "n_groups": len(groups), "n_det": n, "tp": tp, "groups": [group_info(g) for g in groups]}
@@ -875,6 +891,8 @@ def main():
             D["errors"] = dict(RES.get("errors") or {})
             D["tracer_errors"] = tr.errors[:10] + SC.errors[:10]
             v = final_verdict(D)
+            if not final and v["verdict"] == "PASS":
+                v["verdict"] = "RUNNING"  # a progress write must never leave a PASS behind; consumers also require finished == true
             out = {"tool": "chk_driver.py d4", "rule": "ADOPTION_RULE_FINAL_AMENDMENT3 D4'", "profile": profile, "finished": final, "time": time.strftime("%F %T"),
                    "load_s": RES.get("load_s"), "env": RES["env"], **v, "detail": D}
             with open(vpath + ".tmp", "w") as f:
