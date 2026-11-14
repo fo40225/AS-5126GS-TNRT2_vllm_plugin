@@ -1,7 +1,8 @@
 # Speculative launch profile: graph cap 256 + sequence-parallel floor 384 (S1-9 lever 1)
 
 Launch-scoped, no vLLM code change: `env/spec_k7.env` (sourced after `env/host.env`, speculative launches only) and
-`scripts/check_spec_launch.sh` (the boot check). Branch under test: `sm120-muse-spark-open` 0ffa57b714; this folder at main b207e54.
+`scripts/check_spec_launch.sh` (the boot check). Measured on `sm120-muse-spark-open` 0ffa57b714 + host b207e54; production pair after the merge: vLLM
+5b827b215a (0ffa57b714 plus the SP test file, the runtime code is identical) + this folder.
 
 ## What it changes
 
@@ -102,8 +103,9 @@ Accuracy class: rounding-level (row-sharded GEMM, reduce-scatter + all-gather in
    5 of 400 answers at the 16384-token cap, same final answer A vs B 192/200 (identical text 0/200, batch-composition rounding as in every earlier run). Boot: idle 93,627 MiB, KV 1,482,225 tokens.
 4. Determinism, two cold processes of the profile (`greedy_check_g.py gen`: offline TP8 + EP8 engine, `max_cudagraph_capture_size` 256 + floor 384, 64 prompts = 20 GSM8K few-shot + 44 MT-bench, 128 tokens,
    batch pass = 64 concurrent sequences = verify batches of T = 512 down to 384 (eager SP), serial pass): **STRICT PASS 128/128 rows, 0 differing fields** (token ids, top-5 logprobs, text, finish reason; batch AL 4.553,
-   serial 4.501 in both). Production process on the same prompts for the record: serial pass 61/64 identical (the 3 that differ are exactly 3 of the 5 prompts whose prefill is 257..383 tokens, eager replicated
-   against a PIECEWISE graph; the 49 prompts of up to 256 and the 10 above 512 tokens are bit-identical), batch pass 2/64 identical (62 diverge by token 128, 8 of them within 0.1 nat): the expected effect of a
+   serial 4.501 in both). Production process on the same prompts for the record: serial pass 61/64 identical (the 3 that differ are exactly 3 of the 5 prompts whose prefill is 257..383 tokens; most likely the graph dispatcher of
+   production pads such a prefill to the next capture size (280 -> 288, 345 -> 352, 16-token steps above 256) while the profile runs the exact shape eagerly, so the GEMM M differs;
+   the 49 prompts of up to 256 and the 10 above 512 tokens are bit-identical), batch pass 2/64 identical (62 diverge by token 128, 8 of them within 0.1 nat): the expected effect of a
    rounding-level change at T = 512 (row-sharded GEMM, reduce-scatter + all-gather) on greedy continuations of reasoning text under NVFP4 / fp8-KV quantization; `greedy_check.py` is a diagnostic, the accuracy gate is
    the GSM8K run above (batch AL 4.553 against 4.594 in production, serial 4.501 against 4.527).
 
