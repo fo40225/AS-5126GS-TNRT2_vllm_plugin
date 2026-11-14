@@ -151,6 +151,7 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ar2_bnd_kernel(const Ctx c, 
     for (int j = 0; j < 4; ++j) bx[j] = (j == op) ? y : sent4();
   }
   TRACE(c, 5);
+  trigger_stage(c, 2);
   // phase c: the other three slices from their owners
   {
     uint32_t got = 1u << op;
@@ -175,6 +176,7 @@ __global__ void __launch_bounds__(bnd::kRowThreads) ar2_bnd_kernel(const Ctx c, 
     } while (!ok);
   }
   TRACE(c, 6);
+  trigger_stage(c, 3);
   if (bp.ld_mode == 1 || bp.ld_mode == 2) bnd::bnd8192_load<POST_SCALE>(a, row, regs);
   bnd::bnd8192_apply<POST_SCALE, FP32_OUT>(a, row, bx, regs, sm, c.trace);
   TRACE(c, 10);

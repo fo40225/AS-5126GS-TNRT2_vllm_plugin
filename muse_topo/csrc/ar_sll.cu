@@ -371,6 +371,7 @@ __global__ void __launch_bounds__(512) ar2_kernel(const Ctx c, const uint4* __re
       }
     }
     TRACE(c, 5);
+    trigger_stage(c, 2);
     // phase c: receive the other three slices from their owners; each pack is stored to the output and its slot
     // reset as soon as it has arrived, so little work is left after the last arrival
     uint32_t got[U];
@@ -410,6 +411,7 @@ __global__ void __launch_bounds__(512) ar2_kernel(const Ctx c, const uint4* __re
     }
   }
   TRACE(c, 6);
+  trigger_stage(c, 3);
   epoch_end(c, e, old);
 }
 

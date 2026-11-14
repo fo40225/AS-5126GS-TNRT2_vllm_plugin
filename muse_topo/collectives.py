@@ -338,9 +338,14 @@ class TopoComm:
         self._agree(cpu_group, reason, "IPC exchange", exc)
         i = self.info
         self._c.set_pdl(os.environ.get("MUSE_TOPO_PDL", "0") == "1")
-        # The collective kernels let a programmatic successor start at once (only gemv_push_kernel is one): its weight loads then
-        # overlap the tail of the all-reduce in front of it.
-        self._c.set_trigger(self.gemv)
+        # The all-reduce kernels in front of a gemv_push_kernel let it start (it is the only programmatic successor): 1 = at their start,
+        # 2 = when their last phase begins, 3 = when it ends, 0 = never (the GEMV kernel then starts when the all-reduce has completed). Its
+        # 8 MB of weight loads then overlap the tail of the all-reduce; at the start of the kernel they delay the all-reduce itself
+        # (measured: ~5 us, docs/r3b_gemv_push.md). Default 3, the stage of the measured arm; 2 is as good within the noise (c1 equal, c4 1 %
+        # better inside the repeat spread). Only ar2_kernel and ar2_bnd_kernel fire stages 2 and 3; the other all-reduce kernels
+        # (ar1, large / medium reduce_scatter, flag) do not, and the GEMV kernel then starts at their completion. Identical on every rank.
+        self.gemv_trigger = int(os.environ.get("MUSE_TOPO_GEMV_TRIGGER", "3"))
+        self._c.set_trigger(self.gemv_trigger if self.gemv else 0)
         self._c.set_gemv_variant(self.gemv_variant)
         # Where the fused collectives load the epilogue operands that do not depend on the collective (BndParams::ld_mode in
         # csrc/topo_types.h). 0 = into registers behind the first push stage: fastest with the operands in HBM (bench_boundary_cold.py,

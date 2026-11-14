@@ -223,52 +223,59 @@ def run(rank, args):
     # ---- 4. CUDA graphs next to other collectives: counter / parity / early start behind the all-reduce ------------------
     from vllm.models.muse_spark.common.ops.fused_rmsnorm import fused_norm_residual_norm_fwd  # noqa: F811
 
-    for T in ([1, 2, 4, 8] if not args.quick else [1, 8]):
-        xin = make_x(T, D, dev, 500 + T, "mixed")
-        g = torch.Generator(device=dev)
-        g.manual_seed(960 + T)
-        stream0 = (torch.randn(T, D, generator=g, device=dev) * 2.0).float()
-        xr = make_input(rank, (T, D), 510 + T, dev, torch.bfloat16, "mixed")
-        mid = make_input(rank, (T, 4096), 520 + T, dev, torch.bfloat16, "mixed")
+    # The same chain with every trigger stage of the all-reduce kernels in front of the GEMV kernel (0: never, 1: at their start, 2 / 3: when
+    # their last phase begins / ends): when the GEMV kernel becomes resident changes no bit.
+    stages = sorted({comm.gemv_trigger, 2, 3} if args.quick else {0, 1, 2, 3, comm.gemv_trigger})
+    for stage in stages:
+        comm._c.set_trigger(stage)
+        for T in ([1, 2, 4, 8] if not args.quick else [1, 8]):
+            xin = make_x(T, D, dev, 500 + T, "mixed")
+            g = torch.Generator(device=dev)
+            g.manual_seed(960 + T)
+            stream0 = (torch.randn(T, D, generator=g, device=dev) * 2.0).float()
+            xr = make_input(rank, (T, D), 510 + T, dev, torch.bfloat16, "mixed")
+            mid = make_input(rank, (T, 4096), 520 + T, dev, torch.bfloat16, "mixed")
 
-        def layer(use_fused):
-            """A decode-layer-like chain: attn-out all-reduce + boundary, pooler, moe all-reduce, unpooler + boundary."""
-            outs = []
-            y, s1 = comm.all_reduce_boundary(xr, stream0, alpha, beta, pre_w, post_w, 1e-8, 1e-6, 1.0, 1.0)
-            xp = y
-            if use_fused:
-                pooled = comm.gemv_all_gather_rmsnorm(xp, wp, w4, 1e-6, 1.0)
-            else:
-                shard = emulate_gemv(xp, wp, wpr(0))
-                pooled = fused_rmsnorm_fwd(comm.all_gather(shard, -1), w4, 1e-6, gain_center=1.0, input_scale=False,
-                                           use_kahan_summation=True)
-            ar = comm.all_reduce(pooled + mid)
-            if use_fused:
-                o, ns = comm.gemv_all_gather_boundary(ar, wu, s1, alpha, beta, pre_w, post_w, 1e-8, 1e-6, 1.0, 1.0)
-            else:
-                shard = emulate_gemv(ar, wu, wpr(1))
-                yu = comm.all_gather(shard, -1)
-                o, ns = fused_norm_residual_norm_fwd(yu, s1, post_w, pre_w, 1e-8, 1e-6, alpha=alpha, beta=beta,
-                                                     post_gain_center=1.0, pre_gain_center=1.0, post_input_scale=True,
-                                                     pre_input_scale=False, out_dtype=torch.bfloat16)
-            outs += [pooled, ar, o, ns]
-            return outs
+            def layer(use_fused):
+                """A decode-layer-like chain: attn-out all-reduce + boundary, pooler, moe all-reduce, unpooler + boundary."""
+                outs = []
+                y, s1 = comm.all_reduce_boundary(xr, stream0, alpha, beta, pre_w, post_w, 1e-8, 1e-6, 1.0, 1.0)
+                xp = y
+                if use_fused:
+                    pooled = comm.gemv_all_gather_rmsnorm(xp, wp, w4, 1e-6, 1.0)
+                else:
+                    shard = emulate_gemv(xp, wp, wpr(0))
+                    pooled = fused_rmsnorm_fwd(comm.all_gather(shard, -1), w4, 1e-6, gain_center=1.0, input_scale=False,
+                                               use_kahan_summation=True)
+                ar = comm.all_reduce(pooled + mid)
+                if use_fused:
+                    o, ns = comm.gemv_all_gather_boundary(ar, wu, s1, alpha, beta, pre_w, post_w, 1e-8, 1e-6, 1.0, 1.0)
+                else:
+                    shard = emulate_gemv(ar, wu, wpr(1))
+                    yu = comm.all_gather(shard, -1)
+                    o, ns = fused_norm_residual_norm_fwd(yu, s1, post_w, pre_w, 1e-8, 1e-6, alpha=alpha, beta=beta,
+                                                         post_gain_center=1.0, pre_gain_center=1.0, post_input_scale=True,
+                                                         pre_input_scale=False, out_dtype=torch.bfloat16)
+                outs += [pooled, ar, o, ns]
+                return outs
 
-        ref = layer(False)
-        torch.cuda.synchronize()
-        eager = layer(True)
-        torch.cuda.synchronize()
-        check(rank, f"layer chain eager == unfused T={T}", all(bits_equal(a, b) for a, b in zip(eager, ref)))
-        n_it = 6
-        gr = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(gr):
-            captured = [layer(True) for _ in range(n_it)]
-        for rep in range(5):
-            gr.replay()
+            ref = layer(False)
             torch.cuda.synchronize()
-            ok = all(bits_equal(a, b) for c in captured for a, b in zip(c, ref))
-            same = all(all_equal_across_ranks(t, cpu_group) for t in captured[-1])
-            check(rank, f"layer chain graph replay {rep} == unfused T={T}", ok and same)
+            eager = layer(True)
+            torch.cuda.synchronize()
+            check(rank, f"layer chain eager == unfused T={T} trigger={stage}", all(bits_equal(a, b) for a, b in zip(eager, ref)))
+            n_it = 6
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                captured = [layer(True) for _ in range(n_it)]
+            for rep in range(5):
+                gr.replay()
+                torch.cuda.synchronize()
+                ok = all(bits_equal(a, b) for c in captured for a, b in zip(c, ref))
+                same = all(all_equal_across_ranks(t, cpu_group) for t in captured[-1])
+                check(rank, f"layer chain graph replay {rep} == unfused T={T} trigger={stage}", ok and same)
+    comm._c.set_trigger(comm.gemv_trigger)
+
 
     # ---- 5. misaligned activations on odd ranks only; random mixes with other collectives -----------------------------------
     T = 1

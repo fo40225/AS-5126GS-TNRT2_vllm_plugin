@@ -60,7 +60,7 @@ struct RmsParams {
 struct Ctx {
   int rank, island, ipos, opos, partner;
   int pdl;  // 1: launch with programmatic stream serialization (kernels then start with griddepcontrol.wait)
-  int trigger;  // 1: kernels that are not launched with pdl still let a programmatic successor (gemv_push_kernel) start at once
+  int trigger;  // 1 / 2 / 3: the all-reduce kernels in front of a gemv_push_kernel let that programmatic successor start at their start / when their last phase begins / ends (0: never)
   int members[2][kIsland];  // ranks of each island in arithmetic (ascending rank) order
   int owners[kIsland];      // my island: owners[j] = rank that owns slice j (partner order)
   int partner_of[kWorld];

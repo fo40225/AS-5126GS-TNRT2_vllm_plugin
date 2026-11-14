@@ -86,11 +86,10 @@ def run(rank, args):
         for name, fn in (("pooler", pooler), ("unpooler", unpooler), ("layer", layer)):
             cases[f"{name}/two-step"] = (lambda fn=fn: fn("two-step"))
             for gv in args.variants:
-                # GEMV kernel without / with the pushes, geometry variant gv
-                cases[f"{name}/gemv_v{gv}"] = (lambda fn=fn: fn("gemv"))
-                cases[f"{name}/push_v{gv}"] = (lambda fn=fn: fn("push"))
-                cases[f"{name}/last_v{gv}"] = (lambda fn=fn: fn("last"))
-                cases[f"{name}/late_v{gv}"] = (lambda fn=fn: fn("late"))
+                for tr in args.triggers:
+                    # GEMV kernel without / with the pushes, geometry variant gv, trigger stage tr of the all-reduce in front
+                    for mode in ("gemv", "push", "last", "late"):
+                        cases[f"{name}/{mode}_v{gv}_t{tr}"] = (lambda fn=fn, mode=mode: fn(mode))
         row = {"T": T, "cold": args.cold}
         base_flush = 0.0
         if args.cold:
@@ -101,7 +100,8 @@ def run(rank, args):
             variant = name.split("/")[-1]
             comm.gemv_push = {"push": 1, "last": 2, "late": 5}.get(variant.split("_")[0], 0)
             if "_v" in variant:
-                comm.set_gemv_variant(int(variant.split("_v")[-1]))
+                comm.set_gemv_variant(int(variant.split("_v")[1].split("_")[0]))
+                comm._c.set_trigger(int(variant.split("_t")[-1]))
             if args.cold:
                 def one(call=call):
                     flush.zero_()
@@ -115,6 +115,7 @@ def run(rank, args):
             row[name] = round(med_over_ranks(per, cpu_group) - base_flush, 2)
         comm.gemv_push = 1
         comm.set_gemv_variant(0)
+        comm._c.set_trigger(comm.gemv_trigger)
         rows.append(row)
         log(rank, json.dumps(row))
     if rank == 0 and args.out:
@@ -130,6 +131,8 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--cold", action="store_true")
+    ap.add_argument("--triggers", type=lambda s: [int(v) for v in s.split(",")], default=[3],
+                    help="trigger stages of the all-reduce kernels in front of the GEMV kernel (1 start, 2 last phase begins, 3 ends)")
     ap.add_argument("--variants", type=lambda s: [int(v) for v in s.split(",")], default=[0],
                     help="geometry variants of the GEMV kernels to time (csrc/gemv_push.cu)")
     ap.add_argument("--out", default="")

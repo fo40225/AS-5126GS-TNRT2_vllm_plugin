@@ -159,7 +159,10 @@ struct Comm {
   }
   void set_pdl(bool on) { c.pdl = on ? 1 : 0; }
   // Kernels that are not programmatic dependents themselves still let a programmatic successor (gemv_push_kernel) start at once.
-  void set_trigger(bool on) { c.trigger = on ? 1 : 0; }
+  void set_trigger(int stage) {
+    TORCH_CHECK(stage >= 0 && stage <= 3, "bad trigger stage ", stage);
+    c.trigger = stage;
+  }
   // Geometry variant of the GEMV kernels (gemv_push.cu); the summation order depends on it.
   int gemv_variant = 0;
   void set_gemv_variant(int v) {
