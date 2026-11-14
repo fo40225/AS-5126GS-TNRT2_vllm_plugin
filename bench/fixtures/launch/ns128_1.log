@@ -1,0 +1,67 @@
+(APIServer pid=1420826) INFO 11-12 02:19:23 [startup.py:96] non-default args: {'model_tag': 'unsloth/Muse-Spark-Open-816B-A42B-NVFP4', 'enable_auto_tool_choice': True, 'tool_call_parser': 'muse', 'host': '127.0.0.1', 'port': 8100, 'model': 'unsloth/Muse-Spark-Open-816B-A42B-NVFP4', 'max_model_len': 131072, 'quantization': 'modelopt_fp4', 'reasoning_parser': 'muse', 'numa_bind': True, 'tensor_parallel_size': 8, 'enable_expert_parallel': True, 'gpu_memory_utilization': 0.95, 'kv_cache_memory_bytes': 17257267200, 'kv_cache_dtype': 'fp8', 'limit_mm_per_prompt': {'image': 0, 'audio': 0, 'video': 0}, 'max_num_seqs': 128, 'kv_transfer_config': KVTransferConfig(kv_connector='SimpleCPUOffloadConnector', engine_id='578d76ef-ed1c-4011-b7d1-60aec492896c', kv_buffer_device='cuda', kv_role='kv_both', kv_port=14579, kv_connector_extra_config={'cpu_bytes_to_use': 414512578560, 'cpu_bytes_to_use_per_rank': 51814072320}, kv_connector_module_path=None, enable_permute_local_kv=False, kv_load_failure_policy='fail')}
+(APIServer pid=1420826) INFO 11-12 02:19:27 [scheduler.py:310] Chunked prefill is enabled with max_num_batched_tokens=8192.
+(APIServer pid=1420826) INFO 11-12 02:19:27 [config.py:178] MuseSpark SM120: prefill batches of at least 2050 tokens run as 2 microbatches that overlap their collectives with each other's compute.
+(APIServer pid=1420826) INFO 11-12 02:19:29 [numa_utils.py:409] Binding EngineCore subprocess (local_rank=0) to NUMA nodes 0,3,4,7
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [core.py:139] Initializing a V1 LLM engine (v0.33.0) speculative_config=None
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=0, gpu_index=0) to NUMA node 3
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=1, gpu_index=1) to NUMA node 3
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=2, gpu_index=2) to NUMA node 0
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=3, gpu_index=3) to NUMA node 0
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=4, gpu_index=4) to NUMA node 7
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=5, gpu_index=5) to NUMA node 7
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=6, gpu_index=6) to NUMA node 4
+(EngineCore pid=1421153) INFO 11-12 02:19:35 [numa_utils.py:340] Binding worker subprocess (local_rank=7, gpu_index=7) to NUMA node 4
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:19:54 [model.py:3009] MuseSpark SM120: sequence-parallel residual stream for batches of at least 512 tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=512, CUDA graphs up to 256 tokens).
+(Worker_TP4_EP4 pid=1421254) INFO 11-12 02:20:09 [model_runner.py:480] Model loading took 69.07 GiB memory and 16.738558 seconds
+(Worker_TP2_EP2 pid=1421250) INFO 11-12 02:20:09 [model_runner.py:480] Model loading took 69.07 GiB memory and 16.750875 seconds
+(Worker_TP5_EP5 pid=1421256) INFO 11-12 02:20:09 [model_runner.py:480] Model loading took 69.07 GiB memory and 16.770057 seconds
+(Worker_TP3_EP3 pid=1421252) INFO 11-12 02:20:09 [model_runner.py:480] Model loading took 69.07 GiB memory and 16.807023 seconds
+(Worker_TP1_EP1 pid=1421248) INFO 11-12 02:20:10 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.094506 seconds
+(Worker_TP7_EP7 pid=1421260) INFO 11-12 02:20:10 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.133902 seconds
+(Worker_TP6_EP6 pid=1421258) INFO 11-12 02:20:10 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.250289 seconds
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:20:10 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.244184 seconds
+(EngineCore pid=1421153) INFO 11-12 02:20:10 [utils.py:381] Using LBNHC KV cache layout.
+(EngineCore pid=1421153) INFO 11-12 02:20:15 [kv_cache_utils.py:1147] GPU KV cache size: 2,962,366 tokens, Maximum concurrency for 131,072 tokens per request: 22.60x
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP5_EP5 pid=1421256) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP4_EP4 pid=1421254) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP1_EP1 pid=1421248) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP3_EP3 pid=1421252) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP5_EP5 pid=1421256) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP4_EP4 pid=1421254) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP6_EP6 pid=1421258) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP2_EP2 pid=1421250) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP1_EP1 pid=1421248) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP3_EP3 pid=1421252) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP7_EP7 pid=1421260) INFO 11-12 02:20:15 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(Worker_TP6_EP6 pid=1421258) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP2_EP2 pid=1421250) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP7_EP7 pid=1421260) INFO 11-12 02:20:15 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=WORKER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP7_EP7 pid=1421260) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP6_EP6 pid=1421258) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP5_EP5 pid=1421256) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP4_EP4 pid=1421254) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP3_EP3 pid=1421252) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP2_EP2 pid=1421250) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP1_EP1 pid=1421248) INFO 11-12 02:20:15 [worker.py:228] SimpleCPUOffloadWorker [CPU]: 16 tensors, 790620 CPU blocks (48.26 GB)
+(Worker_TP6_EP6 pid=1421258) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP7_EP7 pid=1421260) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP2_EP2 pid=1421250) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP4_EP4 pid=1421254) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP5_EP5 pid=1421256) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP3_EP3 pid=1421252) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP1_EP1 pid=1421248) INFO 11-12 02:20:32 [cudagraph_utils.py:888] CUDA graphs: 19 FULL decode graphs are flagged full_decode_graph (token counts 1..128), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP7_EP7 pid=1421260) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP4_EP4 pid=1421254) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP0_EP0 pid=1421246) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP2_EP2 pid=1421250) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP3_EP3 pid=1421252) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP6_EP6 pid=1421258) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP5_EP5 pid=1421256) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(Worker_TP1_EP1 pid=1421248) INFO 11-12 02:20:41 [model_runner.py:1757] Graph capturing finished in 10 secs, took 0.62 GiB
+(EngineCore pid=1421153) INFO 11-12 02:20:42 [factory.py:62] Creating v1 connector with name: SimpleCPUOffloadConnector and engine_id: 578d76ef-ed1c-4011-b7d1-60aec492896c
+(EngineCore pid=1421153) INFO 11-12 02:20:42 [simple_cpu_offload_connector.py:182] SimpleCPUOffloadConnector: role=SCHEDULER, per_rank=48.26 GB, world_size=8, mode=eager, backend=cpu, disk=none
+(EngineCore pid=1421153) INFO 11-12 02:20:42 [manager.py:198] SimpleCPUOffloadScheduler: Allocating 790620 offload blocks (48.26 GB, mode=eager, backend=cpu)

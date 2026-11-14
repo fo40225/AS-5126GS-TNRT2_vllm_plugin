@@ -1,0 +1,50 @@
+Reference records of the launches that the launch scripts must reproduce (S1-11 Amendment 2). Copied unchanged, read-only, from the places below
+(all on the repo owner's machines; paths are the originals). md5 of every file at the end.
+
+state  boot (record)                                                                 serve_cmd.txt / env.txt origin
+spec_1 S1-10R adoption boot adopt_spec_on   (spec, tier ON)                          muse_wf/s1-10r/adoption_boots/runs/adopt_spec_on/{serve_cmd,env,pid_environ}.txt
+spec_0 S1-10R adoption boot adopt_spec_off  (spec, MUSE_OFFLOAD=0)                   muse_wf/s1-10r/adoption_boots/runs/adopt_spec_off/...
+ns256_1 S1-10R adoption boot adopt_ns256    (ns256, tier ON)                         muse_wf/s1-10r/adoption_boots/runs/adopt_ns256/...
+ns128_1 S1-10R adoption boot adopt_ns128    (ns128, tier ON)                         muse_wf/s1-10r/adoption_boots/runs/adopt_ns128/...
+ns128_0 S1-14 production boot pb_ns128      (ns128, no tier)                         server /raid/vllm-runtime/work/s1-14/merge/runs/pb_ns128/{serve_cmd,env}.txt
+ns256_0 0.33.0 validation boot v033s3_ns256_1 (ns256, no tier; serve line only)       server /raid/vllm-runtime/musetest/results/v033s3_ns256_1/serve_cmd.txt
+
+NAMED DIFFERENCES of the references (nothing else differs):
+ - the host folder: every record names /raid/vllm-runtime/host_topo (PYTHONPATH, NCCL_GRAPH_FILE); a test runs the scripts from a checkout, so exactly one
+   normalization is applied to the script output: the checkout path -> /raid/vllm-runtime/host_topo. The smoke boots on the server repeat the comparison without it.
+ - ns256_0 has NO env record (the 0.33.0 validation harness wrote none). Its only environment evidence is the `flags` line of its status.txt (ns256_0.flags_line.txt):
+   MUSE_TOPO_*, NCCL_GRAPH_FILE (mirror host_topo_v033), NCCL_IB_DISABLE=1, NCCL_P2P_LEVEL=SYS, the L2 prefetch CTAs; that boot predates VLLM_PLUGINS=muse_topo (host a26c2be:
+   its log carries the b12x plugin tracebacks, VALIDATION.md), so the script environment of ns256 OFF has TWO entries that the flags line does not list: VLLM_PLUGINS=muse_topo (new since host a26c2be) and PYTHONPATH (outside the filter of that line).
+   The environment of the ns256 OFF script is therefore proved against ns128_0.env.txt (the same host.env-only launch, S1-14) and against the flags line, not against a record.
+ - the logs bench/fixtures/launch/<state>.log are the check-relevant lines of the real serve.log of the same boot (grep of the patterns the checks read); ns256_0.cache_config_info.txt
+   is the ns256_1 file with the tokens / blocks / bytes of the 0.33.0 validation boot (258,747 blocks, 2,910,864 tokens, 16,957,243,392 B: VALIDATION.md and its serve.log), because that boot saved no metrics.
+
+854452128801e114a8da6918861bd01f  ns128_0.env.txt
+9a9ce4dca5cfa8832631d8dcbeb932ee  ns128_0.serve_cmd.txt
+3e9bac1065e45599f20d688bae9a13f3  ns128_1.env.txt
+64653f470f732d4d433d81af091003f6  ns128_1.pid_environ.txt
+a2c1b8a252c3487cd06314ca565cc287  ns128_1.serve_cmd.txt
+a0b9776a53ef23ccffa52c12285fbaa1  ns256_0.flags_line.txt
+698035991d6e9a29b24fdcaa096ade34  ns256_0.serve_cmd.txt
+d51c65ce8d75661d52161f45d4081d64  ns256_1.env.txt
+2096113dec944dea57e8ca63d2ea1db0  ns256_1.pid_environ.txt
+ef1b5ec3d870c8dceba9af55d4f7bea0  ns256_1.serve_cmd.txt
+fac724a50d2d59a0fe796fd4ba9e37a6  spec_0.env.txt
+8ba1f830fc3aff5d54da107b232a26ec  spec_0.pid_environ.txt
+35679627235e2cb26393260114dd2f94  spec_0.serve_cmd.txt
+bb321596fb3e17c01b96142f17003cdc  spec_1.env.txt
+b8d5e666e3de7664a9eecf627a9a7307  spec_1.pid_environ.txt
+6823381ad53a691450687f3be6d82296  spec_1.serve_cmd.txt
+
+55c293fa6da63116d808c868f0e0342b  ns128_0.cache_config_info.txt
+5854b7e0b2515fd1a564863f19176db2  ns128_0.log
+52a7b3933139734884cfaf3d6962f792  ns128_1.cache_config_info.txt
+55b3dccab769375cf55587c0f70b2bf0  ns128_1.log
+0a703c097f4dcab816e15bee06447690  ns256_0.cache_config_info.txt
+8920b225a67f394aa785303583b1186c  ns256_0.log
+569d2ae0290891909c2dc901071464fa  ns256_1.cache_config_info.txt
+fe761df5b911a9a21f57571ab293e815  ns256_1.log
+e26c76527d4ceaefc014e21da2135e11  spec_0.cache_config_info.txt
+47ce0dc7a972b35fe6e5a1c7cff9a815  spec_0.log
+0599a4ada96506d71fc345f12a4df02a  spec_1.cache_config_info.txt
+7b68cb8ad53eb8ec309378930311b64b  spec_1.log

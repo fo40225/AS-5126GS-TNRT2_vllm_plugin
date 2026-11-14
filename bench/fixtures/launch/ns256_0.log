@@ -1,0 +1,31 @@
+(APIServer pid=975228) INFO 11-09 15:48:42 [startup.py:96] non-default args: {'model_tag': 'unsloth/Muse-Spark-Open-816B-A42B-NVFP4', 'enable_auto_tool_choice': True, 'tool_call_parser': 'muse', 'host': '127.0.0.1', 'port': 8100, 'model': 'unsloth/Muse-Spark-Open-816B-A42B-NVFP4', 'max_model_len': 131072, 'quantization': 'modelopt_fp4', 'reasoning_parser': 'muse', 'tensor_parallel_size': 8, 'enable_expert_parallel': True, 'gpu_memory_utilization': 0.95, 'kv_cache_memory_bytes': 16957243392, 'kv_cache_dtype': 'fp8', 'limit_mm_per_prompt': {'image': 0, 'audio': 0, 'video': 0}, 'max_num_seqs': 256, 'max_cudagraph_capture_size': 256}
+(APIServer pid=975228) INFO 11-09 15:48:46 [scheduler.py:310] Chunked prefill is enabled with max_num_batched_tokens=8192.
+(APIServer pid=975228) INFO 11-09 15:48:46 [config.py:178] MuseSpark SM120: prefill batches of at least 2050 tokens run as 2 microbatches that overlap their collectives with each other's compute.
+(EngineCore pid=975922) INFO 11-09 15:48:54 [core.py:139] Initializing a V1 LLM engine (v0.33.0) speculative_config=None
+(Worker_TP0_EP0 pid=976340) INFO 11-09 15:49:14 [model.py:3002] MuseSpark SM120: sequence-parallel residual stream for batches of at least 512 tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=512, CUDA graphs up to 256 tokens).
+(Worker_TP2_EP2 pid=976342) INFO 11-09 15:49:29 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.008375 seconds
+(Worker_TP0_EP0 pid=976340) INFO 11-09 15:49:29 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.408929 seconds
+(Worker_TP5_EP5 pid=976349) INFO 11-09 15:49:29 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.502821 seconds
+(Worker_TP4_EP4 pid=976346) INFO 11-09 15:49:30 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.636640 seconds
+(Worker_TP1_EP1 pid=976345) INFO 11-09 15:49:30 [model_runner.py:480] Model loading took 69.07 GiB memory and 17.766332 seconds
+(Worker_TP7_EP7 pid=976348) INFO 11-09 15:49:30 [model_runner.py:480] Model loading took 69.07 GiB memory and 18.291502 seconds
+(Worker_TP3_EP3 pid=976341) INFO 11-09 15:49:30 [model_runner.py:480] Model loading took 69.07 GiB memory and 18.260351 seconds
+(Worker_TP6_EP6 pid=976347) INFO 11-09 15:49:30 [model_runner.py:480] Model loading took 69.07 GiB memory and 18.474682 seconds
+(EngineCore pid=975922) INFO 11-09 15:49:30 [utils.py:381] Using LBNHC KV cache layout.
+(EngineCore pid=975922) INFO 11-09 15:49:35 [kv_cache_utils.py:1147] GPU KV cache size: 2,910,864 tokens, Maximum concurrency for 131,072 tokens per request: 22.21x
+(Worker_TP7_EP7 pid=976348) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP4_EP4 pid=976346) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP3_EP3 pid=976341) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP0_EP0 pid=976340) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP2_EP2 pid=976342) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP5_EP5 pid=976349) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+Capturing CUDA graphs (PIECEWISE):   0%|          | 0/35 [00:00<?, ?it/s](Worker_TP6_EP6 pid=976347) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP1_EP1 pid=976345) INFO 11-09 15:49:39 [cudagraph_utils.py:888] CUDA graphs: 35 FULL decode graphs are flagged full_decode_graph (token counts 1..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP2_EP2 pid=976342) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP1_EP1 pid=976345) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP0_EP0 pid=976340) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP4_EP4 pid=976346) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP6_EP6 pid=976347) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP5_EP5 pid=976349) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP7_EP7 pid=976348) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB
+(Worker_TP3_EP3 pid=976341) INFO 11-09 15:49:52 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.73 GiB

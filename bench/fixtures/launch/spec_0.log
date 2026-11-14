@@ -1,0 +1,65 @@
+(APIServer pid=1416125) INFO 11-12 02:15:26 [startup.py:96] non-default args: {'model_tag': 'unsloth/Muse-Spark-Open-816B-A42B-NVFP4', 'enable_auto_tool_choice': True, 'tool_call_parser': 'muse', 'host': '127.0.0.1', 'port': 8100, 'model': 'unsloth/Muse-Spark-Open-816B-A42B-NVFP4', 'max_model_len': 131072, 'quantization': 'modelopt_fp4', 'reasoning_parser': 'muse', 'tensor_parallel_size': 8, 'enable_expert_parallel': True, 'gpu_memory_utilization': 0.95, 'kv_cache_memory_bytes': 11720212480, 'kv_cache_dtype': 'fp8', 'limit_mm_per_prompt': {'image': 0, 'audio': 0, 'video': 0}, 'per_request_spec_decode_metrics': 'detailed', 'max_num_batched_tokens': 8199, 'max_num_scheduled_tokens': 8192, 'max_num_seqs': 128, 'max_cudagraph_capture_size': 256, 'speculative_config': {'draft_sample_method': 'probabilistic', 'method': 'dflash', 'model': '/raid/.cache/huggingface/hub/models--RadixArk--Muse-Spark-Open-DFlash2/snapshots/46c90f412549c472941a68382d91a99e5e6372a0', 'num_speculative_tokens': 7, 'rejection_sample_method': 'block'}}
+(APIServer pid=1416125) INFO 11-12 02:15:29 [model.py:744] Resolved architecture: DFlash2DraftModel
+(APIServer pid=1416125) INFO 11-12 02:15:29 [scheduler.py:310] Chunked prefill is enabled with max_num_batched_tokens=8199.
+(APIServer pid=1416125) INFO 11-12 02:15:29 [config.py:178] MuseSpark SM120: prefill batches of at least 2050 tokens run as 2 microbatches that overlap their collectives with each other's compute.
+(EngineCore pid=1416451) INFO 11-12 02:15:37 [core.py:139] Initializing a V1 LLM engine (v0.33.0) speculative_config=SpeculativeConfig(method='dflash'
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:15:56 [model.py:3009] MuseSpark SM120: sequence-parallel residual stream for batches of at least 384 tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384, CUDA graphs up to 256 tokens).
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:15:56 [model.py:3023] MuseSpark SM120: sequence parallel inside FULL decode CUDA graphs for batches of at least 136 tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=136; decode MoE engines serve up to 128 tokens; eager, mixed and PIECEWISE batches keep the floor of 384 tokens).
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:12 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:12 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:12 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:12 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:12 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:12 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:13 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:13 [model_runner.py:480] Model loading took 70.98 GiB memory and 17.907383 seconds
+(Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:13 [model_runner.py:480] Model loading took 70.98 GiB memory and 17.927288 seconds
+(Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:13 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:13 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:13 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:14 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:14 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:14 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:14 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:14 [model_runner.py:480] Model loading took 70.98 GiB memory and 18.754584 seconds
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:14 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:14 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:14 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:14 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:14 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:14 [model_runner.py:480] Model loading took 70.98 GiB memory and 19.127806 seconds
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:14 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:14 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:14 [qwen3_dflash2.py:545] DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel cutlass): 30 linear layers quantized, 669 MiB freed per rank (allocated 74909 -> 74268 MiB, 0.02 s).
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:15 [model_runner.py:480] Model loading took 70.98 GiB memory and 19.505452 seconds
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:15 [qwen3_dflash2.py:592] DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an extra copy of 197 MiB per rank.
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:15 [speculator.py:306] DFlash2: the aux projection runs in the target's forward (VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:15 [model_runner.py:480] Model loading took 70.98 GiB memory and 19.909023 seconds
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:15 [model_runner.py:480] Model loading took 70.98 GiB memory and 20.036502 seconds
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:15 [model_runner.py:480] Model loading took 70.98 GiB memory and 20.322759 seconds
+(EngineCore pid=1416451) INFO 11-12 02:16:15 [utils.py:381] Using LBNHC KV cache layout.
+(EngineCore pid=1416451) INFO 11-12 02:16:21 [kv_cache_utils.py:1147] GPU KV cache size: 1,649,935 tokens, Maximum concurrency for 131,072 tokens per request: 12.59x
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+Capturing CUDA graphs (PIECEWISE):   0%|          | 0/35 [00:00<?, ?it/s](Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:28 [cudagraph_utils.py:888] CUDA graphs: 32 FULL decode graphs are flagged full_decode_graph (token counts 8..256), 0 other FULL graphs, 35 PIECEWISE graphs.
+(Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+Capturing dflash2 CUDA graphs (FULL):   0%|          | 0/32 [00:00<?, ?it/s](Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:40 [speculator.py:184] Capturing model for DFlash2 speculator...
+(Worker_TP7_EP7 pid=1416625) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP4_EP4 pid=1416618) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP2_EP2 pid=1416617) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP0_EP0 pid=1416619) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP5_EP5 pid=1416620) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP6_EP6 pid=1416624) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP1_EP1 pid=1416621) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
+(Worker_TP3_EP3 pid=1416623) INFO 11-12 02:16:41 [model_runner.py:1757] Graph capturing finished in 13 secs, took 0.92 GiB
