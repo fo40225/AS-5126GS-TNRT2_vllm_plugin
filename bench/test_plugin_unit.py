@@ -22,6 +22,7 @@ torch.cuda.is_current_stream_capturing = lambda: False
 class FakeComm:
     device = torch.device("cpu")
     max_bytes = 8 << 20
+    world_size = 8
     _closed = False
 
     def __init__(self, ok):
@@ -31,14 +32,15 @@ class FakeComm:
         self.calls.append(("supports", op, dim))
         return self.ok
 
-    def all_reduce(self, x):
-        return "topo_ar"
+    # with ``out`` (a result pre-allocated by the plugin, see _output_stream) the fake reports the shape it was given
+    def all_reduce(self, x, out=None):
+        return "topo_ar" if out is None else ("topo_ar", tuple(out.shape))
 
-    def all_gather(self, x, dim):
-        return ("topo_ag", dim)
+    def all_gather(self, x, dim, out=None):
+        return ("topo_ag", dim) if out is None else ("topo_ag", dim, tuple(out.shape))
 
-    def reduce_scatter(self, x):
-        return "topo_rs"
+    def reduce_scatter(self, x, out=None):
+        return "topo_rs" if out is None else ("topo_rs", tuple(out.shape))
 
 
 def make(ok, ops=("all_reduce", "all_gather", "reduce_scatter")):
@@ -69,6 +71,26 @@ def main():
     dc.topo_trace.note("all_reduce", y, None, "nccl", lambda: n.append(1) or "r")
     dc.topo_trace.note("all_reduce", y, None, "nccl", lambda: n.append(1) or "r")
     assert len(n) == 1
+    # inside a microbatched prefill the result is pre-allocated on the compute stream (shape = what TopoComm would make)
+    streams = []
+    real_output_stream, real_alloc = vp._output_stream, vp._alloc
+    vp._output_stream = lambda: "compute_stream"
+    vp._alloc = lambda stream, shape, like: streams.append(stream) or torch.empty(tuple(shape), dtype=like.dtype)
+    try:
+        dc = make(True)
+        assert ar(dc, x) == ("topo_ar", (4, 64))
+        assert ag(dc, x, -1) == ("topo_ag", 1, (4, 512))  # column concatenation
+        assert ag(dc, x, 0) == ("topo_ag", 0, (32, 64))  # rank-major
+        assert ag(dc, torch.zeros(16, dtype=torch.bfloat16), 0) == ("topo_ag", 0, (128,))  # 1-D: rank-major
+        assert ag(dc, torch.zeros(4, 6, 8, dtype=torch.bfloat16), -1) == ("topo_ag", 2, (4, 6, 64))
+        assert rs(dc, torch.zeros(16, 64, dtype=torch.bfloat16), 0) == ("topo_rs", (2, 64))
+        assert streams == ["compute_stream"] * 6
+        dc = make(False)  # a call the topo path cannot take allocates nothing
+        streams.clear()
+        assert ar(dc, x) == "orig_ar" and not streams
+    finally:
+        vp._output_stream, vp._alloc = real_output_stream, real_alloc
+    assert vp._output_stream() is None  # outside a microbatch thread there is no allocation stream (vLLM or not)
     # an op that is not routed never reaches supports()
     dc = make(True, ops=("all_gather",))
     assert ar(dc, x) == "orig_ar" and not any(c[1] == "all_reduce" for c in dc.topo_comm.calls)
