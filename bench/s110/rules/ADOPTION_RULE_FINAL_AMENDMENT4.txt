@@ -1,0 +1,41 @@
+S1-10 FINAL GATE RULE, AMENDMENT 4 (POST-HOC, written 2026-11-11 for the re-gate on the vLLM 0.33.0 line, BEFORE any
+0.33.0 gate boot). Applies on top of ADOPTION_RULE_FINAL.txt (md5 e12749224b0271f627426ffe60b6f128),
+_AMENDMENT1.txt (md5 0a55f33a28ba0812ce21267a1a05c454), _AMENDMENT2.txt (md5 9cf24860768f854e423f90b90240b7be) and
+_AMENDMENT3.txt (md5 1e39f7241256dde81563eebe5d4e9ca6).
+
+LABEL: POST-HOC. It is written after S1-10R phase 3 (S1-7 stress with the tier on at P*) recorded swap, and before any
+0.33.0 gate boot. It adds a record requirement and a statement of status; it changes no threshold of any criterion.
+
+EVIDENCE (S1-10R phase 3, muse_wf/s1-10r/phase3_stress.json meta.swap_finding, docs/s110_numa_offload.md section 4a):
+- At P* = 51,814,072,320 B per rank, 7 of the 9 valid ON boots swapped out 3.7-5.5 GiB of unpinned worker / EngineCore /
+  API-server anonymous memory (process VmSwap 0.2-1.9 GiB per worker on all four GPU nodes). Boot-time swap occurred in 6 of
+  the 10 boots (spec_2, ns256_1, ns128_1, ns256_2, ns128_2, ns128_3) and not in spec_1, ns256_3, ns256_3b, ns256_4; ns256_4
+  swapped 3.7 GiB during the stress. The gap to the previous teardown does not separate the two groups: the cause is open.
+  No OOM kill, no watchdog trip, 0 errors; the swapped pages were cold; READY 119-140 s with boot-time swap, 100-110 s without.
+- The phase 3 pre-stated "no swap" check FAILED in all three confirming boots (phase 3 all_pass=false).
+- No criterion of ADOPTION_RULE_FINAL (G1-G5, P1-P5, X, S, T, D) or of amendments 1-3 looks at swap. G3 requires
+  min(MemFree + file cache) >= 4,096 MiB, READY <= median OFF READY + 180 s and 0 watchdog trips; G1 / G2 / P1-P5 measure the
+  throughput and latency effects of everything the ON arm does, including swap-ins.
+
+CHANGE:
+ (1) SWAP RECORD, mandatory for EVERY boot of the phase 4 gate chain that has a server (ON, OFF and CTL boots, the D / D4'
+     processes, gates S and T). The frozen drivers are not changed; the phase 4 driver copies (their md5s are recorded before
+     the first gate boot) take the record into the boot directory (swap_<tag>.json), at three points: before the launch,
+     at READY, and after the last job of the boot (before the teardown):
+       - swap used = SwapTotal - SwapFree (/proc/meminfo, MiB) and /proc/vmstat pswpin and pswpout;
+       - VmSwap (/proc/<pid>/status, kB) of every process of the launched session (the 8 workers, EngineCore, API server),
+         at READY and at the end;
+       - derived: pswpout delta launch -> READY, READY -> end, and the pswpin delta READY -> end.
+     The report of the chain prints one swap table (per boot: swap used at READY and at the end, the deltas, the largest
+     per-process VmSwap) next to the verdict. A boot whose record is missing is listed as MISSING; this changes no verdict.
+ (2) STATUS: INFORMATIONAL. Swap is not a gate criterion: no outcome of G1-G5, P1-P5, X, S, T or D depends on it, no boot is
+     invalidated or repeated because of swap, and P* (51,814,072,320 B per rank, env/offload.env) stays the tier size of every
+     ON arm. Reasons: the harm of swap is latency, which G1, G2 and P1-P5 measure directly on the ON arm, and memory safety is
+     covered by G3 (4,096 MiB floor, watchdog) and by the 0 OOM / 0 preemption guards.
+ (3) CONSEQUENCES, stated now so they are not decided after the verdict: an ADOPT verdict is reported together with the swap
+     table and is NOT described as swap-free; the production launch note keeps the swap observation of phase 3 and the
+     preflight_offload.sh requirement. If a G1 / G2 / P criterion fails in an ON boot that shows a pswpin delta READY -> end > 0,
+     the report names the swap-in as a candidate cause; that does not change the verdict. Reducing P* (for example by a few
+     GiB, to separate "state left by the previous teardown" from "node pressure at P*") is NOT part of this gate; it would be a
+     new tier size with its own S1-7 stress and its own amendment, written before the boots it governs.
+UNCHANGED: every criterion, threshold, arm, session design and tool of ADOPTION_RULE_FINAL.txt and amendments 1-3.
