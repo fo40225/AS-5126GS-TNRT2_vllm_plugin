@@ -107,6 +107,10 @@ t "m1: an operator override that differs from the ON bytes still prints the NOTE
   'export MUSE_SPEC_KV_BYTES_OVERRIDE=11346923520; n=$(source $E/spec_k7.env 2>&1 >/dev/null | grep -c discarded); source $E/spec_k7.env 2>/dev/null; echo "$n $MUSE_SPEC_KV_BYTES"'
 t "m1: the exports of a child ON-after-ON equal those of the parent (only the NOTE changed)" "same" \
   'source $E/host.env; source $E/spec_k7.env; a=$(export -p | grep -v -E "SHLVL|_=" | sort | md5sum); b=$(bash -c "source \$E/host.env; source \$E/spec_k7.env; export -p" 2>/dev/null | grep -v -E "SHLVL|_=" | sort | md5sum); [ "$a" = "$b" ] && echo same || echo differ'
+t "m3 (closed by test): an explicit operator override equal to the ON bytes with MUSE_OFFLOAD=0 is honoured (ON bytes without the tier; launch/lib.sh and both post-boot checks refuse it)" "off=0 args=[] kv=11645337600" \
+  'export MUSE_OFFLOAD=0 MUSE_SPEC_KV_BYTES_OVERRIDE=11645337600; source $E/spec_k7.env 2>/dev/null; echo "off=$MUSE_OFFLOAD args=[${MUSE_OFFLOAD_SERVE_ARGS:-}] kv=$MUSE_SPEC_KV_BYTES"'
+t "m4 (closed by test): MUSE_OFFLOAD=0 with MUSE_OFFLOAD_PROFILE=ns256 exported: the launch-relevant values equal the plain OFF launch (extra MUSE_OFFLOAD_* exports are not launch-relevant)" "kv=11720212480 args=[] sargs=--max-cudagraph-capture-size 256 --max-num-batched-tokens 8199 --max-num-scheduled-tokens 8192" \
+  'export MUSE_OFFLOAD=0 MUSE_OFFLOAD_PROFILE=ns256; source $E/host.env; source $E/spec_k7.env 2>/dev/null; echo "kv=$MUSE_SPEC_KV_BYTES args=[${MUSE_OFFLOAD_SERVE_ARGS:-}] sargs=$MUSE_SPEC_SERVE_ARGS"'
 # A3 literal proofs: every exported variable (export -p, sorted) of the default launch equals the gated order's; the OFF launch equals main 942acddc48's
 exps() { env -i PATH="$PATH" "${@:2}" bash -c "$1" 2>/dev/null | sort; }
 if [ "$(exps "source $here/env/host.env; source $here/env/spec_k7.env; export -p")" = "$(exps "source $here/env/host.env; source $here/env/offload.env; source $here/env/spec_k7.env; export -p")" ]; then
